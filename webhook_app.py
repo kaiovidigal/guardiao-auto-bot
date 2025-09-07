@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# webhook_app.py — Guardião Auto (DM-only)
+# webhook_app.py — Guardião Auto (DM-only) com gatilho de G1
 
 import os, re, json, time, logging
 from typing import List, Optional, Tuple
@@ -21,7 +21,7 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))  # Canal de sinais A
 if not BOT_TOKEN:
     raise RuntimeError("Defina TG_BOT_TOKEN nas variáveis de ambiente.")
 if not PUBLIC_URL.startswith("http"):
-    log.warning("PUBLIC_URL ausente/invalid. Ex.: https://guardiao-auto-bot.onrender.com")
+    log.warning("PUBLIC_URL ausente/invalid. Ex.: https://seu-app.onrender.com")
 
 # Odds fixas por número (Fan Tan)
 ODDS_TOTAL = 3.85
@@ -82,6 +82,12 @@ re_close   = re.compile(r"\bAPOSTA\s+ENCERRADA\b", re.I)
 re_green   = re.compile(r"\bGREEN\b|✅", re.I)
 re_red     = re.compile(r"\bRED\b|\bNEUTRO\b|❌", re.I)
 
+# >>> NOVO: padrões para detectar mensagem de G1 no canal
+re_g1_hint = re.compile(
+    r"(?:estamos\s+no|vamos\s+para\s+|indo\s+para\s+)?(?:\b1\s*[ºo]?\s*gale\b|\bg1\b)",
+    re.I
+)
+
 def eh_sinal(txt:str) -> bool:
     return bool(re_sinal.search(txt or ""))
 
@@ -104,12 +110,11 @@ def eh_resultado(txt:str) -> Optional[int]:
         return None
     if re_green.search(up): return 1
     if re_red.search(up):  return 0
-    # Se encerrou mas não disse GREEN explicitamente, tratar como RED
     return 0
 
 # ========= CÁLCULOS =========
 def lucro_liquido_no_acerto(por_num: float) -> float:
-    # ganha ODDS_TOTAL*por_num no número vencedor e perde 2*por_num nos outros dois
+    # ganha ODDS_TOTAL*por_num no nº vencedor e perde 2*por_num nos outros dois
     return round((ODDS_TOTAL - 3.0) * por_num, 2)  # 0.85 * por_num
 
 def plano_por_tentativa(base_total: float, mult: float):
@@ -192,8 +197,8 @@ async def cmd_start(m: types.Message):
     await m.answer(
         "🤖 <b>Guardião Auto (DM)</b>\n"
         "• Lê <b>ENTRADA CONFIRMADA</b> no canal A e executa simulação aqui.\n"
-        "• Respeita odds fixas por número (3.85x).\n"
-        "• Usa ciclo para recuperar perdas (perda × Ciclo Mult).\n"
+        "• Odds por número fixas (3.85x).\n"
+        "• Ciclo de recuperação: perda × Ciclo Mult (padrão 3x).\n"
         f"• Canal A: <code>{CHANNEL_ID}</code>",
         disable_web_page_preview=True
     )
@@ -288,7 +293,7 @@ def abrir_operacao(apos:int, alvos:List[int]):
     base = state["stake_base"]
     mults = state["multipliers"][:state["gales_max"]+1] or [1.0]
 
-    # se estamos em modo recuperação (ciclo ativo), ajustar base
+    # modo recuperação (ciclo ativo) usa perda × ciclo_mult
     if risk["cycle_left"] > 0 and risk["prev_cycle_loss"] > 0:
         base = max(base, round(risk["prev_cycle_loss"] * state["ciclo_mult"], 2))
         risk["cycle_left"] -= 1
@@ -332,7 +337,7 @@ async def fechar_com_green():
     op["closed"] = True
     risk["open"] = None
 
-    # recuperou? zera perda carregada
+    # GREEN zera recuperação
     risk["prev_cycle_loss"] = 0.0
     risk["cycle_left"] = 0
     save_risk()
@@ -355,7 +360,7 @@ async def avancar_depois_de_red():
         risk["session_pnl"] = round(risk["session_pnl"] - preju, 2)
         risk["bankroll"]    = round(risk["bankroll"] - preju, 2)
         risk["prev_cycle_loss"] = preju
-        risk["cycle_left"] = state["ciclo_max"]  # ativar recuperação para os próximos sinais
+        risk["cycle_left"] = state["ciclo_max"]  # ativar recuperação
 
         op["closed"] = True
         risk["open"] = None
@@ -389,6 +394,24 @@ async def _process_channel_text(msg: types.Message):
     if not txt:
         return
 
+    # 0) Gatilho: mensagem indicando G1 (ex.: "Estamos no 1° gale")
+    if risk.get("open") and not risk["open"]["closed"] and re_g1_hint.search(txt):
+        op = risk["open"]
+        # só avança se estiver em G0 e há multiplicador para G1
+        if op["step"] == 0 and len(op["mult"]) > 1:
+            op["step"] = 1
+            save_risk()
+            s1, per1, _ = plano_por_tentativa(op["base"], op["mult"][1])
+            if state["dm_user_id"]:
+                await bot.send_message(
+                    state["dm_user_id"],
+                    f"🟠 <b>G1 ativado</b>\n"
+                    f"💵 Tentativa 2 (G1) total: <b>R${s1:.2f}</b> (≈ <i>{per1:.2f} por número</i>)"
+                )
+        # não processa como novo sinal
+        # (mas deixa seguir para fechar se a mesma msg tiver 'APOSTA ENCERRADA', o que é improvável)
+        # -> não retorna aqui de propósito
+
     # 1) Resultado fecha/avança
     r = eh_resultado(txt)
     if r is not None:
@@ -404,7 +427,6 @@ async def _process_channel_text(msg: types.Message):
         return
     if time.time() < state.get("cooldown_until", 0.0):
         return
-    # aplicar stops antes
     if (risk["session_pnl"] >= risk["stop_win"]) or (risk["session_pnl"] <= -risk["stop_loss"]):
         await checar_stops()
         return
