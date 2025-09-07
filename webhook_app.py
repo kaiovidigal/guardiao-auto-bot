@@ -5,39 +5,45 @@ from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# ================= LOG =================
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-log = logging.getLogger("guardiao-risco-auto")
+# ============== LOGGING ==============
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+log = logging.getLogger("guardiao-risco-auto-io")
 
-# =============== CONFIG =================
+# ============== CONFIG BÁSICA ==============
 BOT_TOKEN   = os.getenv("TG_BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Faltando TG_BOT_TOKEN")
 
-CHANNEL_ID  = int(os.getenv("CHANNEL_ID", "-1002810508717"))  # coloque o ID do seu canal
-PUBLIC_URL  = os.getenv("PUBLIC_URL", "").rstrip("/")
-CONF_LIMIAR = float(os.getenv("CONF_LIMIAR", "0.92"))
-COOLDOWN_S  = int(os.getenv("COOLDOWN_S", "10"))
+# Canal onde CHEGAM os sinais (entrada)
+CHANNEL_ID_INPUT  = int(os.getenv("CHANNEL_ID_INPUT", "-1002810508717"))
+# Canal onde o bot PUBLICA a execução/decisão (saída)
+CHANNEL_ID_OUTPUT = int(os.getenv("CHANNEL_ID_OUTPUT", "-1003052132833"))
+
+PUBLIC_URL  = (os.getenv("PUBLIC_URL", "").rstrip("/"))
+CONF_LIMIAR = float(os.getenv("CONF_LIMIAR", "0.92"))   # confiança mínima
+COOLDOWN_S  = int(os.getenv("COOLDOWN_S", "10"))        # anti-flood
 
 bot = Bot(token=BOT_TOKEN, parse_mode=types.ParseMode.HTML)
 dp  = Dispatcher(bot)
 
-# ============== PERSISTÊNCIA ============
+# ============== PERSISTÊNCIA ==============
 os.makedirs("data", exist_ok=True)
 STATE_FILE = "data/state.json"
 RISK_FILE  = "data/risk.json"
 
 state = {
-    "seguir_sinal": True,
+    "seguir_sinal": True,        # só age quando vier ENTRADA CONFIRMADA
     "cooldown_until": 0.0,
     "limiar": CONF_LIMIAR,
-    "stake_base": 5.00,
-    "gales_max": 1,
-    "ciclo_max": 1,
-    "gale_mult": 2.0,
-    "multipliers": [1.0, 2.0],   # usados no plano (até 4)
-    "modo_real": False,
+
+    # gestão de stake/gale/ciclo
+    "stake_base": 5.00,          # valor total da 1ª tentativa (soma dos 3 números)
+    "gales_max": 1,              # 0..3 (número de gales)
+    "ciclo_max": 1,              # nº de ciclos antes de pausar
+    "gale_mult": 2.0,            # multiplicador rápido dos botões
+    "multipliers": [1.0, 2.0],   # até 4; pode ajustar com /mult 1,2,3,4
+
+    "modo_real": False,          # apenas SIMULAÇÃO
 }
 def load_state():
     try:
@@ -47,20 +53,19 @@ def load_state():
         log.warning("Falha ao carregar state: %s", e)
 def save_state():
     try:
-        json.dump(state, open(STATE_FILE, "w", encoding="utf-8"),
-                  ensure_ascii=False, indent=2)
+        json.dump(state, open(STATE_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     except Exception as e:
         log.warning("Falha ao salvar state: %s", e)
 load_state()
 
 risk = {
-    "bankroll": 100.00,
-    "session_pnl": 0.0,
+    "bankroll": 100.00,     # banca virtual
+    "session_pnl": 0.0,     # PnL da sessão
     "stop_win": 50.00,
     "stop_loss": 50.00,
-    "odds_total": 3.85,   # odds por número (padrão simulação)
-    "prev_cycle_loss": 0.0,
-    "open": None
+    "odds_total": 3.85,     # retorno total ao acertar UM número (≈3.85x)
+    "prev_cycle_loss": 0.0, # prejuízo do ciclo anterior (para recuperação)
+    "open": None            # operação aberta
 }
 def load_risk():
     try:
@@ -70,13 +75,12 @@ def load_risk():
         log.warning("Falha ao carregar risk: %s", e)
 def save_risk():
     try:
-        json.dump(risk, open(RISK_FILE, "w", encoding="utf-8"),
-                  ensure_ascii=False, indent=2)
+        json.dump(risk, open(RISK_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     except Exception as e:
         log.warning("Falha ao salvar risk: %s", e)
 load_risk()
 
-# ======== MÉTRICAS / APRENDIZADO ========
+# ============== MÉTRICAS / APRENDIZADO (CONFIRMAR) ==============
 hist_long  = deque(maxlen=300)   # 0/1
 hist_short = deque(maxlen=30)    # 0/1
 ultimos_numeros = deque(maxlen=120)   # 1..4
@@ -93,14 +97,16 @@ def atualiza_estat_num(seq_nums):
             ultimos_numeros.append(n)
             contagem_num[n] += 1
 
-def winrate(d): 
-    d=list(d); 
+def winrate(d):
+    d=list(d)
     return (sum(d)/len(d)) if d else 0.0
+
 def volatilidade(d):
     d=list(d)
     if len(d)<10: return 0.0
     trocas=sum(1 for i in range(1,len(d)) if d[i]!=d[i-1])
     return trocas/(len(d)-1)
+
 def streak_loss(d):
     d=list(d); s=0; mx=0
     for x in d:
@@ -135,7 +141,7 @@ def conf_final(short_wr, long_wr, vol, max_reds, risco_num):
     if vol > 0.6:     pena += 0.05
     return max(0.0, min(1.0, base - pena))
 
-# ============== PARSERS ==============
+# ============== PARSERS DE TEXTO DO CANAL ==============
 re_sinal   = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
 re_seq     = re.compile(r"Sequ[eê]ncia[:\s]*([^\n]+)", re.I)
 re_apos    = re.compile(r"Entrar\s+ap[oó]s\s+o\s+([1-4])", re.I)
@@ -145,7 +151,7 @@ re_close   = re.compile(r"APOSTA\s+ENCERRADA", re.I)
 
 def eh_sinal(txt): return bool(re_sinal.search(txt or ""))
 def extrai_sequencia(txt):
-    m=re_seq.search(txt or "")
+    m=re_seq.search(txt or ""); 
     if not m: return []
     return [int(x) for x in re.findall(r"[1-4]", m.group(1))]
 def extrai_regra_sinal(txt):
@@ -159,9 +165,9 @@ def eh_resultado(txt):
     if "GREEN" in up or "WIN" in up or "✅" in up: return 1
     return None
 
-# ============== CÁLCULOS DE STAKE ==============
+# ============== CÁLCULOS DE STAKE (3 números) ==============
 def lucro_liquido_no_acerto(por_num, odds_total):
-    # ganha odds_total*por_num no número vencedor e perde 2*por_num
+    # acerta 1 número: ganha odds_total*por_num e perde 2*por_num
     return round((odds_total - 3.0) * por_num, 2)
 
 def plano_por_tentativa(base_total, mult):
@@ -171,6 +177,7 @@ def plano_por_tentativa(base_total, mult):
     return stake_total, por_num, lucro
 
 def required_base_for_recovery(prev_loss, want_profit, multipliers):
+    # garante recuperação no pior caso (acertando na última tentativa)
     j = len(multipliers) - 1
     sum_prev = sum(multipliers[:j])
     denom = (risk["odds_total"] - 3.0) * (multipliers[j] / 3.0) - sum_prev
@@ -181,7 +188,6 @@ def required_base_for_recovery(prev_loss, want_profit, multipliers):
 
 # ============== UI / PAINEL ==============
 def kb_painel():
-    modo = "🧪 SIMULADO"
     seguir = "🟢 Seguir: ON" if state["seguir_sinal"] else "⚪️ Seguir: OFF"
     presets_row = [
         InlineKeyboardButton("✖️ 1x", callback_data="preset_mult_1"),
@@ -204,8 +210,7 @@ def kb_painel():
            InlineKeyboardButton("📈 +", callback_data="gmx_+"))
     kb.row(*presets_row)
     kb.row(InlineKeyboardButton(seguir, callback_data="toggle_seg"))
-    kb.row(InlineKeyboardButton(modo, callback_data="noop"),
-           InlineKeyboardButton("🔄 Atualizar", callback_data="refresh"))
+    kb.row(InlineKeyboardButton("🔄 Atualizar", callback_data="refresh"))
     return kb
 
 def resumo_plano_text(multipliers, base_total):
@@ -219,11 +224,10 @@ def resumo_plano_text(multipliers, base_total):
 @dp.message_handler(commands=["start"])
 async def cmd_start(m: types.Message):
     await m.answer(
-        "<b>🤖 Guardião de Risco (AUTOMÁTICO)</b>\n"
-        "• Lê apenas <b>ENTRADA CONFIRMADA</b>\n"
-        "• Não usa navegador (SIMULAÇÃO)\n"
+        "<b>🤖 Guardião Automático (SIMULAÇÃO)</b>\n"
+        f"• Lê SINAIS em: <code>{CHANNEL_ID_INPUT}</code>\n"
+        f"• Publica EXECUÇÃO em: <code>{CHANNEL_ID_OUTPUT}</code>\n"
         "• /painel para configurar stake/gales/ciclo/multiplicadores/odds/stops\n"
-        f"• Canal: <code>{CHANNEL_ID}</code>\n"
         f"• Limiar: <b>{state['limiar']:.2f}</b>\n",
         parse_mode="HTML"
     )
@@ -274,7 +278,7 @@ async def on_cb(call: types.CallbackQuery):
         else:
             await call.answer()
 
-# ======== COMANDOS DE CONTROLE =========
+# ======== COMANDOS DE CONTROLE ========
 @dp.message_handler(commands=["odds"])
 async def cmd_odds(m: types.Message):
     try:
@@ -343,12 +347,9 @@ async def cmd_mult(m: types.Message):
         if len(lst)>4: lst=lst[:4]
         state["multipliers"]=lst[:state["gales_max"]+1]
         save_state()
-        await m.answer(
-            f"✅ Multiplicadores: <b>{', '.join(f'{x:.2f}' for x in state['multipliers'])}</b>",
-            parse_mode="HTML"
-        )
+        await m.answer(f"✅ Multiplicadores: <b>{', '.join(f'{x:.2f}' for x in state['multipliers'])}</b>", parse_mode="HTML")
     except:
-        await m.answer("Use: /mult 1,2,2.5,3 (até 4 valores)")
+        await m.answer("Use: /mult 1,2,2.5,3  (até 4 valores)")
 
 @dp.message_handler(commands=["status"])
 async def cmd_status(m: types.Message):
@@ -364,21 +365,19 @@ async def cmd_status(m: types.Message):
         parse_mode="HTML"
     )
 
-# ============== STOP-WIN/LOSS ==========
+# ============== STOP-WIN/LOSS ==============
 def check_stops_and_pause():
     if risk["session_pnl"] >= risk["stop_win"]:
         state["seguir_sinal"]=False; save_state(); save_risk()
-        bot.loop.create_task(bot.send_message(CHANNEL_ID,
-            "✅ <b>STOP WIN atingido</b>. Pausando entradas.", parse_mode="HTML"))
+        bot.loop.create_task(bot.send_message(CHANNEL_ID_OUTPUT, "✅ <b>STOP WIN atingido</b>. Pausando entradas.", parse_mode="HTML"))
         return True
     if risk["session_pnl"] <= -risk["stop_loss"]:
         state["seguir_sinal"]=False; save_state(); save_risk()
-        bot.loop.create_task(bot.send_message(CHANNEL_ID,
-            "⛔ <b>STOP LOSS atingido</b>. Pausando entradas.", parse_mode="HTML"))
+        bot.loop.create_task(bot.send_message(CHANNEL_ID_OUTPUT, "⛔ <b>STOP LOSS atingido</b>. Pausando entradas.", parse_mode="HTML"))
         return True
     return False
 
-# ============== EXECUÇÃO SIMULADA =======
+# ============== EXECUÇÃO SIMULADA ==============
 def abrir_operacao(apos_num, alvos, base_total, multipliers):
     op = {
         "apos": apos_num,
@@ -415,7 +414,7 @@ def avancar_depois_de_red():
         risk["open"]=None
         save_risk()
         bot.loop.create_task(bot.send_message(
-            CHANNEL_ID,
+            CHANNEL_ID_OUTPUT,
             f"❌ Ciclo perdido. Prejuízo acumulado: <b>R${risk['prev_cycle_loss']:.2f}</b>",
             parse_mode="HTML"
         ))
@@ -438,31 +437,36 @@ def fechar_com_green():
     risk["open"]=None
     save_risk()
     bot.loop.create_task(bot.send_message(
-        CHANNEL_ID,
+        CHANNEL_ID_OUTPUT,
         f"✅ GREEN (step {op['step']}) | PnL: <b>R${pnl:.2f}</b> | Sessão: <b>{risk['session_pnl']:.2f}</b>",
         parse_mode="HTML"
     ))
     check_stops_and_pause()
 
-# ============== HANDLERS DO CANAL =======
+# ============== HANDLER DO CANAL DE ENTRADA ==============
 @dp.channel_post_handler(content_types=["text"])
 async def on_channel_post(msg: types.Message):
-    if msg.chat.id != CHANNEL_ID:
+    # Só ESCUTA o canal de ENTRADA
+    if msg.chat.id != CHANNEL_ID_INPUT:
         return
+
     txt = (msg.text or "").strip()
     if not txt: return
 
+    # aprendizado (sequência / resultado)
     seq=extrai_sequencia(txt)
     if seq: atualiza_estat_num(seq)
     r = eh_resultado(txt)
     if r is not None:
         hist_long.append(r); hist_short.append(r)
+        # Se houver operação aberta, fecha/avança
         if risk.get("open") and not risk["open"]["closed"]:
             if r==1: fechar_com_green()
             else:    avancar_depois_de_red()
         return
 
-    if not eh_sinal(txt):
+    # Só reage a ENTRADA CONFIRMADA
+    if not re_sinal.search(txt):
         return
 
     now=time.time()
@@ -475,13 +479,15 @@ async def on_channel_post(msg: types.Message):
         log.info("Sinal sem 3 alvos claros: %s", txt)
         return
 
+    # decisão
     short_wr=winrate(hist_short); long_wr=winrate(hist_long)
     vol=volatilidade(hist_short); mx_reds=streak_loss(hist_short)
     risco_num=risco_por_numeros(apos_num, alvos)
     conf=conf_final(short_wr, long_wr, vol, mx_reds, risco_num)
     if conf < state["limiar"]:
-        return
+        return  # silencioso
 
+    # define multiplicadores e stake base (com recuperação opcional)
     mults = state["multipliers"][:state["gales_max"]+1] or [1.0]
     base_total = state["stake_base"]
     if risk["prev_cycle_loss"] > 0:
@@ -489,6 +495,7 @@ async def on_channel_post(msg: types.Message):
         if rec is not None:
             base_total = max(base_total, rec)
 
+    # abre operação (simulada) e mostra plano no CANAL DE SAÍDA
     op = abrir_operacao(apos_num, alvos, base_total, mults)
     s0, per0, _ = valor_tentativa(op)
     plano_txt = resumo_plano_text(mults, base_total)
@@ -502,15 +509,15 @@ async def on_channel_post(msg: types.Message):
         f"📈 Odds por número: <b>{risk['odds_total']:.2f}x</b>\n"
         f"💼 Sessão: <b>{risk['session_pnl']:.2f}</b> | Banca: <b>{risk['bankroll']:.2f}</b>"
     )
-    await bot.send_message(CHANNEL_ID, msg_txt, parse_mode="HTML")
+    await bot.send_message(CHANNEL_ID_OUTPUT, msg_txt, parse_mode="HTML")
     state["cooldown_until"]=now+COOLDOWN_S
     save_state()
 
-# ============== FASTAPI / WEBHOOK =========
+# ============== FASTAPI / WEBHOOK ==============
 app = FastAPI()
 
 @app.get("/healthz")
-def healthz(): 
+def healthz():
     return {"ok": True}
 
 @app.on_event("startup")
@@ -526,9 +533,8 @@ async def on_startup():
 async def telegram_webhook(request: Request):
     data = await request.body()
     update = types.Update(**json.loads(data.decode("utf-8")))
-    # >>>>>>> FIX para Aiogram v2 (contexto atual) <<<<<<<
+    # garante contexto correto no aiogram v2
     Bot.set_current(bot)
     Dispatcher.set_current(dp)
-    # ---------------------------------------------------
     await dp.process_update(update)
     return {"ok": True}
