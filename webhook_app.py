@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# webhook_app.py — Guardião Auto (DM-only) com gatilho de G1 (sem NEUTRO)
+# webhook_app.py — Guardião Auto (DM-only) | G1 imediato, Ciclo no próximo sinal, sem NEUTRO
 
 import os, re, json, time, logging
 from typing import List, Optional, Tuple
@@ -41,8 +41,8 @@ state = {
     "stake_base": 10.00,       # valor total da tentativa 1 (3 números somados)
     "gales_max": 1,            # G0..G3  (tentativas = gales_max+1)
     "ciclo_max": 1,            # quantos sinais serão usados para recuperar
-    "multipliers": [1.0, 3.0], # padrão G1=3x
-    "ciclo_mult": 3.0,         # multiplica a perda do ciclo anterior
+    "multipliers": [1.0, 3.0], # padrão: G1=3x imediato
+    "ciclo_mult": 3.0,         # multiplica a perda do ciclo anterior (apenas no PRÓXIMO sinal)
     "cooldown_until": 0.0
 }
 risk = {
@@ -50,7 +50,7 @@ risk = {
     "session_pnl": 0.0,
     "stop_win": 1000.00,
     "stop_loss": 1000.00,
-    "prev_cycle_loss": 0.0,    # perda carregada para recuperar
+    "prev_cycle_loss": 0.0,    # perda carregada p/ recuperar
     "cycle_left": 0,           # quantos sinais restam no modo ciclo
     "open": None               # operação aberta
 }
@@ -82,7 +82,7 @@ re_alvos   = re.compile(r"apostar\s+em\s+Ssh\s+([1-4])[\s\-\|]+([1-4])[\s\-\|]+(
 # Resultado: **apenas GREEN e RED** (NEUTRO removido)
 re_close   = re.compile(r"\bAPOSTA\s+ENCERRADA\b", re.I)
 re_green   = re.compile(r"(GREEN|✅)", re.I)
-re_red     = re.compile(r"(RED|❌)", re.I)   # <<< NEUTRO foi removido
+re_red     = re.compile(r"(RED|❌)", re.I)
 
 # Gatilho textual para G1 (ex.: "Estamos no 1° gale", "G1")
 re_g1_hint = re.compile(
@@ -112,7 +112,7 @@ def eh_resultado(txt:str) -> Optional[int]:
         return None
     if re_green.search(up): return 1
     if re_red.search(up):   return 0
-    return None  # <<<<< nada de NEUTRO/forçar RED
+    return None  # sem NEUTRO, sem forçar RED
 
 # ========= CÁLCULOS =========
 def lucro_liquido_no_acerto(por_num: float) -> float:
@@ -185,10 +185,10 @@ def painel_texto():
         "⚙️ <b>PAINEL</b>\n"
         f"💰 Base: <b>{state['stake_base']:.2f}</b> | ♻️ Gales: <b>{state['gales_max']}</b> | 🔁 Ciclo: <b>{state['ciclo_max']}</b>\n"
         f"✖️ Mults (G0..Gn): <b>{mults}</b>\n"
-        f"📌 Ciclo Mult: <b>x{state['ciclo_mult']:.2f}</b>\n"
+        f"📌 Ciclo Mult (próx. sinal): <b>x{state['ciclo_mult']:.2f}</b>\n"
         f"🎯 Odds por nº (fixo): <b>{ODDS_TOTAL:.2f}x</b>\n"
         f"💼 Banca: <b>R${risk['bankroll']:.2f}</b> | PnL Sessão: <b>{risk['session_pnl']:.2f}</b>\n"
-        f"🧮 Plano (até G1): {resumo_plano(state['multipliers'][:state['gales_max']+1], state['stake_base'])}\n"
+        f"🧮 Plano (até G{state['gales_max']}): {resumo_plano(state['multipliers'][:state['gales_max']+1], state['stake_base'])}\n"
         f"Seguir: <b>{'ON' if state['seguir'] else 'OFF'}</b>"
     )
 
@@ -200,7 +200,7 @@ async def cmd_start(m: types.Message):
         "🤖 <b>Guardião Auto (DM)</b>\n"
         "• Lê <b>ENTRADA CONFIRMADA</b> no canal A e executa simulação aqui.\n"
         "• Odds por número fixas (3.85x). Somente GREEN/RED contam.\n"
-        "• Ciclo de recuperação: perda × Ciclo Mult (padrão 3x).\n"
+        "• G1 é imediato na mesma operação; <b>ciclo</b> só no <b>próximo sinal</b>.\n"
         f"• Canal A: <code>{CHANNEL_ID}</code>",
         disable_web_page_preview=True
     )
@@ -291,11 +291,15 @@ async def on_numeric_reply(m: types.Message):
 
 # ========= CORE: abrir/fechar =========
 def abrir_operacao(apos:int, alvos:List[int]):
-    # base padrão
+    """
+    Abre nova operação.
+    - G1 (multiplier step 1) é sempre IMEDIATO quando o canal disser 'G1'.
+    - Ciclo (recuperação) só será aplicado NO PRÓXIMO SINAL, ajustando a base.
+    """
     base = state["stake_base"]
     mults = state["multipliers"][:state["gales_max"]+1] or [1.0]
 
-    # modo recuperação (ciclo ativo) usa perda × ciclo_mult
+    # Se estamos em modo ciclo (de rodadas passadas), ajustar base para ESTE novo sinal
     if risk["cycle_left"] > 0 and risk["prev_cycle_loss"] > 0:
         base = max(base, round(risk["prev_cycle_loss"] * state["ciclo_mult"], 2))
         risk["cycle_left"] -= 1
@@ -357,12 +361,12 @@ async def avancar_depois_de_red():
     if not op or op["closed"]: return
     op["step"] += 1
     if op["step"] >= len(op["mult"]):
-        # ciclo perdido
+        # Perdeu TODAS as tentativas → guarda perda para recuperar no PRÓXIMO sinal (ciclo)
         preju = total_gasto_ate(op["mult"], op["base"], len(op["mult"]))
         risk["session_pnl"] = round(risk["session_pnl"] - preju, 2)
         risk["bankroll"]    = round(risk["bankroll"] - preju, 2)
         risk["prev_cycle_loss"] = preju
-        risk["cycle_left"] = state["ciclo_max"]  # ativar recuperação
+        risk["cycle_left"] = state["ciclo_max"]  # ativa recuperação, mas só aplicará no próximo abrir_operacao
 
         op["closed"] = True
         risk["open"] = None
@@ -376,6 +380,7 @@ async def avancar_depois_de_red():
             )
         await checar_stops()
     else:
+        # Ainda dentro da mesma operação (ex.: indo para G1)
         save_risk()
 
 async def checar_stops():
@@ -396,23 +401,23 @@ async def _process_channel_text(msg: types.Message):
     if not txt:
         return
 
-    # 0) Gatilho: mensagem indicando G1 (ex.: "Estamos no 1° gale")
+    # (A) Gatilho de G1: IMEDIATO na mesma operação
     if risk.get("open") and not risk["open"]["closed"] and re_g1_hint.search(txt):
         op = risk["open"]
         # só avança se estiver em G0 e há multiplicador para G1
         if op["step"] == 0 and len(op["mult"]) > 1:
-            op["step"] = 1
+            op["step"] = 1  # ativa G1 imediatamente (mesmo sinal)
             save_risk()
             s1, per1, _ = plano_por_tentativa(op["base"], op["mult"][1])
             if state["dm_user_id"]:
                 await bot.send_message(
                     state["dm_user_id"],
-                    f"🟠 <b>G1 ativado</b>\n"
+                    f"🟠 <b>G1 ativado</b> (mesmo sinal)\n"
                     f"💵 Tentativa 2 (G1) total: <b>R${s1:.2f}</b> (≈ <i>{per1:.2f} por número</i>)"
                 )
-        # não retorna aqui; deixa seguir para caso a mesma mensagem traga fechamento
+        # não retorna; deixa continuar para o caso desta mesma mensagem também trazer o fechamento
 
-    # 1) Resultado fecha/avança
+    # (B) Resultado fecha/avança
     r = eh_resultado(txt)
     if r is not None:
         if risk.get("open") and not risk["open"]["closed"]:
@@ -420,20 +425,21 @@ async def _process_channel_text(msg: types.Message):
             elif r == 0: await avancar_depois_de_red()
         return
 
-    # 2) Nova ENTRADA CONFIRMADA -> abre operação (se permitido)
+    # (C) Nova ENTRADA CONFIRMADA -> abre operação (se permitido)
     if not eh_sinal(txt):
         return
     if not state["seguir"]:
         return
     if time.time() < state.get("cooldown_until", 0.0):
         return
+    # Stops
     if (risk["session_pnl"] >= risk["stop_win"]) or (risk["session_pnl"] <= -risk["stop_loss"]):
         await checar_stops()
         return
 
     regra = extrai_regra_sinal(txt)
     if not regra:
-        log.info("Sinal sem padrão esperado: %s", txt[:120])
+        log.info("Sinal sem padrão esperado: %s", txt[:160])
         return
     apos, alvos = regra
     if len(alvos) != 3:
