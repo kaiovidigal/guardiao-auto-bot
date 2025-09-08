@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# webhook_app.py — Guardião Auto (DM-only) | G1 imediato, Ciclo no próximo sinal, sem NEUTRO
+# webhook_app.py — Guardião Auto (DM-only) | G1 imediato (texto exato), ciclo no próximo, stake editável
 
 import os, re, json, time, logging
 from typing import List, Optional, Tuple
@@ -36,13 +36,13 @@ STATE_PATH = "data/state.json"
 RISK_PATH  = "data/risk.json"
 
 state = {
-    "dm_user_id": 0,           # preenchido no /start
-    "seguir": True,            # seguir sinais
-    "stake_base": 10.00,       # valor total da tentativa 1 (3 números somados)
-    "gales_max": 1,            # G0..G3  (tentativas = gales_max+1)
-    "ciclo_max": 1,            # quantos sinais serão usados para recuperar
-    "multipliers": [1.0, 3.0], # padrão: G1=3x imediato
-    "ciclo_mult": 3.0,         # multiplica a perda do ciclo anterior (apenas no PRÓXIMO sinal)
+    "dm_user_id": 0,            # preenchido no /start
+    "seguir": True,             # seguir sinais
+    "stake_base": 10.00,        # valor total da tentativa 1 (3 números somados)
+    "gales_max": 1,             # G0..G3  (tentativas = gales_max+1)
+    "ciclo_max": 1,             # quantos sinais serão usados para recuperar
+    "multipliers": [1.0, 3.0],  # padrão: G1=3x imediato
+    "ciclo_mult": 3.0,          # multiplica a perda do ciclo anterior (só no PRÓXIMO sinal)
     "cooldown_until": 0.0
 }
 risk = {
@@ -50,9 +50,9 @@ risk = {
     "session_pnl": 0.0,
     "stop_win": 1000.00,
     "stop_loss": 1000.00,
-    "prev_cycle_loss": 0.0,    # perda carregada p/ recuperar
-    "cycle_left": 0,           # quantos sinais restam no modo ciclo
-    "open": None               # operação aberta
+    "prev_cycle_loss": 0.0,     # perda carregada p/ recuperar
+    "cycle_left": 0,            # quantos sinais restam no modo ciclo
+    "open": None                # operação aberta
 }
 
 def load(path, default):
@@ -84,11 +84,8 @@ re_close   = re.compile(r"\bAPOSTA\s+ENCERRADA\b", re.I)
 re_green   = re.compile(r"(GREEN|✅)", re.I)
 re_red     = re.compile(r"(RED|❌)", re.I)
 
-# Gatilho textual para G1 (ex.: "Estamos no 1° gale", "G1")
-re_g1_hint = re.compile(
-    r"(?:estamos\s+no|vamos\s+para\s+|indo\s+para\s+)?(?:\b1\s*[ºo]?\s*gale\b|\bg1\b)",
-    re.I
-)
+# G1: exatamente este texto (com emoji e símbolo de grau U+00B0)
+G1_TEXTO_EXATO = "🔁 Estamos no 1° gale"
 
 def eh_sinal(txt:str) -> bool:
     return bool(re_sinal.search(txt or ""))
@@ -150,14 +147,12 @@ def kb_painel():
         InlineKeyboardButton("✖️ 4x", callback_data="preset_4"),
     )
     kb.row(
+        InlineKeyboardButton("✏️ Stake", callback_data="set_stake"),
         InlineKeyboardButton("💼 Banca", callback_data="set_banca"),
-        InlineKeyboardButton("🟢 Stop Win", callback_data="set_sw"),
-        InlineKeyboardButton("🔴 Stop Loss", callback_data="set_sl"),
     )
     kb.row(
-        InlineKeyboardButton("Stake -", callback_data="stake_-"),
-        InlineKeyboardButton(f"Stake: R${state['stake_base']:.2f}", callback_data="noop"),
-        InlineKeyboardButton("Stake +", callback_data="stake_+"),
+        InlineKeyboardButton("🟢 Stop Win", callback_data="set_sw"),
+        InlineKeyboardButton("🔴 Stop Loss", callback_data="set_sl"),
     )
     kb.row(
         InlineKeyboardButton("Gales -", callback_data="gales_-"),
@@ -183,7 +178,7 @@ def painel_texto():
     mults = ", ".join(f"{x:.2f}" for x in state["multipliers"][:state["gales_max"]+1])
     return (
         "⚙️ <b>PAINEL</b>\n"
-        f"💰 Base: <b>{state['stake_base']:.2f}</b> | ♻️ Gales: <b>{state['gales_max']}</b> | 🔁 Ciclo: <b>{state['ciclo_max']}</b>\n"
+        f"💰 Stake: <b>{state['stake_base']:.2f}</b> | ♻️ Gales: <b>{state['gales_max']}</b> | 🔁 Ciclo: <b>{state['ciclo_max']}</b>\n"
         f"✖️ Mults (G0..Gn): <b>{mults}</b>\n"
         f"📌 Ciclo Mult (próx. sinal): <b>x{state['ciclo_mult']:.2f}</b>\n"
         f"🎯 Odds por nº (fixo): <b>{ODDS_TOTAL:.2f}x</b>\n"
@@ -200,7 +195,7 @@ async def cmd_start(m: types.Message):
         "🤖 <b>Guardião Auto (DM)</b>\n"
         "• Lê <b>ENTRADA CONFIRMADA</b> no canal A e executa simulação aqui.\n"
         "• Odds por número fixas (3.85x). Somente GREEN/RED contam.\n"
-        "• G1 é imediato na mesma operação; <b>ciclo</b> só no <b>próximo sinal</b>.\n"
+        "• G1 é imediato no mesmo sinal; <b>ciclo</b> só no <b>próximo sinal</b>.\n"
         f"• Canal A: <code>{CHANNEL_ID}</code>",
         disable_web_page_preview=True
     )
@@ -211,7 +206,7 @@ async def cmd_painel(m: types.Message):
     await m.answer(painel_texto(), reply_markup=kb_painel())
 
 # ====== entrada de números por prompt ======
-AWAIT_NUMERIC = {}  # {user_id: "banca"|"sw"|"sl"}
+AWAIT_NUMERIC = {}  # {user_id: "stake"|"banca"|"sw"|"sl"}
 
 @dp.callback_query_handler(lambda c: True)
 async def on_cb(call: types.CallbackQuery):
@@ -219,9 +214,7 @@ async def on_cb(call: types.CallbackQuery):
     data = call.data
     changed=False
 
-    if data=="stake_+": state["stake_base"]=round(state["stake_base"]+1.0,2); changed=True
-    elif data=="stake_-": state["stake_base"]=max(1.0, round(state["stake_base"]-1.0,2)); changed=True
-    elif data=="gales_+": state["gales_max"]=min(3, state["gales_max"]+1); changed=True
+    if data=="gales_+": state["gales_max"]=min(3, state["gales_max"]+1); changed=True
     elif data=="gales_-": state["gales_max"]=max(0, state["gales_max"]-1); changed=True
     elif data=="ciclo_+": state["ciclo_max"]=min(10, state["ciclo_max"]+1); changed=True
     elif data=="ciclo_-": state["ciclo_max"]=max(1, state["ciclo_max"]-1); changed=True
@@ -238,6 +231,10 @@ async def on_cb(call: types.CallbackQuery):
     elif data=="preset_4":
         state["multipliers"]=[1.0]+[4.0]*state["gales_max"]; changed=True
 
+    elif data=="set_stake":
+        AWAIT_NUMERIC[uid]="stake"
+        await call.message.reply("💬 Digite o novo <b>stake total</b> da 1ª tentativa (ex: 12.50):", parse_mode="HTML")
+        await call.answer(); return
     elif data=="set_banca":
         AWAIT_NUMERIC[uid]="banca"
         await call.message.reply("💬 Digite a nova banca (ex: 1000):")
@@ -275,16 +272,22 @@ async def on_numeric_reply(m: types.Message):
     try:
         v = float((m.text or "").replace(",", "."))
         if v <= 0: raise ValueError()
-        if kind=="banca":
+        if kind=="stake":
+            state["stake_base"]=round(v,2)
+            save_state()
+            await m.reply(f"✅ Stake ajustado para <b>R${state['stake_base']:.2f}</b>", parse_mode="HTML")
+        elif kind=="banca":
             risk["bankroll"]=round(v,2)
-            await m.reply(f"✅ Banca ajustada para <b>R${risk['bankroll']:.2f}</b>")
+            save_risk()
+            await m.reply(f"✅ Banca ajustada para <b>R${risk['bankroll']:.2f}</b>", parse_mode="HTML")
         elif kind=="sw":
             risk["stop_win"]=round(v,2)
-            await m.reply(f"✅ Stop Win ajustado: <b>R${risk['stop_win']:.2f}</b>")
+            save_risk()
+            await m.reply(f"✅ Stop Win ajustado: <b>R${risk['stop_win']:.2f}</b>", parse_mode="HTML")
         elif kind=="sl":
             risk["stop_loss"]=round(v,2)
-            await m.reply(f"✅ Stop Loss ajustado: <b>R${risk['stop_loss']:.2f}</b>")
-        save_risk()
+            save_risk()
+            await m.reply(f"✅ Stop Loss ajustado: <b>R${risk['stop_loss']:.2f}</b>", parse_mode="HTML")
         await m.reply(painel_texto(), reply_markup=kb_painel())
     except:
         await m.reply("❗ Valor inválido.")
@@ -293,8 +296,8 @@ async def on_numeric_reply(m: types.Message):
 def abrir_operacao(apos:int, alvos:List[int]):
     """
     Abre nova operação.
-    - G1 (multiplier step 1) é sempre IMEDIATO quando o canal disser 'G1'.
-    - Ciclo (recuperação) só será aplicado NO PRÓXIMO SINAL, ajustando a base.
+    - G1 (multiplier step 1) é IMEDIATO quando vier o texto exato '🔁 Estamos no 1° gale'.
+    - Ciclo só será aplicado NO PRÓXIMO SINAL, ajustando a base.
     """
     base = state["stake_base"]
     mults = state["multipliers"][:state["gales_max"]+1] or [1.0]
@@ -331,10 +334,14 @@ async def publicar_plano(op):
     if state["dm_user_id"]:
         await bot.send_message(state["dm_user_id"], txt)
 
+def valor_tentativa(op):
+    m = op["mult"][op["step"]]
+    return plano_por_tentativa(op["base"], m)
+
 async def fechar_com_green():
     op = risk.get("open")
     if not op or op["closed"]: return
-    stake_total, _, lucro = plano_por_tentativa(op["base"], op["mult"][op["step"]])
+    stake_total, _, lucro = valor_tentativa(op)
     gastos_previos = total_gasto_ate(op["mult"], op["base"], op["step"])
     pnl = round(lucro - gastos_previos, 2)
 
@@ -380,7 +387,6 @@ async def avancar_depois_de_red():
             )
         await checar_stops()
     else:
-        # Ainda dentro da mesma operação (ex.: indo para G1)
         save_risk()
 
 async def checar_stops():
@@ -401,10 +407,9 @@ async def _process_channel_text(msg: types.Message):
     if not txt:
         return
 
-    # (A) Gatilho de G1: IMEDIATO na mesma operação
-    if risk.get("open") and not risk["open"]["closed"] and re_g1_hint.search(txt):
+    # (A) Gatilho de G1: IMEDIATO na mesma operação — texto EXATO
+    if risk.get("open") and not risk["open"]["closed"] and txt == G1_TEXTO_EXATO:
         op = risk["open"]
-        # só avança se estiver em G0 e há multiplicador para G1
         if op["step"] == 0 and len(op["mult"]) > 1:
             op["step"] = 1  # ativa G1 imediatamente (mesmo sinal)
             save_risk()
@@ -415,7 +420,7 @@ async def _process_channel_text(msg: types.Message):
                     f"🟠 <b>G1 ativado</b> (mesmo sinal)\n"
                     f"💵 Tentativa 2 (G1) total: <b>R${s1:.2f}</b> (≈ <i>{per1:.2f} por número</i>)"
                 )
-        # não retorna; deixa continuar para o caso desta mesma mensagem também trazer o fechamento
+        # continua para permitir que a mesma msg também feche (pouco provável)
 
     # (B) Resultado fecha/avança
     r = eh_resultado(txt)
