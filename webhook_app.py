@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 # webhook_app.py — Guardião Auto (DM-only) | G1 imediato (texto exato), ciclo no próximo, stake editável
+# Adaptação: botão "✏️ Mult G1" para digitar o multiplicador do G1 (máx. 4.00). G0 fixo em 1.00.
 
 import os, re, json, time, logging
 from typing import List, Optional, Tuple
@@ -41,7 +42,7 @@ state = {
     "stake_base": 10.00,        # valor total da tentativa 1 (3 números somados)
     "gales_max": 1,             # G0..G3  (tentativas = gales_max+1)
     "ciclo_max": 1,             # quantos sinais serão usados para recuperar
-    "multipliers": [1.0, 3.0],  # padrão: G1=3x imediato
+    "multipliers": [1.0, 3.0],  # G0=1.0; G1 default=3.0; G2/G3 livres
     "ciclo_mult": 3.0,          # multiplica a perda do ciclo anterior (só no PRÓXIMO sinal)
     "cooldown_until": 0.0
 }
@@ -146,6 +147,9 @@ def kb_painel():
         InlineKeyboardButton("✖️ 3x", callback_data="preset_3"),
         InlineKeyboardButton("✖️ 4x", callback_data="preset_4"),
     )
+    # Novo: editar somente o multiplicador do G1
+    kb.row(InlineKeyboardButton("✏️ Mult G1", callback_data="set_mult_g1"))
+
     kb.row(
         InlineKeyboardButton("✏️ Stake", callback_data="set_stake"),
         InlineKeyboardButton("💼 Banca", callback_data="set_banca"),
@@ -206,7 +210,7 @@ async def cmd_painel(m: types.Message):
     await m.answer(painel_texto(), reply_markup=kb_painel())
 
 # ====== entrada de números por prompt ======
-AWAIT_NUMERIC = {}  # {user_id: "stake"|"banca"|"sw"|"sl"}
+AWAIT_NUMERIC = {}  # {user_id: "stake"|"banca"|"sw"|"sl"|"mult_g1"}
 
 @dp.callback_query_handler(lambda c: True)
 async def on_cb(call: types.CallbackQuery):
@@ -223,6 +227,7 @@ async def on_cb(call: types.CallbackQuery):
     elif data=="toggle": state["seguir"]=not state["seguir"]; changed=True
 
     elif data=="preset_1":
+        # Presets mantidos, mas G0 sempre 1.0
         state["multipliers"]=[1.0]*(state["gales_max"]+1); changed=True
     elif data=="preset_2":
         state["multipliers"]=[1.0]+[2.0]*state["gales_max"]; changed=True
@@ -248,7 +253,19 @@ async def on_cb(call: types.CallbackQuery):
         await call.message.reply("💬 Digite o novo Stop Loss (ex: 300):")
         await call.answer(); return
 
+    # NOVO: editar somente o multiplicador do G1
+    elif data=="set_mult_g1":
+        AWAIT_NUMERIC[uid]="mult_g1"
+        await call.message.reply(
+            "💬 Digite o <b>multiplicador do G1</b> (máx. 4.00). Ex.: <code>3</code> ou <code>2,5</code>",
+            parse_mode="HTML"
+        )
+        await call.answer(); return
+
     if changed:
+        # garantir G0 sempre 1.0
+        if state["multipliers"]:
+            state["multipliers"][0] = 1.0
         save_state()
         try:
             await call.message.edit_text(painel_texto(), reply_markup=kb_painel())
@@ -269,28 +286,62 @@ async def on_numeric_reply(m: types.Message):
     if uid not in AWAIT_NUMERIC:
         return
     kind = AWAIT_NUMERIC.pop(uid)
+    txt  = m.text or ""
+
     try:
-        v = float((m.text or "").replace(",", "."))
-        if v <= 0: raise ValueError()
-        if kind=="stake":
-            state["stake_base"]=round(v,2)
+        if kind in ("stake", "banca", "sw", "sl"):
+            v = float(txt.replace(",", "."))
+            if v <= 0: raise ValueError()
+            if kind=="stake":
+                state["stake_base"]=round(v,2)
+                save_state()
+                await m.reply(f"✅ Stake ajustado para <b>R${state['stake_base']:.2f}</b>", parse_mode="HTML")
+            elif kind=="banca":
+                risk["bankroll"]=round(v,2)
+                save_risk()
+                await m.reply(f"✅ Banca ajustada para <b>R${risk['bankroll']:.2f}</b>", parse_mode="HTML")
+            elif kind=="sw":
+                risk["stop_win"]=round(v,2)
+                save_risk()
+                await m.reply(f"✅ Stop Win ajustado: <b>R${risk['stop_win']:.2f}</b>", parse_mode="HTML")
+            elif kind=="sl":
+                risk["stop_loss"]=round(v,2)
+                save_risk()
+                await m.reply(f"✅ Stop Loss ajustado: <b>R${risk['stop_loss']:.2f}</b>", parse_mode="HTML")
+
+        elif kind == "mult_g1":
+            v = float(txt.replace(",", "."))
+            # limite: (0, 4.00]
+            if v <= 0 or v > 4.0:
+                raise ValueError()
+
+            # G0 travado em 1.0; garantir que o array tenha pelo menos 2 posições
+            if not state.get("multipliers"):
+                state["multipliers"] = [1.0, v]
+            else:
+                # sempre forçar G0=1.0
+                if len(state["multipliers"]) == 0:
+                    state["multipliers"] = [1.0, v]
+                else:
+                    state["multipliers"][0] = 1.0
+                    if len(state["multipliers"]) == 1:
+                        state["multipliers"].append(v)
+                    else:
+                        state["multipliers"][1] = v  # altera só o G1
+
+            # arredondar e salvar
+            state["multipliers"] = [round(x, 2) for x in state["multipliers"]]
             save_state()
-            await m.reply(f"✅ Stake ajustado para <b>R${state['stake_base']:.2f}</b>", parse_mode="HTML")
-        elif kind=="banca":
-            risk["bankroll"]=round(v,2)
-            save_risk()
-            await m.reply(f"✅ Banca ajustada para <b>R${risk['bankroll']:.2f}</b>", parse_mode="HTML")
-        elif kind=="sw":
-            risk["stop_win"]=round(v,2)
-            save_risk()
-            await m.reply(f"✅ Stop Win ajustado: <b>R${risk['stop_win']:.2f}</b>", parse_mode="HTML")
-        elif kind=="sl":
-            risk["stop_loss"]=round(v,2)
-            save_risk()
-            await m.reply(f"✅ Stop Loss ajustado: <b>R${risk['stop_loss']:.2f}</b>", parse_mode="HTML")
+            await m.reply(
+                f"✅ Multiplicador do G1 ajustado para <b>x{state['multipliers'][1]:.2f}</b> (G0 fixo em x1.00)",
+                parse_mode="HTML"
+            )
+
+        # Sempre retorna o painel atualizado
         await m.reply(painel_texto(), reply_markup=kb_painel())
+
     except:
-        await m.reply("❗ Valor inválido.")
+        await m.reply("❗ Valor inválido. Informe algo entre 0.01 e 4.00.")
 
 # ========= CORE: abrir/fechar =========
 def abrir_operacao(apos:int, alvos:List[int]):
@@ -301,6 +352,10 @@ def abrir_operacao(apos:int, alvos:List[int]):
     """
     base = state["stake_base"]
     mults = state["multipliers"][:state["gales_max"]+1] or [1.0]
+
+    # Forçar G0 sempre 1.0
+    if mults:
+        mults[0] = 1.0
 
     # Se estamos em modo ciclo (de rodadas passadas), ajustar base para ESTE novo sinal
     if risk["cycle_left"] > 0 and risk["prev_cycle_loss"] > 0:
@@ -468,7 +523,7 @@ async def on_channel_edit(msg: types.Message):
 app = FastAPI()
 
 @app.get("/healthz")
-def healthz(): 
+def healthz():
     return {"ok": True}
 
 @app.on_event("startup")
