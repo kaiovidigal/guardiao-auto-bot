@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
-# webhook_app.py — Guardião Auto (DM-only) | G1 imediato (texto exato), ciclo no próximo, stake editável
+# webhook_app.py — Guardião Auto (DM-only) | G1 imediato (texto exato), ciclo no próximo,
+# stake editável, e override embutido para priorizar nº1 + aviso "não vai respeitar"
 
 import os, re, json, time, logging
+from collections import deque
 from typing import List, Optional, Tuple
 
 from fastapi import FastAPI, Request
@@ -38,7 +40,7 @@ RISK_PATH  = "data/risk.json"
 state = {
     "dm_user_id": 0,            # preenchido no /start
     "seguir": True,             # seguir sinais
-    "stake_base": 10.00,        # valor total da tentativa 1 (3 números somados)
+    "stake_base": 10.00,        # valor total da 1ª tentativa (3 números somados)
     "gales_max": 1,             # G0..G3  (tentativas = gales_max+1)
     "ciclo_max": 1,             # quantos sinais serão usados para recuperar
     "multipliers": [1.0, 3.0],  # padrão: G1=3x imediato
@@ -74,10 +76,16 @@ load(RISK_PATH, risk)
 def save_state(): save(STATE_PATH, state)
 def save_risk():  save(RISK_PATH,  risk)
 
+# ========= BUFFERS (para priorizar nº1) =========
+ultimos_numeros = deque(maxlen=20)
+
 # ========= PARSERS =========
 re_sinal   = re.compile(r"\bENTRADA\s+CONFIRMADA\b", re.I)
 re_apos    = re.compile(r"Entrar\s+ap[oó]s\s+o\s+([1-4])", re.I)
 re_alvos   = re.compile(r"apostar\s+em\s+Ssh\s+([1-4])[\s\-\|]+([1-4])[\s\-\|]+([1-4])", re.I)
+
+# Sequência para aprender últimos resultados Fantan (para a lógica do nº1)
+re_seq     = re.compile(r"Sequ[eê]ncia[:\s]*([^\n]+)", re.I)
 
 # Resultado: **apenas GREEN e RED** (NEUTRO removido)
 re_close   = re.compile(r"\bAPOSTA\s+ENCERRADA\b", re.I)
@@ -98,6 +106,12 @@ def extrai_regra_sinal(txt:str) -> Optional[Tuple[int, List[int]]]:
     apos = int(m1.group(1))
     alvos = [int(m2.group(1)), int(m2.group(2)), int(m2.group(3))]
     return apos, alvos
+
+def extrai_sequencia(txt: str) -> List[int]:
+    m = re_seq.search(txt or "")
+    if not m:
+        return []
+    return [int(x) for x in re.findall(r"[1-4]", m.group(1))]
 
 def eh_resultado(txt:str) -> Optional[int]:
     """
@@ -292,6 +306,22 @@ async def on_numeric_reply(m: types.Message):
     except:
         await m.reply("❗ Valor inválido.")
 
+# ========= AJUSTE: priorizar nº1 quando fizer sentido =========
+def ajusta_alvos_priorizar_1(apos: Optional[int], alvos: List[int]) -> Tuple[List[int], Optional[str]]:
+    """
+    Regras de override para priorizar o nº1:
+    - Se 'apos' == 1 e 1 NÃO estiver nos alvos -> usar [1,2,3].
+    - OU se os dois últimos observados forem 1-1 e 1 NÃO estiver nos alvos -> usar [1,2,3].
+    Retorna (alvos_modificados, motivo_textual_ou_None).
+    """
+    # Checa últimos 2
+    ult2 = list(ultimos_numeros)[-2:]
+    dois_ultimos_sao_11 = (len(ult2) == 2 and ult2[0] == 1 and ult2[1] == 1)
+
+    if alvos and 1 not in alvos and ((apos == 1) or dois_ultimos_sao_11):
+        return [1, 2, 3], ("apos=1" if apos == 1 else "sequência 1-1")
+    return alvos, None
+
 # ========= CORE: abrir/fechar =========
 def abrir_operacao(apos:int, alvos:List[int]):
     """
@@ -301,191 +331,3 @@ def abrir_operacao(apos:int, alvos:List[int]):
     """
     base = state["stake_base"]
     mults = state["multipliers"][:state["gales_max"]+1] or [1.0]
-
-    # Se estamos em modo ciclo (de rodadas passadas), ajustar base para ESTE novo sinal
-    if risk["cycle_left"] > 0 and risk["prev_cycle_loss"] > 0:
-        base = max(base, round(risk["prev_cycle_loss"] * state["ciclo_mult"], 2))
-        risk["cycle_left"] -= 1
-        save_risk()
-
-    op = {
-        "apos": apos,
-        "alvos": alvos,
-        "base": base,
-        "mult": mults,
-        "step": 0,
-        "closed": False
-    }
-    risk["open"] = op
-    save_risk()
-    return op
-
-async def publicar_plano(op):
-    s0, per0, _ = plano_por_tentativa(op["base"], op["mult"][0])
-    plano_txt = resumo_plano(op["mult"], op["base"])
-    txt = (
-        "🟢 <b>CONFIRMAR</b>\n"
-        f"🎯 Alvos: <b>{op['alvos'][0]}-{op['alvos'][1]}-{op['alvos'][2]}</b> (após {op['apos']})\n"
-        f"💵 Tentativa 1 (total): <b>R${s0:.2f}</b> (≈ <i>{per0:.2f} por número</i>)\n"
-        f"🧮 Plano: {plano_txt}\n"
-        f"📈 Odds por nº (fixo): <b>{ODDS_TOTAL:.2f}x</b>\n"
-        f"💼 Banca: <b>R${risk['bankroll']:.2f}</b> | Sessão: <b>{risk['session_pnl']:.2f}</b>"
-    )
-    if state["dm_user_id"]:
-        await bot.send_message(state["dm_user_id"], txt)
-
-def valor_tentativa(op):
-    m = op["mult"][op["step"]]
-    return plano_por_tentativa(op["base"], m)
-
-async def fechar_com_green():
-    op = risk.get("open")
-    if not op or op["closed"]: return
-    stake_total, _, lucro = valor_tentativa(op)
-    gastos_previos = total_gasto_ate(op["mult"], op["base"], op["step"])
-    pnl = round(lucro - gastos_previos, 2)
-
-    risk["session_pnl"] = round(risk["session_pnl"] + pnl, 2)
-    risk["bankroll"]    = round(risk["bankroll"] + pnl, 2)
-    op["closed"] = True
-    risk["open"] = None
-
-    # GREEN zera recuperação
-    risk["prev_cycle_loss"] = 0.0
-    risk["cycle_left"] = 0
-    save_risk()
-
-    if state["dm_user_id"]:
-        await bot.send_message(
-            state["dm_user_id"],
-            f"✅ <b>GREEN</b> (step {op['step']+1}) | Lucro: <b>R${pnl:.2f}</b> | "
-            f"Sessão: <b>{risk['session_pnl']:.2f}</b> | Banca: <b>{risk['bankroll']:.2f}</b>"
-        )
-    await checar_stops()
-
-async def avancar_depois_de_red():
-    op = risk.get("open")
-    if not op or op["closed"]: return
-    op["step"] += 1
-    if op["step"] >= len(op["mult"]):
-        # Perdeu TODAS as tentativas → guarda perda para recuperar no PRÓXIMO sinal (ciclo)
-        preju = total_gasto_ate(op["mult"], op["base"], len(op["mult"]))
-        risk["session_pnl"] = round(risk["session_pnl"] - preju, 2)
-        risk["bankroll"]    = round(risk["bankroll"] - preju, 2)
-        risk["prev_cycle_loss"] = preju
-        risk["cycle_left"] = state["ciclo_max"]  # ativa recuperação, mas só aplicará no próximo abrir_operacao
-
-        op["closed"] = True
-        risk["open"] = None
-        save_risk()
-
-        if state["dm_user_id"]:
-            await bot.send_message(
-                state["dm_user_id"],
-                f"❌ <b>RED</b> | Perda: <b>R${preju:.2f}</b> | "
-                f"Sessão: <b>{risk['session_pnl']:.2f}</b> | Banca: <b>{risk['bankroll']:.2f}</b>"
-            )
-        await checar_stops()
-    else:
-        save_risk()
-
-async def checar_stops():
-    if risk["session_pnl"] >= risk["stop_win"]:
-        state["seguir"]=False; save_state()
-        if state["dm_user_id"]:
-            await bot.send_message(state["dm_user_id"], "🟢 <b>STOP WIN atingido</b>. Pausando entradas.")
-    if risk["session_pnl"] <= -risk["stop_loss"]:
-        state["seguir"]=False; save_state()
-        if state["dm_user_id"]:
-            await bot.send_message(state["dm_user_id"], "🔴 <b>STOP LOSS atingido</b>. Pausando entradas.")
-
-# ========= PROCESSADOR ÚNICO (post/edição) =========
-async def _process_channel_text(msg: types.Message):
-    if not CHANNEL_ID or msg.chat.id != CHANNEL_ID:
-        return
-    txt = (msg.text or "").strip()
-    if not txt:
-        return
-
-    # (A) Gatilho de G1: IMEDIATO na mesma operação — texto EXATO
-    if risk.get("open") and not risk["open"]["closed"] and txt == G1_TEXTO_EXATO:
-        op = risk["open"]
-        if op["step"] == 0 and len(op["mult"]) > 1:
-            op["step"] = 1  # ativa G1 imediatamente (mesmo sinal)
-            save_risk()
-            s1, per1, _ = plano_por_tentativa(op["base"], op["mult"][1])
-            if state["dm_user_id"]:
-                await bot.send_message(
-                    state["dm_user_id"],
-                    f"🟠 <b>G1 ativado</b> (mesmo sinal)\n"
-                    f"💵 Tentativa 2 (G1) total: <b>R${s1:.2f}</b> (≈ <i>{per1:.2f} por número</i>)"
-                )
-        # continua para permitir que a mesma msg também feche (pouco provável)
-
-    # (B) Resultado fecha/avança
-    r = eh_resultado(txt)
-    if r is not None:
-        if risk.get("open") and not risk["open"]["closed"]:
-            if r == 1: await fechar_com_green()
-            elif r == 0: await avancar_depois_de_red()
-        return
-
-    # (C) Nova ENTRADA CONFIRMADA -> abre operação (se permitido)
-    if not eh_sinal(txt):
-        return
-    if not state["seguir"]:
-        return
-    if time.time() < state.get("cooldown_until", 0.0):
-        return
-    # Stops
-    if (risk["session_pnl"] >= risk["stop_win"]) or (risk["session_pnl"] <= -risk["stop_loss"]):
-        await checar_stops()
-        return
-
-    regra = extrai_regra_sinal(txt)
-    if not regra:
-        log.info("Sinal sem padrão esperado: %s", txt[:160])
-        return
-    apos, alvos = regra
-    if len(alvos) != 3:
-        return
-
-    op = abrir_operacao(apos, alvos)
-    await publicar_plano(op)
-
-    state["cooldown_until"] = time.time() + 5
-    save_state()
-
-@dp.channel_post_handler(content_types=["text"])
-async def on_channel_post(msg: types.Message):
-    await _process_channel_text(msg)
-
-@dp.edited_channel_post_handler(content_types=["text"])
-async def on_channel_edit(msg: types.Message):
-    await _process_channel_text(msg)
-
-# ========= FASTAPI / WEBHOOK =========
-app = FastAPI()
-
-@app.get("/healthz")
-def healthz(): 
-    return {"ok": True}
-
-@app.on_event("startup")
-async def on_startup():
-    if not PUBLIC_URL:
-        log.warning("PUBLIC_URL não definido; defina no Render.")
-        return
-    await bot.delete_webhook(drop_pending_updates=True)
-    await bot.set_webhook(f"{PUBLIC_URL}/webhook/{BOT_TOKEN}")
-    log.info("Webhook configurado em %s/webhook/<token>", PUBLIC_URL)
-
-@app.post(f"/webhook/{BOT_TOKEN}")
-async def tg_webhook(request: Request):
-    data = await request.body()
-    update = types.Update(**json.loads(data.decode("utf-8")))
-    # contexto aiogram v2
-    Bot.set_current(bot)
-    Dispatcher.set_current(dp)
-    await dp.process_update(update)
-    return {"ok": True}
