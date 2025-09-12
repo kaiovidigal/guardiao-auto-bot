@@ -5,9 +5,9 @@
 # - Gera tiro seco por IA e publica no canal réplica
 #
 # Endpoints úteis:
-#   GET  /                         -> status
-#   GET  /debug/samples            -> snapshot de amostras e thresholds
-#   GET  /debug/ping?key=...       -> envia ping de teste no canal réplica
+#   GET  /                       -> status
+#   GET  /debug/samples          -> snapshot de amostras e thresholds
+#   GET  /debug/ping?key=...     -> envia ping de teste no canal réplica
 #   GET  /debug/force_fire?key=... -> força um FIRE (para teste)
 #
 # ENV obrigatórias:
@@ -52,9 +52,9 @@ DECAY    = 0.990
 W4, W3, W2, W1 = 0.38, 0.30, 0.20, 0.12
 ALPHA, BETA, GAMMA = 1.05, 0.70, 0.40
 
-MIN_SAMPLES = 80     # amostra mínima (bem baixa)
-GAP_MIN     = 0.01   # gap quase zero
-CONF_MIN    = 0.30   # confiança mínima para liberar FIRE
+MIN_SAMPLES = 80    # amostra mínima (bem baixa)
+GAP_MIN     = 0.01  # gap quase zero
+CONF_MIN    = 0.30  # confiança mínima para liberar FIRE
 
 # ========= DB helpers =========
 def _ensure_dir(p: str):
@@ -305,12 +305,34 @@ async def webhook(token: str, request: Request):
     # 3) Em "ENTRADA CONFIRMADA", IA dispara (se passar nos mínimos)
     if re.search(r"ENTRADA\s+CONFIRMADA", t, flags=re.I):
         num, conf, samples, post = suggest_number()
+        
+        # Bloco de depuração para quando a IA não disparar
+        if not num:
+            try:
+                # O primeiro bloco de código que você forneceu não define
+                # 'min_conf_dyn' e 'min_gap_dyn'. Para que ele funcione,
+                # a função _dyn_thresholds() precisa ser chamada.
+                # Como essa função não está definida neste arquivo,
+                # usarei as variáveis fixas MIN_SAMPLES, GAP_MIN, CONF_MIN para o log.
+                await tg_broadcast(
+                    f"🧪 conf={conf:.3f} | gap={post[sorted(post.items(), key=lambda kv: kv[1], reverse=True)[0][0]] - post[sorted(post.items(), key=lambda kv: kv[1], reverse=True)[1][0]] if len(post) > 1 else 0.0:.3f} | min_conf={CONF_MIN:.3f} | min_gap={GAP_MIN:.3f} | amostras≈{samples}"
+                )
+            except Exception:
+                pass
+        
+        # Aqui, a IA dispara se 'num' não for None
         if num:
             txt = (f"🤖 <b>{SELF_LABEL_IA} [FIRE]</b>\n"
-                   f"🎯 Número seco (G0): <b>{num}</b>\n"
-                   f"📈 Conf: <b>{conf*100:.2f}%</b> | Amostra≈<b>{samples}</b>")
+                    f"🎯 Número seco (G0): <b>{num}</b>\n"
+                    f"📈 Conf: <b>{conf*100:.2f}%</b> | Amostra≈<b>{samples}</b>")
             await tg_broadcast(txt)
             return {"ok": True, "fire": num, "conf": conf, "samples": samples}
+
+        # O segundo bloco de código que você forneceu também usa
+        # '_dyn_thresholds()'. Como não está definido, ele causaria um erro.
+        # Ele também faz a mesma coisa que o primeiro bloco, então
+        # podemos remover o segundo bloco para evitar redundância.
+        
         return {"ok": True, "skipped_low_conf_or_samples": True}
 
     # Outros textos são ignorados (mas não dão erro)
