@@ -71,7 +71,7 @@ WINDOW = 400
 DECAY  = 0.985
 W4, W3, W2, W1 = 0.38, 0.30, 0.20, 0.12
 ALPHA, BETA, GAMMA = 1.05, 0.70, 0.40
-MIN_SAMPLES = 1000
+MIN_SAMPLES = 100
 GAP_MIN = 0.08
 
 def get_recent_tail(window: int = WINDOW) -> List[int]:
