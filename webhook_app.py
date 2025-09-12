@@ -175,3 +175,16 @@ async def _boot():
                 print("[IA] erro:", e)
             await asyncio.sleep(max(0.2, INTEL_ANALYZE_INTERVAL))
     asyncio.create_task(_loop())
+    # --- PING de teste: envia uma mensagem para o canal réplica ---
+@app.get("/debug/ping")
+async def debug_ping(key: str = ""):
+    # usa a mesma chave do /debug/flush para proteger
+    if not key or key != FLUSH_KEY:
+        return {"ok": False, "error": "unauthorized"}
+    try:
+        await tg_broadcast("🔔 Ping de teste: o bot está conseguindo postar no canal.")
+        return {"ok": True, "sent": True, "channel": REPL_CHANNEL}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    
+    
