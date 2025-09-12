@@ -1,10 +1,9 @@
-# ========= ENV =========
-DB_PATH = os.getenv("DB_PATH", "/var/data/main.sqlite").strip()
 # -*- coding: utf-8 -*-
 # Fan Tan — Guardião Híbrido (Canal + IA + Réplica)
 # Escuta o canal de origem, atualiza o banco, roda IA e publica no canal réplica.
 
-import os, re, json, time, sqlite3, asyncio
+import os   # ✅ Corrigido: necessário para usar os.getenv
+import re, json, time, sqlite3, asyncio
 from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timezone, timedelta
 from collections import Counter
@@ -14,7 +13,7 @@ from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 
 # ========= ENV =========
-DB_PATH = os.getenv("DB_PATH", "/var/data/data.db/main.sqlite").strip()
+DB_PATH = os.getenv("DB_PATH", "/var/data/main.sqlite").strip()
 TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
 WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "meusegredo123").strip()
 PUBLIC_CHANNEL = os.getenv("PUBLIC_CHANNEL", "").strip()
@@ -105,7 +104,8 @@ def ngram_backoff_score(tail: List[int], candidate: int) -> float:
     if len(ctx4)==4: parts.append((W4, prob_from_ngrams(ctx4[:-1], candidate)))
     if len(ctx3)==3: parts.append((W3, prob_from_ngrams(ctx3[:-1], candidate)))
     if len(ctx2)==2: parts.append((W2, prob_from_ngrams(ctx2[:-1], candidate)))
-    if len(ctx1)==1: parts.append((W1, prob_from_ngrams(ctx1[:-1], candidate)))
+    if len(ctx1)==1:
+        parts.append((W1, prob_from_ngrams(ctx1[:-1], candidate)))
     return sum(w*p for w,p in parts)
 
 def tail_top2_boost(tail: List[int], k:int=40) -> Dict[int, float]:
