@@ -1,3 +1,5 @@
+# ========= ENV =========
+DB_PATH = os.getenv("DB_PATH", "/var/data/main.sqlite").strip()
 # -*- coding: utf-8 -*-
 # Fan Tan — Guardião Híbrido (Canal + IA + Réplica)
 # Escuta o canal de origem, atualiza o banco, roda IA e publica no canal réplica.
