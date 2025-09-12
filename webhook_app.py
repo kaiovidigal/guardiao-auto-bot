@@ -42,7 +42,7 @@ if not TG_BOT_TOKEN:
 if not REPL_CHANNEL:
     print("⚠️ Defina REPL_CHANNEL.")
 if not WEBHOOK_TOKEN:
-    print("⚠️ Defina WEBHOOK_TOKEN.")
+    print("⚠️ WEBHOOK_TOKEN.")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
@@ -218,6 +218,17 @@ def suggest_number() -> Tuple[Optional[int], float, int, Dict[int,float]]:
 
     return number, conf, samples, post
 
+# === Novos helpers ===
+def _dyn_thresholds() -> Tuple[float, float]:
+    # hoje usa as constantes; amanhã você pode torná-los dinâmicos (horário, volume, etc)
+    return (CONF_MIN, GAP_MIN)
+
+def _gap_from_post(post: Dict[int, float]) -> float:
+    if not post or len(post) < 2:
+        return 0.0
+    top = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
+    return top[0][1] - top[1][1]
+
 # ========= FastAPI =========
 app = FastAPI(title="Guardião Híbrido (Destravado)", version="1.1.0")
 
@@ -305,35 +316,37 @@ async def webhook(token: str, request: Request):
     # 3) Em "ENTRADA CONFIRMADA", IA dispara (se passar nos mínimos)
     if re.search(r"ENTRADA\s+CONFIRMADA", t, flags=re.I):
         num, conf, samples, post = suggest_number()
-        
-        # Bloco de depuração para quando a IA não disparar
-        if not num:
-            try:
-                # O primeiro bloco de código que você forneceu não define
-                # 'min_conf_dyn' e 'min_gap_dyn'. Para que ele funcione,
-                # a função _dyn_thresholds() precisa ser chamada.
-                # Como essa função não está definida neste arquivo,
-                # usarei as variáveis fixas MIN_SAMPLES, GAP_MIN, CONF_MIN para o log.
-                await tg_broadcast(
-                    f"🧪 conf={conf:.3f} | gap={post[sorted(post.items(), key=lambda kv: kv[1], reverse=True)[0][0]] - post[sorted(post.items(), key=lambda kv: kv[1], reverse=True)[1][0]] if len(post) > 1 else 0.0:.3f} | min_conf={CONF_MIN:.3f} | min_gap={GAP_MIN:.3f} | amostras≈{samples}"
-                )
-            except Exception:
-                pass
-        
-        # Aqui, a IA dispara se 'num' não for None
-        if num:
-            txt = (f"🤖 <b>{SELF_LABEL_IA} [FIRE]</b>\n"
-                    f"🎯 Número seco (G0): <b>{num}</b>\n"
-                    f"📈 Conf: <b>{conf*100:.2f}%</b> | Amostra≈<b>{samples}</b>")
-            await tg_broadcast(txt)
-            return {"ok": True, "fire": num, "conf": conf, "samples": samples}
 
-        # O segundo bloco de código que você forneceu também usa
-        # '_dyn_thresholds()'. Como não está definido, ele causaria um erro.
-        # Ele também faz a mesma coisa que o primeiro bloco, então
-        # podemos remover o segundo bloco para evitar redundância.
-        
-        return {"ok": True, "skipped_low_conf_or_samples": True}
+        if not num:
+            # === LOG curto quando barra por qualidade ===
+            gap = _gap_from_post(post)
+            try:
+                min_conf_dyn, min_gap_dyn = _dyn_thresholds()
+                await tg_broadcast(
+                    f"🧪 conf={conf:.3f} | gap={gap:.3f} | min_conf={min_conf_dyn:.3f} | min_gap={min_gap_dyn:.3f} | amostras≈{samples}"
+                )
+            except:
+                pass
+
+            # Segundo LOG (IA) no mesmo cenário de bloqueio
+            try:
+                mc, mg = _dyn_thresholds()
+                conf_raw = conf    # no seu pipeline, conf_raw ≡ conf
+                tail_len = samples  # e tail_len ≡ samples
+                await tg_broadcast(
+                    f"🧪 IA: conf={conf_raw:.3f} gap={gap:.3f} min_conf={mc:.3f} min_gap={mg:.3f} tail={tail_len}"
+                )
+            except:
+                pass
+
+            return {"ok": True, "skipped_low_conf_or_samples": True}
+
+        # Se passou, FIRE normal
+        txt = (f"🤖 <b>{SELF_LABEL_IA} [FIRE]</b>\n"
+               f"🎯 Número seco (G0): <b>{num}</b>\n"
+               f"📈 Conf: <b>{conf*100:.2f}%</b> | Amostra≈<b>{samples}</b>")
+        await tg_broadcast(txt)
+        return {"ok": True, "fire": num, "conf": conf, "samples": samples}
 
     # Outros textos são ignorados (mas não dão erro)
     return {"ok": True, "ignored": True}
