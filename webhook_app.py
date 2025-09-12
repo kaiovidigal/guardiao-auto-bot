@@ -39,7 +39,7 @@ if not REPL_CHANNEL:
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
-# ========= Hiperparâmetros (iguais ao serviço completo) =========
+# ========= Hiperparâmetros =========
 WINDOW = 400
 DECAY  = 0.985
 W4, W3, W2, W1 = 0.38, 0.30, 0.20, 0.12
@@ -93,7 +93,7 @@ async def tg_broadcast(text: str, parse: str="HTML"):
     if REPL_CHANNEL:
         await tg_send_text(REPL_CHANNEL, text, parse)
 
-# ========= Modelo simples =========
+# ========= Modelo =========
 def get_recent_tail(window: int = WINDOW) -> List[int]:
     rows = _all("SELECT number FROM timeline ORDER BY id DESC LIMIT ?", (window,))
     return [r["number"] for r in rows][::-1]
@@ -159,7 +159,7 @@ def suggest_number() -> Tuple[Optional[int], float, int, Dict[int,float]]:
         return None,0.0,samples,post
     return number, conf, samples, post
 
-# ========= Loop IA (com anti-spam) =========
+# ========= Loop IA =========
 _last_fire_ts = 0
 MIN_SECONDS_BETWEEN_FIRE = 10
 MAX_PER_HOUR = 30
@@ -184,8 +184,8 @@ async def ia_loop_once():
     if (now_ts() - _last_fire_ts) < MIN_SECONDS_BETWEEN_FIRE:
         return
     conf_capped = max(0.0, min(float(conf), CONF_CAP))
-    txt = (f"🤖 <b>{SELF_LABEL_IA} [FIRE]</b>\\n"
-           f"🎯 Número seco (G0): <b>{number}</b>\\n"
+    txt = (f"🤖 <b>{SELF_LABEL_IA} [FIRE]</b>\n"
+           f"🎯 Número seco (G0): <b>{number}</b>\n"
            f"📈 Conf: <b>{conf_capped*100:.2f}%</b> | Amostra≈<b>{samples}</b>")
     await tg_broadcast(txt)
     _last_fire_ts = now_ts()
