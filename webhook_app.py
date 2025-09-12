@@ -67,12 +67,12 @@ async def tg_broadcast(text: str, parse: str="HTML"):
         await tg_send_text(REPL_CHANNEL, text, parse)
 
 # ========= IA =========
-WINDOW = 400
+WINDOW = 40
 DECAY  = 0.985
 W4, W3, W2, W1 = 0.38, 0.30, 0.20, 0.12
 ALPHA, BETA, GAMMA = 1.05, 0.70, 0.40
-MIN_SAMPLES = 100
-GAP_MIN = 0.08
+MIN_SAMPLES = 50
+GAP_MIN = 0.06
 
 def get_recent_tail(window: int = WINDOW) -> List[int]:
     rows = query_all("SELECT number FROM timeline ORDER BY id DESC LIMIT ?", (window,))
