@@ -1,1 +1,1 @@
-web: uvicorn webhook_app:app --host 0.0.0.0 --port $PORT
+web: uvicorn guardiao_hibrido_v2:app --host 0.0.0.0 --port $PORT
