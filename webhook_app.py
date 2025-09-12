@@ -1,61 +1,93 @@
 # -*- coding: utf-8 -*-
-# Fan Tan — Guardião Híbrido (Canal-in + IA-out + Recuperação visível)
-# - Escuta o canal de origem via webhook (não replica o texto do canal).
-# - Atualiza o banco (timeline + ngrams) em tempo real.
-# - IA sugere somente quando há "ENTRADA CONFIRMADA" no canal.
-# - Envia APENAS a mensagem FIRE da IA ao canal réplica:
-#     "🤖 Tiro seco por IA [FIRE]\nEntrar no <N>\nDepois do <X>" (se houver "após X" na origem)
-# - RECUPERAÇÃO visível: se bater em G1/G2, envia "🟢 RECUPERAÇÃO G1/G2 — Número: N"
-# - Latência mínima: processamento é síncrono no webhook (sem fila lenta).
+# IA Worker — Guardião Fan Tan (FIRE-only) + Relatório do Guardião
+# - Publica apenas sinal de IA (sem replicar texto do canal de origem)
+# - Usa o mesmo DB do serviço "canal" para aprender / consultar estatísticas
+# - Envia Relatório do Guardião (manual via /debug/flush e automático em intervalo)
 #
-# ENV necessárias (Render -> Environment):
-#   TG_BOT_TOKEN       -> token do bot que POSTA no canal réplica
-#   REPL_CHANNEL       -> ID do canal réplica (ex: -1002796105884)
-#   WEBHOOK_TOKEN      -> segredo do endpoint (ex: meusegredo123)
-#   DB_PATH            -> caminho no disco persistente (ex: /var/data/data.db/main.sqlite)
-#   MIN_CONF_IA        -> conf mínima p/ FIRE (padrão: 0.30 = 30%)
-#   MIN_SAMPLES        -> amostras mínimas p/ IA liberar FIRE (padrão: 200)
-#   GAP_MIN            -> gap mínimo top1-top2 (padrão: 0.08)
-#   FLUSH_KEY          -> chave simples p/ /debug endpoints (padrão: meusegredo123)
+# ENV necessários (Render):
+#   TG_BOT_TOKEN             -> token do bot que VAI POSTAR no canal réplica
+#   REPL_CHANNEL             -> ID do canal réplica (ex: -1002796105884)
+#   DB_PATH                  -> MESMO caminho do serviço canal (ex: /var/data/data.db/main.sqlite)
+#   INTEL_ANALYZE_INTERVAL   -> (opcional) intervalo de análise da IA em segundos (default: 1)
+#   FLUSH_KEY                -> (opcional) segredo simples para debug/flush (default: meusegredo123)
+#   HEALTH_INTERVAL          -> (opcional) intervalo (s) do relatório automático (default: 1800 -> 30min)
+#   SELF_LABEL_IA            -> (opcional) rótulo do sinal IA (default: "Tiro seco por IA")
 #
-# Procfile (ex):
-#   web: uvicorn guardiao_hibrido:app --host 0.0.0.0 --port $PORT
+# Procfile:
+#   web: uvicorn ia_worker_guardiao:app --host 0.0.0.0 --port $PORT
 #
-import os, re, json, time, sqlite3, asyncio
-from typing import List, Optional, Tuple, Dict
+# requirements.txt (mínimo):
+#   fastapi
+#   uvicorn
+#   httpx
+#
+import os, time, json, sqlite3, asyncio
 from datetime import datetime, timezone
+from typing import List, Optional, Dict, Tuple
 from collections import Counter
 
 import httpx
-from fastapi import FastAPI, Request, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, Query
 
 # ========= ENV =========
-DB_PATH        = os.getenv("DB_PATH", "/var/data/data.db/main.sqlite").strip()
-TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
-REPL_CHANNEL   = os.getenv("REPL_CHANNEL", "").strip()
-WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "meusegredo123").strip()
-SELF_LABEL_IA  = os.getenv("SELF_LABEL_IA", "Tiro seco por IA").strip()
-FLUSH_KEY      = os.getenv("FLUSH_KEY", "meusegredo123").strip()
+DB_PATH = os.getenv("DB_PATH", "/var/data/data.db/main.sqlite").strip()
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
+REPL_CHANNEL = os.getenv("REPL_CHANNEL", "").strip()
+SELF_LABEL_IA = os.getenv("SELF_LABEL_IA", "Tiro seco por IA").strip()
 
-MIN_CONF_IA    = float(os.getenv("MIN_CONF_IA", "0.30"))   # 30%
-MIN_SAMPLES    = int(os.getenv("MIN_SAMPLES", "200"))
-GAP_MIN        = float(os.getenv("GAP_MIN", "0.08"))
+INTEL_ANALYZE_INTERVAL = float(os.getenv("INTEL_ANALYZE_INTERVAL", "1"))
+FLUSH_KEY = os.getenv("FLUSH_KEY", "meusegredo123").strip()
+HEALTH_INTERVAL = float(os.getenv("HEALTH_INTERVAL", "1800"))  # 30 min
 
-if not TG_BOT_TOKEN:  print("⚠️ Defina TG_BOT_TOKEN.")
-if not REPL_CHANNEL:  print("⚠️ Defina REPL_CHANNEL.")
-if not WEBHOOK_TOKEN: print("⚠️ Defina WEBHOOK_TOKEN.")
+if not TG_BOT_TOKEN:
+    print("⚠️ Defina TG_BOT_TOKEN.")
+if not REPL_CHANNEL:
+    print("⚠️ Defina REPL_CHANNEL (ID do canal réplica).")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
-# ========= Modelo IA (n-grams + cauda 40) =========
+# ========= Hiperparâmetros de IA =========
 WINDOW = 400
 DECAY  = 0.985
 W4, W3, W2, W1 = 0.38, 0.30, 0.20, 0.12
-ALPHA, BETA, GAMMA = 1.05, 0.70, 0.40  # BETA/GAMMA reservados p/ futuro
+ALPHA, BETA, GAMMA = 1.05, 0.70, 0.40
+
+# Destravamento por confiança (pedido: mínimo 30%)
+MIN_CONF_FIRE = 0.30
+MIN_SAMPLES = 1000
+GAP_MIN = 0.04
 CONF_CAP = 0.999
 
-# ========= DB =========
+# Antispam baixo delay para envio imediato
+MIN_SECONDS_BETWEEN_FIRE = 5
+MAX_PER_HOUR = 40
+
+# ========= Estado IA/telemetry =========
+def now_ts() -> int: 
+    return int(time.time())
+
+_ia_last_reason: str = "—"
+_ia_last_reason_ts: int = 0
+
+def _mark_reason(txt: str):
+    global _ia_last_reason, _ia_last_reason_ts
+    _ia_last_reason = txt
+    _ia_last_reason_ts = now_ts()
+
+_last_fire_ts = 0
+_sent_this_hour = 0
+_hour_bucket = None
+
+def _hour_key() -> int:
+    return int(datetime.now(timezone.utc).strftime("%Y%m%d%H"))
+
+def _reset_hour():
+    global _sent_this_hour, _hour_bucket
+    hb = _hour_key()
+    if _hour_bucket != hb:
+        _sent_this_hour = 0
+
+# ========= DB helpers (somente leitura/consulta rápida) =========
 def _connect() -> sqlite3.Connection:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     con = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30.0)
@@ -64,85 +96,47 @@ def _connect() -> sqlite3.Connection:
     con.execute("PRAGMA synchronous=NORMAL;")
     return con
 
-def exec_write(sql: str, params: tuple = ()):
-    con = _connect()
-    con.execute(sql, params)
-    con.commit()
-    con.close()
+def _get(sql: str, params: tuple=()) -> Optional[sqlite3.Row]:
+    con=_connect()
+    try:
+        return con.execute(sql, params).fetchone()
+    finally:
+        con.close()
 
-def query_all(sql: str, params: tuple = ()) -> list:
-    con = _connect()
-    rows = con.execute(sql, params).fetchall()
-    con.close()
-    return rows
+def _all(sql: str, params: tuple=()) -> list:
+    con=_connect()
+    try:
+        return con.execute(sql, params).fetchall()
+    finally:
+        con.close()
 
-def query_one(sql: str, params: tuple = ()) -> Optional[sqlite3.Row]:
-    con = _connect()
-    row = con.execute(sql, params).fetchone()
-    con.close()
-    return row
+# ========= Telegram =========
+async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
+    if not TG_BOT_TOKEN or not chat_id: 
+        return
+    async with httpx.AsyncClient(timeout=15) as client:
+        await client.post(
+            f"{TELEGRAM_API}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": parse, "disable_web_page_preview": True},
+        )
 
-def init_db():
-    con = _connect()
-    cur = con.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS timeline (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        created_at INTEGER NOT NULL,
-        number INTEGER NOT NULL
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS ngram_stats (
-        n INTEGER NOT NULL, ctx TEXT NOT NULL, next INTEGER NOT NULL, weight REAL NOT NULL,
-        PRIMARY KEY (n, ctx, next)
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS pending_outcome (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        created_at INTEGER NOT NULL,
-        suggested INTEGER NOT NULL,
-        stage INTEGER NOT NULL,         -- 0=G0,1=G1,2=G2
-        window_left INTEGER NOT NULL,   -- quantos estágios restam (incluindo o atual)
-        after_num INTEGER,              -- se houver "após X" na origem
-        open INTEGER NOT NULL DEFAULT 1
-    )""")
-    con.commit()
-    con.close()
+async def tg_broadcast(text: str, parse: str="HTML"):
+    if REPL_CHANNEL:
+        await tg_send_text(REPL_CHANNEL, text, parse)
 
-init_db()
-
-def now_ts() -> int:
-    return int(time.time())
-
-def append_timeline(n: int):
-    exec_write("INSERT INTO timeline (created_at, number) VALUES (?,?)", (now_ts(), int(n)))
-
+# ========= Modelo (n-gramas) =========
 def get_recent_tail(window: int = WINDOW) -> List[int]:
-    rows = query_all("SELECT number FROM timeline ORDER BY id DESC LIMIT ?", (window,))
+    rows = _all("SELECT number FROM timeline ORDER BY id DESC LIMIT ?", (window,))
     return [r["number"] for r in rows][::-1]
-
-def update_ngrams(decay: float = DECAY, max_n: int = 5, window: int = WINDOW):
-    tail = get_recent_tail(window)
-    if len(tail) < 2: return
-    for t in range(1, len(tail)):
-        nxt  = tail[t]
-        dist = (len(tail)-1) - t
-        w = (decay ** dist)
-        for n in range(2, max_n+1):
-            if t-(n-1) < 0: break
-            ctx = tail[t-(n-1):t]
-            ctx_key = ",".join(str(x) for x in ctx)
-            exec_write("""
-                INSERT INTO ngram_stats (n, ctx, next, weight)
-                VALUES (?,?,?,?)
-                ON CONFLICT(n, ctx, next) DO UPDATE SET weight = weight + excluded.weight
-            """, (n, ctx_key, int(nxt), float(w)))
 
 def prob_from_ngrams(ctx: List[int], candidate: int) -> float:
     n = len(ctx) + 1
     if n < 2 or n > 5: return 0.0
     ctx_key = ",".join(str(x) for x in ctx)
-    row = query_one("SELECT SUM(weight) AS w FROM ngram_stats WHERE n=? AND ctx=?", (n, ctx_key))
+    row = _get("SELECT SUM(weight) AS w FROM ngram_stats WHERE n=? AND ctx=?", (n, ctx_key))
     tot = (row["w"] or 0.0) if row else 0.0
     if tot <= 0: return 0.0
-    row2 = query_one("SELECT weight FROM ngram_stats WHERE n=? AND ctx=? AND next=?", (n, ctx_key, candidate))
+    row2 = _get("SELECT weight FROM ngram_stats WHERE n=? AND ctx=? AND next=?", (n, ctx_key, candidate))
     w = (row2["weight"] or 0.0) if row2 else 0.0
     return w / tot
 
@@ -161,14 +155,27 @@ def ngram_backoff_score(tail: List[int], candidate: int) -> float:
 
 def tail_top2_boost(tail: List[int], k:int=40) -> Dict[int, float]:
     boosts={1:1.00, 2:1.00, 3:1.00, 4:1.00}
-    if not tail: return boosts
+    if not tail:
+        return boosts
     c = Counter(tail[-k:] if len(tail)>=k else tail[:])
     freq = c.most_common()
     if len(freq)>=1: boosts[freq[0][0]]=1.04
     if len(freq)>=2: boosts[freq[1][0]]=1.02
     return boosts
 
-def suggest_number() -> Tuple[Optional[int], float, int, Dict[int,float]]:
+def _after_hint_from_tail(tail: List[int], best:int) -> int:
+    """Heurística simples: usa o número mais frequente na cauda (40) diferente de 'best'.
+       Se não houver, usa o último número observado."""
+    if not tail:
+        return 1
+    last40 = tail[-40:] if len(tail)>=40 else tail[:]
+    c = Counter(last40)
+    for num,_ in c.most_common():
+        if num != best:
+            return num
+    return tail[-1]
+
+def suggest_number() -> Tuple[Optional[int], float, int, Dict[int,float], Optional[int]]:
     base=[1,2,3,4]
     tail = get_recent_tail(WINDOW)
     boosts = tail_top2_boost(tail, k=40)
@@ -182,236 +189,203 @@ def suggest_number() -> Tuple[Optional[int], float, int, Dict[int,float]]:
     post={k:v/total for k,v in scores.items()}
     a=sorted(post.items(), key=lambda kv: kv[1], reverse=True)
     if not a:
-        return None,0.0,len(tail),post
+        _mark_reason("sem_posterior")
+        return None,0.0,len(tail),post,None
     gap = (a[0][1] - (a[1][1] if len(a)>1 else 0.0))
     number = a[0][0] if gap >= GAP_MIN else None
     conf = post.get(number,0.0) if number is not None else 0.0
-    # amostras ~= soma de pesos
-    row = query_one("SELECT SUM(weight) AS s FROM ngram_stats")
+
+    row = _get("SELECT SUM(weight) AS s FROM ngram_stats")
     samples = int((row["s"] or 0) if row else 0)
+
     if samples < MIN_SAMPLES:
-        return None,0.0,samples,post
-    # limiar de confiança
-    if number is None or conf < MIN_CONF_IA:
-        return None,0.0,samples,post
-    return number, conf, samples, post
+        _mark_reason(f"amostra_insuficiente({samples}<{MIN_SAMPLES})")
+        return None,0.0,samples,post,None
 
-# ========= Telegram =========
-async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
-    if not TG_BOT_TOKEN or not chat_id:
+    if number is None or conf < MIN_CONF_FIRE:
+        _mark_reason(f"reprovado(conf={conf:.3f}, gap={gap:.3f})")
+        return None,conf,samples,post,None
+
+    after_hint = _after_hint_from_tail(tail, number)
+    _mark_reason(f"FIRE(best={number}, conf={conf:.3f}, gap={gap:.3f}, tail={len(tail)})")
+    return number, conf, samples, post, after_hint
+
+# ========= Relatório do Guardião =========
+def _get_scalar(sql:str, params:tuple=(), default:int|float=0):
+    try:
+        row = _get(sql, params)
+        if not row: return default
+        try:
+            return row[0] if row[0] is not None else default
+        except Exception:
+            keys = row.keys()
+            return row[keys[0]] if keys and row[keys[0]] is not None else default
+    except Exception:
+        return default
+
+def today_key() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d")
+
+def _daily_score_snapshot():
+    y = today_key()
+    try:
+        row = _get("SELECT g0,g1,g2,loss,streak FROM daily_score WHERE yyyymmdd=?", (y,))
+        if not row: return 0,0,0,0,0.0
+        g0 = row["g0"] or 0
+        loss = row["loss"] or 0
+        streak = row["streak"] or 0
+        total = g0 + loss
+        acc = (g0/total*100.0) if total else 0.0
+        return g0, loss, streak, total, acc
+    except Exception:
+        return 0,0,0,0,0.0
+
+def _daily_score_snapshot_ia():
+    y = today_key()
+    try:
+        row = _get("SELECT g0,loss,streak FROM daily_score_ia WHERE yyyymmdd=?", (y,))
+        g0 = row["g0"] if row else 0
+        loss = row["loss"] if row else 0
+        total = g0 + loss
+        acc = (g0/total*100.0) if total else 0.0
+        return g0, loss, total, acc
+    except Exception:
+        return 0,0,0,0.0
+
+def _ia_acc_days(days:int=7) -> Tuple[int,int,float]:
+    days = max(1, min(int(days), 30))
+    try:
+        rows = _all("SELECT g0, loss FROM daily_score_ia ORDER BY yyyymmdd DESC LIMIT ?", (days,))
+        g = sum((r["g0"] or 0) for r in rows)
+        l = sum((r["loss"] or 0) for r in rows)
+        acc = (g/(g+l)) if (g+l)>0 else 0.0
+        return int(g), int(l), float(acc)
+    except Exception:
+        return 0,0,0.0
+
+def _health_text() -> str:
+    timeline_cnt   = _get_scalar("SELECT COUNT(*) FROM timeline")
+    ngram_rows     = _get_scalar("SELECT COUNT(*) FROM ngram_stats")
+    ngram_samples  = _get_scalar("SELECT SUM(weight) FROM ngram_stats")
+    pat_rows       = _get_scalar("SELECT COUNT(*) FROM stats_pattern")
+    pat_events     = _get_scalar("SELECT SUM(wins+losses) FROM stats_pattern")
+    strat_rows     = _get_scalar("SELECT COUNT(*) FROM stats_strategy")
+    strat_events   = _get_scalar("SELECT SUM(wins+losses) FROM stats_strategy")
+    pend_open      = _get_scalar("SELECT COUNT(*) FROM pending_outcome WHERE open=1")
+
+    g0, loss, streak, total, acc = _daily_score_snapshot()
+    ia_g0, ia_loss, ia_total, ia_acc = _daily_score_snapshot_ia()
+
+    age = max(0, now_ts() - (_ia_last_reason_ts or now_ts()))
+    last_reason_line = f"🤖 Motivo último NÃO-FIRE/FIRE: {_ia_last_reason} (há {age}s)"
+
+    g7, l7, acc7 = _ia_acc_days(7)
+
+    return (
+        "🩺 <b>Saúde do Guardião</b>\n"
+        f"⏱️ UTC: <code>{datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()}</code>\n"
+        "—\n"
+        f"🗄️ timeline: <b>{timeline_cnt}</b>\n"
+        f"📚 ngram_stats: <b>{ngram_rows}</b> | amostras≈<b>{int(ngram_samples or 0)}</b>\n"
+        f"🧩 stats_pattern: chaves=<b>{pat_rows}</b> | eventos=<b>{int(pat_events or 0)}</b>\n"
+        f"🧠 stats_strategy: chaves=<b>{strat_rows}</b> | eventos=<b>{int(strat_events or 0)}</b>\n"
+        f"⏳ pendências abertas: <b>{pend_open}</b>\n"
+        "—\n"
+        f"📊 Placar (hoje - G0 only): G0=<b>{g0}</b> | Loss=<b>{loss}</b> | Total=<b>{total}</b>\n"
+        f"✅ Acerto: {acc:.2f}% | 🔥 Streak: <b>{streak}</b>\n"
+        "—\n"
+        f"🤖 IA G0=<b>{ia_g0}</b> | Loss=<b>{ia_loss}</b> | Total=<b>{ia_total}</b>\n"
+        f"✅ IA Acerto (dia): {ia_acc:.2f}%\n"
+        f"{last_reason_line}\n"
+        f"🧮 IA 7d: {(g7+l7)} ops • {acc7*100:.2f}%\n"
+    )
+
+# ========= Loop IA =========
+async def ia_loop_once():
+    global _last_fire_ts, _sent_this_hour
+    number, conf, samples, post, after_hint = suggest_number()
+    if not number:
         return
-    async with httpx.AsyncClient(timeout=15) as client:
-        await client.post(
-            f"{TELEGRAM_API}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "parse_mode": parse, "disable_web_page_preview": True},
-        )
 
-async def tg_broadcast(text: str, parse: str="HTML"):
-    if REPL_CHANNEL:
-        await tg_send_text(REPL_CHANNEL, text, parse)
-
-# ========= Pendências (G0 + G1/G2 visíveis ao recuperar) =========
-def open_pending(suggested:int, after_num: Optional[int]):
-    exec_write("""
-        INSERT INTO pending_outcome (created_at, suggested, stage, window_left, after_num, open)
-        VALUES (?,?,?,?,?,1)
-    """, (now_ts(), int(suggested), 0, 3, (int(after_num) if after_num else None)))
-
-async def close_pending_with_observed(n_observed: int):
-    # busca a mais antiga pendência aberta
-    rows = query_all("SELECT id, suggested, stage, window_left, after_num FROM pending_outcome WHERE open=1 ORDER BY id ASC LIMIT 1")
-    if not rows:
+    # antispam leve (prioridade: rapidez)
+    _reset_hour()
+    if _sent_this_hour >= MAX_PER_HOUR:
+        _mark_reason("limite_hora")
         return
-    r = rows[0]
-    pid, sug, stage, left, after_num = int(r["id"]), int(r["suggested"]), int(r["stage"]), int(r["window_left"]), r["after_num"]
-    if int(n_observed) == sug:
-        # GREEN (se stage>0 => recuperação visível)
-        if stage == 0:
-            # green direto
-            pass
-        else:
-            lab = "G1" if stage==1 else "G2"
-            await tg_broadcast(f"🟢 <b>RECUPERAÇÃO {lab}</b> — Número: <b>{sug}</b>")
-        exec_write("UPDATE pending_outcome SET open=0, window_left=0 WHERE id=?", (pid,))
-    else:
-        # não bateu
-        if left > 1:
-            exec_write("UPDATE pending_outcome SET stage=stage+1, window_left=window_left-1 WHERE id=?", (pid,))
-        else:
-            # esgotou G2
-            exec_write("UPDATE pending_outcome SET open=0, window_left=0 WHERE id=?", (pid,))
+    if (now_ts() - _last_fire_ts) < MIN_SECONDS_BETWEEN_FIRE:
+        _mark_reason("espacamento_minimo")
+        return
 
-# ========= Parsers do canal =========
-def is_analise(text:str) -> bool:
-    return bool(re.search(r"\bANALISANDO\b", text, flags=re.I))
-
-def extract_seq_raw(text: str) -> Optional[str]:
-    m = re.search(r"Sequ[eê]ncia:\s*([^\n\r]+)", text, flags=re.I)
-    return m.group(1).strip() if m else None
-
-def extract_green_number(text: str) -> Optional[int]:
-    pats = [
-        re.compile(r"APOSTA\s+ENCERRADA.*?\bGREEN\b.*?\(([1-4])\)", re.I|re.S),
-        re.compile(r"\bGREEN\b.*?N[uú]mero[:\s]*([1-4])", re.I|re.S),
-        re.compile(r"\bGREEN\b.*?\(([1-4])\)", re.I|re.S),
-    ]
-    t = re.sub(r"\s+"," ", text)
-    for rx in pats:
-        m = rx.search(t)
-        if m:
-            return int(m.group(1))
-    return None
-
-def extract_red_last_left(text: str) -> Optional[int]:
-    pats = [
-        re.compile(r"APOSTA\s+ENCERRADA.*?\bRED\b.*?\(([^\)]+)\)", re.I|re.S),
-        re.compile(r"\bLOSS\b.*?N[uú]mero[:\s]*([1-4])", re.I|re.S),
-        re.compile(r"\bRED\b.*?\(([1-4])\)", re.I|re.S),
-    ]
-    t = re.sub(r"\s+"," ", text)
-    for rx in pats:
-        m = rx.search(t)
-        if m:
-            nums = re.findall(r"[1-4]", m.group(1))
-            if nums: return int(nums[0])
-    return None
-
-def extract_after_num(text: str) -> Optional[int]:
-    m = re.search(r"Entrar\s+ap[oó]s\s+o\s+([1-4])", text, flags=re.I)
-    return int(m.group(1)) if m else None
-
-def is_real_entry(text: str) -> bool:
-    # sinal do canal que abre janela (não será replicado; só gatilha IA)
-    must = (r"ENTRADA\s+CONFIRMADA", r"Mesa:\s*Fantan\s*-\s*Evolution")
-    must_not = (r"\bANALISANDO\b", r"\bPlacar do dia\b", r"\bAPOSTA ENCERRADA\b")
-    t = re.sub(r"\s+"," ", text).strip()
-    for bad in must_not:
-        if re.search(bad, t, flags=re.I): return False
-    for good in must:
-        if not re.search(good, t, flags=re.I): return False
-    return True
+    conf_capped = max(0.0, min(float(conf), CONF_CAP))
+    # Mensagem no formato pedido
+    txt = (
+        f"🤖 <b>{SELF_LABEL_IA} [FIRE]</b>\n"
+        f"🎯 <b>Entrar no {number}</b>\n"
+        f"➡️ <i>Depois do {after_hint}</i>\n"
+        f"📈 Conf: <b>{conf_capped*100:.2f}%</b> | Amostra≈<b>{samples}</b>"
+    )
+    await tg_broadcast(txt)
+    _last_fire_ts = now_ts()
+    _sent_this_hour += 1
 
 # ========= FastAPI =========
-class Update(BaseModel):
-    update_id: int
-    channel_post: Optional[dict] = None
-    message: Optional[dict] = None
-    edited_channel_post: Optional[dict] = None
-    edited_message: Optional[dict] = None
-
-app = FastAPI(title="Guardião Híbrido — IA-only Out", version="2.1.0")
+app = FastAPI(title="IA Worker — Guardião", version="1.2.0")
 
 @app.get("/")
 async def root():
-    row = query_one("SELECT COUNT(*) AS c FROM timeline")
-    timeline_cnt = int(row["c"] or 0) if row else 0
-    row2 = query_one("SELECT SUM(weight) AS s FROM ngram_stats")
-    samples = int((row2["s"] or 0) if row2 else 0)
-    return {"ok": True, "timeline": timeline_cnt, "samples": samples, "min_conf": MIN_CONF_IA}
+    row = _get("SELECT SUM(weight) AS s FROM ngram_stats")
+    samples = int((row["s"] or 0) if row else 0)
+    return {"ok": True, "samples": samples, "enough_samples": samples >= MIN_SAMPLES}
 
-@app.post("/webhook/{token}")
-async def webhook(token: str, request: Request):
-    if token != WEBHOOK_TOKEN:
-        raise HTTPException(status_code=403, detail="Forbidden")
+@app.on_event("startup")
+async def _boot():
+    # Loop IA
+    async def _loop():
+        while True:
+            try:
+                await ia_loop_once()
+            except Exception as e:
+                print("[IA] erro:", e)
+            await asyncio.sleep(max(0.2, INTEL_ANALYZE_INTERVAL))
+    asyncio.create_task(_loop())
 
-    data = await request.json()
-    upd = Update(**data)
-    msg = upd.channel_post or upd.message or upd.edited_channel_post or upd.edited_message
-    if not msg:
-        return {"ok": True}
+    # Relatório automático
+    async def _health_loop():
+        while True:
+            try:
+                await tg_broadcast(_health_text())
+            except Exception as e:
+                print("[HEALTH] erro ao enviar relatório:", e)
+            await asyncio.sleep(max(60.0, HEALTH_INTERVAL))
+    asyncio.create_task(_health_loop())
 
-    text = (msg.get("text") or msg.get("caption") or "").strip()
-
-    # 0) ANALISANDO -> só alimentar timeline (cauda) rápido
-    if is_analise(text):
-        seq_raw = extract_seq_raw(text)
-        if seq_raw:
-            parts = re.findall(r"[1-4]", seq_raw)
-            # vêm "da esquerda recente": jogar em ordem correta (antigo->novo)
-            seq_old_to_new = [int(x) for x in parts][::-1]
-            for n in seq_old_to_new:
-                append_timeline(n)
-            update_ngrams()
-        return {"ok": True, "analise": True}
-
-    # 1) GREEN/RED do canal -> fechar/avançar pendências + timeline
-    gnum = extract_green_number(text)
-    rnum = extract_red_last_left(text)
-    if gnum is not None or rnum is not None:
-        observed = gnum if gnum is not None else rnum
-        append_timeline(int(observed))
-        update_ngrams()
-        await close_pending_with_observed(int(observed))
-        return {"ok": True, "observed": int(observed)}
-
-    # 2) ENTRADA CONFIRMADA -> rodar IA e ENVIAR só FIRE (sem replicar texto do canal)
-    if is_real_entry(text):
-        after_num = extract_after_num(text)
-
-        num, conf, samples, post = suggest_number()
-        if num is None:
-            return {"ok": True, "skipped": "low_conf_or_samples", "samples": samples}
-
-        conf_capped = max(0.0, min(float(conf), CONF_CAP))
-        if after_num:
-            txt = (f"🤖 <b>{SELF_LABEL_IA} [FIRE]</b>\n"
-                   f"🎯 Entrar no <b>{num}</b>\n"
-                   f"↪️ Depois do <b>{after_num}</b>\n"
-                   f"📈 Conf: <b>{conf_capped*100:.2f}%</b> | Amostra≈<b>{samples}</b>")
-        else:
-            txt = (f"🤖 <b>{SELF_LABEL_IA} [FIRE]</b>\n"
-                   f"🎯 Entrar no <b>{num}</b>\n"
-                   f"📈 Conf: <b>{conf_capped*100:.2f}%</b> | Amostra≈<b>{samples}</b>")
-
-        # enviar já (latência mínima)
-        await tg_broadcast(txt)
-
-        # abrir pendência (G0->G1->G2)
-        open_pending(int(num), after_num)
-
-        return {"ok": True, "fire": int(num), "conf": conf_capped, "samples": samples}
-
-    # 3) Demais mensagens do canal: ignorar (mas sem travar o fluxo)
-    return {"ok": True, "ignored": True}
-
-# ========= Debug / Saúde =========
-def _fmt_bytes(n: int) -> str:
-    try:
-        n = float(n)
-    except Exception:
-        return "—"
-    for unit in ["B","KB","MB","GB","TB","PB"]:
-        if n < 1024.0:
-            return f"{n:.1f} {unit}"
-        n /= 1024.0
-    return f"{n:.1f} EB"
-
-@app.get("/debug/health")
-async def debug_health(key: str = ""):
-    if not key or key != FLUSH_KEY:
-        return {"ok": False, "error": "unauthorized"}
-    try:
-        row_t = query_one("SELECT COUNT(*) AS c FROM timeline")
-        row_n = query_one("SELECT COUNT(*) AS r, SUM(weight) AS s FROM ngram_stats")
-        row_p = query_one("SELECT COUNT(*) AS o FROM pending_outcome WHERE open=1")
-        return {
-            "ok": True,
-            "timeline": int(row_t["c"] or 0),
-            "ngrams_rows": int(row_n["r"] or 0),
-            "ngrams_samples": int(row_n["s"] or 0),
-            "pending_open": int(row_p["o"] or 0),
-            "min_conf": MIN_CONF_IA,
-            "min_samples": MIN_SAMPLES,
-        }
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
+# --- Debug endpoints ---
 @app.get("/debug/ping")
-async def debug_ping(key: str = ""):
+async def debug_ping(key: str = Query(default="")):
     if not key or key != FLUSH_KEY:
         return {"ok": False, "error": "unauthorized"}
     try:
         await tg_broadcast("🔔 Ping de teste: o bot está conseguindo postar no canal.")
         return {"ok": True, "sent": True, "channel": REPL_CHANNEL}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.get("/debug/say")
+async def debug_say(text: str, key: str = Query(default="")):
+    if not key or key != FLUSH_KEY:
+        return {"ok": False, "error": "unauthorized"}
+    try:
+        await tg_broadcast(text)
+        return {"ok": True, "sent": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.get("/debug/flush")
+async def debug_flush(key: str = Query(default="")):
+    if not key or key != FLUSH_KEY:
+        return {"ok": False, "error": "unauthorized"}
+    try:
+        await tg_broadcast(_health_text())
+        return {"ok": True, "flushed": True}
     except Exception as e:
         return {"ok": False, "error": str(e)}
