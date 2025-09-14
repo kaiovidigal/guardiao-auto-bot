@@ -53,7 +53,7 @@ if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
 # ========= App =========
-app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="2.1.0")
+app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="2.2.0")
 
 # ========= Utils =========
 def now_ts() -> int:
@@ -264,6 +264,31 @@ GALE2_RX = re.compile(r"Estamos\s+no\s*2[ºo]\s*gale", re.I)
 GREEN_RX = re.compile(r"(green|✅|win)", re.I)
 LOSS_RX  = re.compile(r"(loss|perdemos|❌)", re.I)
 
+# ==== EXTRA: extrair número do resultado no texto do canal-fonte ====
+GREEN_NUM_RXS = [
+    re.compile(r"\bGREEN\b.*?\(([1-4])\)", re.I | re.S),
+    re.compile(r"✅.*?\(([1-4])\)", re.I | re.S),
+    re.compile(r"\bwin\b.*?\(([1-4])\)", re.I | re.S),
+    re.compile(r"n[uú]mero\s*[:\-]?\s*([1-4])", re.I),
+]
+LOSS_NUM_RXS = [
+    re.compile(r"\bLOSS\b.*?\(([1-4])\)", re.I | re.S),
+    re.compile(r"❌.*?\(([1-4])\)", re.I | re.S),
+    re.compile(r"n[uú]mero\s*[:\-]?\s*([1-4])", re.I),
+]
+
+def extract_result_number(text: str, is_green: bool) -> Optional[int]:
+    t = re.sub(r"\s+", " ", text)
+    rxs = GREEN_NUM_RXS if is_green else LOSS_NUM_RXS
+    for rx in rxs:
+        m = rx.search(t)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                pass
+    return None
+
 def parse_entry_text(text: str) -> Optional[Dict]:
     t = re.sub(r"\s+", " ", text).strip()
     if not ENTRY_RX.search(t):
@@ -355,24 +380,43 @@ async def webhook(token: str, request: Request):
         pend = get_open_pending()
         if pend:
             stage_lbl = _stage_label(pend["stage"])
-            close_pending("GREEN")
-            bump_score("GREEN")
-            await tg_send_text(
-                TARGET_CHANNEL,
-                f"🟢 <b>GREEN</b> — finalizado (<b>{stage_lbl}</b>).\n"
-                f"📊 Geral: {score_text()}"
-            )
+            sug = int(pend["suggested"] or 0)
+            got = extract_result_number(text, is_green=True)
+            if got is not None and got != sug:
+                # Fonte disse GREEN mas número != sugerido -> trata como LOSS por conferência
+                close_pending("LOSS")
+                bump_score("LOSS")
+                await tg_send_text(
+                    TARGET_CHANNEL,
+                    f"🔴 <b>LOSS</b> — finalizado (<b>{stage_lbl}</b>). "
+                    f"Número do fonte: <b>{got}</b> ≠ sugerido: <b>{sug}</b>\n"
+                    f"📊 Geral: {score_text()}"
+                )
+            else:
+                # GREEN coerente (ou sem número para conferir)
+                close_pending("GREEN")
+                bump_score("GREEN")
+                num_txt = f" Número: <b>{got}</b>." if got is not None else ""
+                await tg_send_text(
+                    TARGET_CHANNEL,
+                    f"🟢 <b>GREEN</b> — finalizado (<b>{stage_lbl}</b>).{num_txt}\n"
+                    f"📊 Geral: {score_text()}"
+                )
         return {"ok": True, "closed": "green"}
 
     if LOSS_RX.search(text):
         pend = get_open_pending()
         if pend:
             stage_lbl = _stage_label(pend["stage"])
+            sug = int(pend["suggested"] or 0)
+            got = extract_result_number(text, is_green=False)
             close_pending("LOSS")
             bump_score("LOSS")
+            num_txt = f" Número: <b>{got}</b>." if got is not None else ""
+            sug_txt = f" (sugerido: <b>{sug}</b>)" if got is not None else ""
             await tg_send_text(
                 TARGET_CHANNEL,
-                f"🔴 <b>LOSS</b> — finalizado (<b>{stage_lbl}</b>).\n"
+                f"🔴 <b>LOSS</b> — finalizado (<b>{stage_lbl}</b>).{num_txt}{sug_txt}\n"
                 f"📊 Geral: {score_text()}"
             )
         return {"ok": True, "closed": "loss"}
