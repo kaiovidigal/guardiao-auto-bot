@@ -53,7 +53,7 @@ if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
 # ========= App =========
-app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="2.3.0")
+app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="2.3.1")
 
 # ========= Parâmetros de qualidade =========
 DECAY = 0.980
@@ -227,6 +227,56 @@ def _prob_from_ngrams(ctx: List[int], cand: int) -> float:
     con.close()
     return w / tot
 
+# ======== boosts/tie/temperatura (NÃO mudam estrutura) ========
+def _sharpen(post: Dict[int,float], tau: float=0.75) -> Dict[int,float]:
+    raw = {k: (v**(1.0/max(1e-6, tau))) for k,v in post.items()}
+    s = sum(raw.values()) or 1e-9
+    return {k: v/s for k,v in raw.items()}
+
+def _rare_rising_boost(tail: List[int], post: Dict[int,float]) -> Dict[int,float]:
+    if not tail: return post
+    long = tail[-200:] if len(tail)>=200 else tail
+    short= tail[-40:]  if len(tail)>=40  else tail
+    from collections import Counter
+    cL, cS = Counter(long), Counter(short)
+    m = {}
+    for n,p in post.items():
+        rateL = (cL[n]/max(1,len(long)))
+        rateS = (cS[n]/max(1,len(short)))
+        boost = 1.03 if (rateS > rateL*1.25 and rateS < 0.40) else 1.0
+        m[n] = p*boost
+    s = sum(m.values()) or 1e-9
+    return {k: v/s for k,v in m.items()}
+
+def _time_bucket_bias(post: Dict[int,float]) -> Dict[int,float]:
+    bucket = int(datetime.now(timezone.utc).minute >= 30)
+    bias = {1:1.00, 2:(1.01 if bucket==0 else 0.995), 3:1.00, 4:(1.01 if bucket==1 else 0.995)}
+    m = {k: post[k]*bias.get(k,1.0) for k in post}
+    s = sum(m.values()) or 1e-9
+    return {k: v/s for k,v in m.items()}
+
+def _after_laplace_boost(tail: List[int], after: Optional[int], post: Dict[int,float]) -> Dict[int,float]:
+    if after is None or after not in tail: return post
+    pairs = sum(1 for i in range(len(tail)-1) if tail[i]==after)
+    from collections import Counter
+    c = Counter(tail[i+1] for i in range(len(tail)-1) if tail[i]==after)
+    m={}
+    for k,p in post.items():
+        lap = (c.get(k,0)+1.0)/(pairs+4.0) if pairs>0 else 0.25
+        boost = 1.0 + min(0.03, max(0.0, (lap-0.25)*0.20))
+        m[k]=p*boost
+    s=sum(m.values()) or 1e-9
+    return {k:v/s for k,v in m.items()}
+
+def _anti_runlen(tail: List[int], post: Dict[int,float]) -> Dict[int,float]:
+    last = tail[-10:] if len(tail)>=10 else tail
+    from collections import Counter
+    c = Counter(last)
+    m={k:(v*(0.95 if c.get(k,0)>=3 else 1.0)) for k,v in post.items()}
+    s=sum(m.values()) or 1e-9
+    return {k:v/s for k,v in m.items()}
+
+# ========= posterior bruto =========
 def _post_from_tail(tail: List[int], after: Optional[int]) -> Dict[int, float]:
     cands = [1,2,3,4]
     scores = {c: 0.0 for c in cands}
@@ -258,7 +308,8 @@ def _post_from_tail(tail: List[int], after: Optional[int]) -> Dict[int, float]:
 def choose_single_number(after: Optional[int]) -> Tuple[int, float, int, Dict[int,float]]:
     tail = get_tail(400)
     post = _post_from_tail(tail, after)
-    # empate técnico → fallback leve por frequência nos últimos 50
+
+    # Empate técnico → fallback leve por frequência (como já estava)
     top2 = sorted(post.items(), key=lambda kv: kv[1], reverse=True)[:2]
     if len(top2) == 2 and (top2[0][1] - top2[1][1]) < GAP_SOFT:
         last = tail[-50:] if len(tail) >= 50 else tail
@@ -267,6 +318,21 @@ def choose_single_number(after: Optional[int]) -> Tuple[int, float, int, Dict[in
             best = sorted([1,2,3,4], key=lambda x: (freq.get(x,0), x))[0]
             conf = 0.50
             return best, conf, len(tail), post
+
+    # >>>>>>> melhorias de qualidade (não mudam estrutura) <<<<<<<
+    post = _rare_rising_boost(tail, post)
+    post = _after_laplace_boost(tail, after, post)
+    post = _anti_runlen(tail, post)
+
+    # Desempate por meia-hora se top1~top2 < 0.02
+    top = sorted(post.items(), key=lambda x: x[1], reverse=True)
+    if len(top)>=2 and (top[0][1]-top[1][1])<0.02:
+        post = _time_bucket_bias(post)
+
+    # Temperaturas (duas afiadas leves)
+    post = _sharpen(post, tau=0.75)
+    post = _sharpen(post, tau=0.90)
+
     best = max(post.items(), key=lambda kv: kv[1])[0]
     conf = float(post[best])
     return best, conf, len(tail), post
@@ -455,7 +521,7 @@ async def webhook(token: str, request: Request):
         return {"ok": True, "noted": "g2"}
 
     # 2) Fechamentos do fonte: GREEN/LOSS + números (quando houver)
-    if GREEN_RX.search(text) or LOSS_RX.search(text):
+    if re.search(r"(GREEN|WIN|✅|LOSS|RED|❌|perdemos)", text, re.I):
         pend = get_open_pending()
         if pend:
             nums = parse_close_numbers(text)  # [n1, n2, n3]? às vezes vem só 1-2
