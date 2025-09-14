@@ -7,6 +7,15 @@ FastAPI + Telegram webhook para refletir sinais do canal-fonte e publicar
 um "número seco" (modo GEN = sem restrição de paridade/tamanho) no canal-alvo.
 Também acompanha os gales (G1/G2) com base nas mensagens do canal-fonte.
 
+Mudanças (v2.2.0):
+- Fechamento baseado APENAS no número observado no canal-fonte:
+  * 1º número após a entrada = G0
+  * 2º número após a entrada = G1
+  * 3º número após a entrada = G2
+  * Se nenhum desses iguala ao sugerido → LOSS ao registrar o 3º diferente
+- Mensagens GREEN/LOSS incluem o número que saiu e o estágio correto (G0/G1/G2)
+- Placar geral ao lado da mensagem, sem alterar a estrutura do DB
+
 Principais pontos:
 - ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
 - ENV opcionais:
@@ -19,16 +28,7 @@ Principais pontos:
 - Banco:
   * timeline / ngram -> memória leve para n-grams (2..5) com decaimento
   * pending -> controle do sinal em aberto (um por vez):
-      id, created_at, suggested, stage(0|1|2), open(0|1), seen(TEXT)
-
-- Regras resumidas:
-  * Só abre novo sinal quando não há pendência aberta.
-  * "ENTRADA CONFIRMADA" do fonte -> escolhe 1 número via n-gram (GEN) e publica.
-  * "Estamos no 1° gale" -> marca G1; "Estamos no 2° gale" -> marca G2.
-  * Heurística para desfecho:
-      - Se aparecer "green", "✅", "win" no texto do fonte -> encerra como GREEN.
-      - Se vier uma NOVA "ENTRADA CONFIRMADA" e a pendência anterior já estava em G2,
-        encerra a anterior como LOSS.
+      id, created_at, suggested, stage(0|1|2), open(0|1), seen(TEXT CSV com resultados observados)
 """
 
 import os, re, json, time, sqlite3, asyncio
@@ -259,35 +259,11 @@ def choose_single_number(after: Optional[int]) -> Tuple[int, float, int]:
 ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
 SEQ_RX = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
 AFTER_RX = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
-GALE1_RX = re.compile(r"Estamos\s+no\s*1[ºo]\s*gale", re.I)
-GALE2_RX = re.compile(r"Estamos\s+no\s*2[ºo]\s*gale", re.I)
-GREEN_RX = re.compile(r"(green|✅|win)", re.I)
-LOSS_RX  = re.compile(r"(loss|perdemos|❌)", re.I)
 
-# ==== EXTRA: extrair número do resultado no texto do canal-fonte ====
-GREEN_NUM_RXS = [
-    re.compile(r"\bGREEN\b.*?\(([1-4])\)", re.I | re.S),
-    re.compile(r"✅.*?\(([1-4])\)", re.I | re.S),
-    re.compile(r"\bwin\b.*?\(([1-4])\)", re.I | re.S),
-    re.compile(r"n[uú]mero\s*[:\-]?\s*([1-4])", re.I),
-]
-LOSS_NUM_RXS = [
-    re.compile(r"\bLOSS\b.*?\(([1-4])\)", re.I | re.S),
-    re.compile(r"❌.*?\(([1-4])\)", re.I | re.S),
-    re.compile(r"n[uú]mero\s*[:\-]?\s*([1-4])", re.I),
-]
-
-def extract_result_number(text: str, is_green: bool) -> Optional[int]:
-    t = re.sub(r"\s+", " ", text)
-    rxs = GREEN_NUM_RXS if is_green else LOSS_NUM_RXS
-    for rx in rxs:
-        m = rx.search(t)
-        if m:
-            try:
-                return int(m.group(1))
-            except Exception:
-                pass
-    return None
+# Observação de resultado (aceita muitos formatos simples; ignora quando for sequência):
+# Regra: se NÃO for mensagem de "Sequência:" e houver exatamente UM dígito [1-4] no texto,
+# interpretamos como o número que saiu na mesa.
+RESULT_ONE_RX = re.compile(r"[1-4]")
 
 def parse_entry_text(text: str) -> Optional[Dict]:
     t = re.sub(r"\s+", " ", text).strip()
@@ -301,6 +277,26 @@ def parse_entry_text(text: str) -> Optional[Dict]:
     mafter = AFTER_RX.search(t)
     after_num = int(mafter.group(1)) if mafter else None
     return {"seq": seq, "after": after_num, "raw": t}
+
+def extract_result_number(text: str) -> Optional[int]:
+    """Retorna o número 1..4 quando o texto aparenta ser o resultado da rodada.
+       Heurística: ignorar mensagens que contenham 'Sequência:'; se o resto do texto
+       tiver exatamente 1 dígito 1..4, tomamos como resultado.
+    """
+    t = re.sub(r"\s+", " ", text).strip()
+    if SEQ_RX.search(t):
+        return None
+    nums = RESULT_ONE_RX.findall(t)
+    # manter apenas 1..4
+    nums = [int(x) for x in nums if x in ("1","2","3","4")]
+    # deduplicar mantendo ordem
+    seen = []
+    for x in nums:
+        if x not in seen:
+            seen.append(x)
+    if len(seen) == 1:
+        return seen[0]
+    return None
 
 # ========= Pending helpers =========
 def get_open_pending() -> Optional[sqlite3.Row]:
@@ -317,6 +313,20 @@ def open_pending(suggested: int):
 def set_stage(stage:int):
     con = _connect(); cur = con.cursor()
     cur.execute("UPDATE pending SET stage=? WHERE open=1", (int(stage),))
+    con.commit(); con.close()
+
+def _append_seen_and_stage(res_number:int):
+    """Acrescenta o número observado em pending.seen (CSV) e atualiza pending.stage
+       para refletir quantos resultados já passaram (0 = G0, 1 = G1, 2 = G2)."""
+    con = _connect(); cur = con.cursor()
+    row = cur.execute("SELECT id, seen FROM pending WHERE open=1 ORDER BY id DESC LIMIT 1").fetchone()
+    if not row:
+        con.close(); return
+    pid = row["id"]
+    seen = (row["seen"] or "").strip()
+    new_seen = (f"{seen},{res_number}" if seen else f"{res_number}")
+    stage_idx = new_seen.count(",")  # 0 => G0, 1 => G1, 2 => G2
+    cur.execute("UPDATE pending SET seen=?, stage=? WHERE id=?", (new_seen, stage_idx, pid))
     con.commit(); con.close()
 
 def close_pending(outcome:str):
@@ -363,105 +373,78 @@ async def webhook(token: str, request: Request):
     if not text:
         return {"ok": True, "skipped": "sem_texto"}
 
-    # 1) Gales/Green/Loss
-    if GALE1_RX.search(text):
-        if get_open_pending():
-            set_stage(1)
-            await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>1° gale (G1)</b>")
-        return {"ok": True, "noted": "g1"}
-
-    if GALE2_RX.search(text):
-        if get_open_pending():
-            set_stage(2)
-            await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>2° gale (G2)</b>")
-        return {"ok": True, "noted": "g2"}
-
-    if GREEN_RX.search(text):
+    # 0) Se for um "resultado" (um único número 1..4 fora de 'Sequência:'), processa conferência
+    res = extract_result_number(text)
+    if res is not None:
         pend = get_open_pending()
         if pend:
-            stage_lbl = _stage_label(pend["stage"])
-            sug = int(pend["suggested"] or 0)
-            got = extract_result_number(text, is_green=True)
-            if got is not None and got != sug:
-                # Fonte disse GREEN mas número != sugerido -> trata como LOSS por conferência
-                close_pending("LOSS")
-                bump_score("LOSS")
-                await tg_send_text(
-                    TARGET_CHANNEL,
-                    f"🔴 <b>LOSS</b> — finalizado (<b>{stage_lbl}</b>). "
-                    f"Número do fonte: <b>{got}</b> ≠ sugerido: <b>{sug}</b>\n"
-                    f"📊 Geral: {score_text()}"
-                )
-            else:
-                # GREEN coerente (ou sem número para conferir)
-                close_pending("GREEN")
-                bump_score("GREEN")
-                num_txt = f" Número: <b>{got}</b>." if got is not None else ""
-                await tg_send_text(
-                    TARGET_CHANNEL,
-                    f"🟢 <b>GREEN</b> — finalizado (<b>{stage_lbl}</b>).{num_txt}\n"
-                    f"📊 Geral: {score_text()}"
-                )
-        return {"ok": True, "closed": "green"}
+            suggested = int(pend["suggested"] or 0)
+            # Anota o resultado e atualiza stage conforme quantos já saíram
+            _append_seen_and_stage(res)
+            # re-lê a pendência para saber o stage atualizado
+            pend2 = get_open_pending()
+            if pend2:
+                stage_lbl = _stage_label(pend2["stage"])
+                # GREEN se bateu
+                if res == suggested:
+                    close_pending("GREEN")
+                    bump_score("GREEN")
+                    await tg_send_text(
+                        TARGET_CHANNEL,
+                        f"🟢 <b>GREEN</b> — número: <b>{res}</b> (<b>{stage_lbl}</b>).\n"
+                        f"📊 Geral: {score_text()}"
+                    )
+                else:
+                    # Se já computamos 3 resultados (G2 é o 3º) sem bater → LOSS
+                    # pend2['stage'] já representa 0 (G0), 1 (G1), 2 (G2)
+                    if int(pend2["stage"] or 0) >= 2:
+                        close_pending("LOSS")
+                        bump_score("LOSS")
+                        await tg_send_text(
+                            TARGET_CHANNEL,
+                            f"🔴 <b>LOSS</b> — número: <b>{res}</b> (<b>{stage_lbl}</b>).\n"
+                            f"📊 Geral: {score_text()}"
+                        )
+        return {"ok": True, "noted": "resultado", "value": res}
 
-    if LOSS_RX.search(text):
-        pend = get_open_pending()
-        if pend:
-            stage_lbl = _stage_label(pend["stage"])
-            sug = int(pend["suggested"] or 0)
-            got = extract_result_number(text, is_green=False)
-            close_pending("LOSS")
-            bump_score("LOSS")
-            num_txt = f" Número: <b>{got}</b>." if got is not None else ""
-            sug_txt = f" (sugerido: <b>{sug}</b>)" if got is not None else ""
-            await tg_send_text(
-                TARGET_CHANNEL,
-                f"🔴 <b>LOSS</b> — finalizado (<b>{stage_lbl}</b>).{num_txt}{sug_txt}\n"
-                f"📊 Geral: {score_text()}"
-            )
-        return {"ok": True, "closed": "loss"}
-
-    # 2) Nova entrada
+    # 1) ENTRADA CONFIRMADA → abre pendência e publica o G0
     parsed = parse_entry_text(text)
-    if not parsed:
-        return {"ok": True, "skipped": "nao_eh_entrada_confirmada"}
-
-    # Se já existe pendência aberta:
-    pend = get_open_pending()
-    if pend:
-        # heurística: se já estávamos em G2 e chegou outra entrada, considera LOSS da anterior
-        if int(pend["stage"] or 0) >= 2:
-            stage_lbl = _stage_label(pend["stage"])
-            close_pending("LOSS")
-            bump_score("LOSS")
-            await tg_send_text(
-                TARGET_CHANNEL,
-                f"🔴 <b>LOSS (G2)</b> — anterior encerrada (<b>{stage_lbl}</b>).\n"
-                f"📊 Geral: {score_text()}"
-            )
-        else:
-            # ignora abertura até encerrar
+    if parsed:
+        # Se já existe pendência aberta, não abrimos outra.
+        pend = get_open_pending()
+        if pend:
             return {"ok": True, "ignored": "ja_existe_pendente"}
 
-    # Alimenta memória de sequência (se vier algo), antes de decidir
-    seq = parsed["seq"] or []
-    if seq:
-        append_seq(seq)
+        # Alimenta memória de sequência (se vier algo), antes de decidir
+        seq = parsed["seq"] or []
+        if seq:
+            append_seq(seq)
 
-    after = parsed["after"]
-    best, conf, samples = choose_single_number(after)
+        after = parsed["after"]
+        best, conf, samples = choose_single_number(after)
 
-    # Abre pendência e publica
-    open_pending(best)
-    aft_txt = f" após {after}" if after else ""
-    txt = (
-        f"🎯 <b>Número seco (G0):</b> <b>{best}</b>\n"
-        f"🧩 <b>Padrão:</b> GEN{aft_txt}\n"
-        f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples}"
-    )
-    await tg_send_text(TARGET_CHANNEL, txt)
+        # Abre pendência e publica
+        open_pending(best)
+        aft_txt = f" após {after}" if after else ""
+        txt = (
+            f"🎯 <b>Número seco (G0):</b> <b>{best}</b>\n"
+            f"🧩 <b>Padrão:</b> GEN{aft_txt}\n"
+            f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples}"
+        )
+        await tg_send_text(TARGET_CHANNEL, txt)
 
-    return {"ok": True, "posted": True, "best": best, "conf": conf, "samples": samples}
+        return {"ok": True, "posted": True, "best": best, "conf": conf, "samples": samples}
+
+    # 2) Se vier "Sequência:" fora de entrada confirmada, apenas alimenta memória
+    if SEQ_RX.search(text):
+        parts = re.findall(r"[1-4]", text)
+        seq = [int(x) for x in parts]
+        if seq:
+            append_seq(seq)
+        return {"ok": True, "noted": "sequencia", "len": len(seq)}
+
+    # Outros textos: ignorar
+    return {"ok": True, "skipped": "texto_nao_relevante"}
 
 # ===== Debug/help endpoints (opcionais) =====
 @app.get("/health")
