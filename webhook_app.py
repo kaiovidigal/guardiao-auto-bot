@@ -34,7 +34,6 @@ Principais pontos:
 import os, re, json, time, sqlite3, asyncio
 from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timezone
-from collections import Counter
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -54,7 +53,7 @@ if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
 # ========= App =========
-app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="2.2.0")
+app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="2.1.1")
 
 # ========= Utils =========
 def now_ts() -> int:
@@ -183,7 +182,7 @@ def append_seq(seq: List[int]):
                     (now_ts(), int(n)))
     _update_ngrams()
 
-def _update_ngrams(decay: float=0.980, max_n:int=5, window:int=400):
+def _update_ngrams(decay: float=0.985, max_n:int=5, window:int=400):
     tail = get_tail(window)
     if len(tail) < 2: return
     con = _connect(); cur = con.cursor()
@@ -218,9 +217,7 @@ def _prob_from_ngrams(ctx: List[int], cand: int) -> float:
     con.close()
     return w / tot
 
-# Pesos ajustados
-W4, W3, W2, W1 = 0.42, 0.30, 0.18, 0.10
-
+W4, W3, W2, W1 = 0.40, 0.30, 0.20, 0.10
 def _ngram_backoff(tail: List[int], after: Optional[int], cand:int) -> float:
     if not tail: return 0.0
     if after is not None and after in tail:
@@ -242,70 +239,21 @@ def _ngram_backoff(tail: List[int], after: Optional[int], cand:int) -> float:
     if len(ctx1)==1: s += W1 * _prob_from_ngrams(ctx1[:-1], cand)
     return s
 
-# ==== Melhorias de escolha (sem travar fluxo) ====
-
-def _tail_top2_boost(tail: List[int], k:int=40) -> Dict[int, float]:
-    """ Leve boost para top-2 mais frequentes nos últimos k. """
-    boosts = {1:1.00, 2:1.00, 3:1.00, 4:1.00}
-    if not tail: return boosts
-    seg = tail[-k:] if len(tail) >= k else tail[:]
-    cnt = Counter(seg).most_common()
-    if len(cnt) >= 1: boosts[cnt[0][0]] = 1.04
-    if len(cnt) >= 2: boosts[cnt[1][0]] = 1.02
-    return boosts
-
-def _last_closed_loss_number() -> Optional[int]:
-    """ Retorna o número sugerido do último LOSS encerrado (se houver). """
-    con = _connect()
-    row = con.execute(
-        "SELECT suggested FROM pending WHERE open=0 AND seen='LOSS' ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    con.close()
-    return int(row["suggested"]) if row else None
-
 def choose_single_number(after: Optional[int]) -> Tuple[int, float, int]:
-    """ Sempre escolhe e retorna um número (sem abster), porém com escolha mais esperta. """
     cands = [1,2,3,4]
     tail = get_tail(400)
-
-    # 1) score n-gram backoff
     scores = {c: _ngram_backoff(tail, after, c) for c in cands}
-
-    # 2) leve boost histórico (top-2 da cauda)
-    boosts = _tail_top2_boost(tail, k=40)
-    for c in cands:
-        scores[c] = (scores.get(c, 0.0) or 1e-9) * boosts.get(c, 1.0)
-
-    # 3) penalidade se último encerrado foi LOSS com o mesmo número
-    last_loss = _last_closed_loss_number()
-    if last_loss in cands:
-        scores[last_loss] *= 0.93  # penalidade suave
-
-    # 4) se tudo zerado, fallback por frequência recente (robusto)
     if all(v == 0.0 for v in scores.values()):
         last = tail[-50:] if len(tail) >= 50 else tail
         freq = {c: last.count(c) for c in cands}
-        best = sorted(cands, key=lambda x: (freq.get(x,0), x))[0]  # menos frequente
+        best = sorted(cands, key=lambda x: (freq.get(x,0), x))[0]
         conf = 0.50
         return best, conf, len(tail)
-
-    # 5) normalização + escolha
-    total = sum(max(v, 0.0) for v in scores.values()) or 1e-9
-    post = {k: max(v, 0.0)/total for k,v in scores.items()}
-
-    # desempate robusto
-    top = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
-    best, p1 = top[0]
-    p2 = top[1][1] if len(top) > 1 else 0.0
-    gap = p1 - p2
-
-    # se gap muito pequeno, evitar repetir último LOSS
-    if gap < 0.015 and last_loss is not None and last_loss == best and len(top) > 1:
-        best = top[1][0]
-        p1 = top[1][1]
-
-    conf = float(p1)
-    return int(best), conf, len(tail)
+    total = sum(scores.values()) or 1e-9
+    post = {k: v/total for k,v in scores.items()}
+    best = max(post.items(), key=lambda kv: kv[1])[0]
+    conf = float(post[best])
+    return best, conf, len(tail)
 
 # ========= Parse =========
 ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
@@ -313,28 +261,28 @@ SEQ_RX = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
 AFTER_RX = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
 GALE1_RX = re.compile(r"Estamos\s+no\s*1[ºo]\s*gale", re.I)
 GALE2_RX = re.compile(r"Estamos\s+no\s*2[ºo]\s*gale", re.I)
-GREEN_RX = re.compile(r"(green|greem|✅|win)", re.I)  # aceita "greem"
-LOSS_RX  = re.compile(r"(loss|perdemos|❌|red)", re.I)
+GREEN_RX = re.compile(r"(green|✅|win)", re.I)
+LOSS_RX  = re.compile(r"(loss|perdemos|❌)", re.I)
 
-# === Extração dos números observados no fechamento ===
-# Ex.: "GREEN ... (4 | 2)" ou "RED ❌ (1 | 4 | 4)"
-GREEN_NUMS_RX = re.compile(r"GREEN[^()]*\(([^)]+)\)", re.I | re.S)
-LOSS_NUMS_RX  = re.compile(r"(?:RED|LOSS)[^()]*\(([^)]+)\)", re.I | re.S)
+def _parse_entry_core(text: str) -> Optional[Dict]:
+    t = re.sub(r"\s+", " ", text).strip()
+    if not ENTRY_RX.search(t):
+        return None
+    mseq = SEQ_RX.search(t)
+    seq = []
+    if mseq:
+        parts = re.findall(r"[1-4]", mseq.group(1))
+        seq = [int(x) for x in parts]
+    mafter = AFTER_RX.search(t)
+    after_num = int(mafter.group(1)) if mafter else None
+    return {"seq": seq, "after": after_num, "raw": t}
 
-def _extract_numbers_block(s: str) -> List[int]:
-    """Extrai todos os dígitos 1..4 de um bloco dentro de parênteses."""
-    return [int(x) for x in re.findall(r"[1-4]", s)]
+# Compat: manter ambos os nomes válidos SEM mudar a estrutura do app
+def parse_entry_text(text: str) -> Optional[Dict]:
+    return _parse_entry_core(text)
 
-def extract_observed_numbers(text: str) -> List[int]:
-    t = re.sub(r"\s+", " ", text)
-    m = GREEN_NUMS_RX.search(t)
-    if m:
-        return _extract_numbers_block(m.group(1))
-    m = LOSS_NUMS_RX.search(t)
-    if m:
-        return _extract_numbers_block(m.group(1))
-    # fallback: nenhum bloco identificado
-    return []
+def parse_entry(text: str) -> Optional[Dict]:
+    return _parse_entry_core(text)
 
 # ========= Pending helpers =========
 def get_open_pending() -> Optional[sqlite3.Row]:
@@ -364,27 +312,6 @@ def _stage_label(stage_val: Optional[int]) -> str:
     except Exception:
         s = 0
     return "G0" if s == 0 else ("G1" if s == 1 else "G2")
-
-def _stage_from_observed(obs: List[int], suggested: int, fallback_stage: int) -> Tuple[str, str]:
-    """
-    Determina o stage textual com base na primeira ocorrência do nosso número nos observados.
-    Se não aparecer, devolve o stage pelo tamanho dos observados (1->G0, 2->G1, >=3->G2)
-    e usa 'número x'.
-    Retorna (stage_label, numero_texto).
-    """
-    if obs:
-        try:
-            idx = obs.index(int(suggested))  # 0,1,2...
-            stage_lbl = "G0" if idx == 0 else ("G1" if idx == 1 else "G2")
-            return stage_lbl, str(suggested)
-        except ValueError:
-            pass
-        # não achou: deduz pelo tamanho
-        n = len(obs)
-        stage_lbl = "G0" if n == 1 else ("G1" if n == 2 else "G2")
-        return stage_lbl, "x"
-    # sem observados no texto: usa fallback do pending
-    return _stage_label(fallback_stage), "x"
 
 # ========= Telegram =========
 async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
@@ -434,37 +361,31 @@ async def webhook(token: str, request: Request):
     if GREEN_RX.search(text):
         pend = get_open_pending()
         if pend:
-            suggested = int(pend["suggested"])
-            obs = extract_observed_numbers(text)  # ex.: [4,2]
-            stage_lbl, num_txt = _stage_from_observed(obs, suggested, fallback_stage=pend["stage"])
+            stage_lbl = _stage_label(pend["stage"])
             close_pending("GREEN")
             bump_score("GREEN")
-            extra = f"\n🔎 Conferência: nosso={suggested} | observados={' | '.join(map(str,obs)) if obs else '—'}"
             await tg_send_text(
                 TARGET_CHANNEL,
-                f"🟢 <b>GREEN</b> — finalizado (<b>{stage_lbl}</b>, número {num_txt}).\n"
-                f"📊 Geral: {score_text()}{extra}"
+                f"🟢 <b>GREEN</b> — finalizado (<b>{stage_lbl}</b>).\n"
+                f"📊 Geral: {score_text()}"
             )
         return {"ok": True, "closed": "green"}
 
     if LOSS_RX.search(text):
         pend = get_open_pending()
         if pend:
-            suggested = int(pend["suggested"])
-            obs = extract_observed_numbers(text)  # ex.: [1,4,4]
-            stage_lbl, num_txt = _stage_from_observed(obs, suggested, fallback_stage=pend["stage"])
+            stage_lbl = _stage_label(pend["stage"])
             close_pending("LOSS")
             bump_score("LOSS")
-            extra = f"\n🔎 Conferência: nosso={suggested} | observados={' | '.join(map(str,obs)) if obs else '—'}"
             await tg_send_text(
                 TARGET_CHANNEL,
-                f"🔴 <b>LOSS</b> — finalizado (<b>{stage_lbl}</b>, número {num_txt}).\n"
-                f"📊 Geral: {score_text()}{extra}"
+                f"🔴 <b>LOSS</b> — finalizado (<b>{stage_lbl}</b>).\n"
+                f"📊 Geral: {score_text()}"
             )
         return {"ok": True, "closed": "loss"}
 
     # 2) Nova entrada
-    parsed = parse_entry_text(text)
+    parsed = parse_entry_text(text)  # <- agora garantido
     if not parsed:
         return {"ok": True, "skipped": "nao_eh_entrada_confirmada"}
 
@@ -473,13 +394,12 @@ async def webhook(token: str, request: Request):
     if pend:
         # heurística: se já estávamos em G2 e chegou outra entrada, considera LOSS da anterior
         if int(pend["stage"] or 0) >= 2:
-            suggested = int(pend["suggested"])
-            # sem info de observados aqui; apenas encerra anterior como loss (G2, x)
+            stage_lbl = _stage_label(pend["stage"])
             close_pending("LOSS")
             bump_score("LOSS")
             await tg_send_text(
                 TARGET_CHANNEL,
-                f"🔴 <b>LOSS (G2)</b> — anterior encerrada (<b>G2</b>, número x).\n"
+                f"🔴 <b>LOSS (G2)</b> — anterior encerrada (<b>{stage_lbl}</b>).\n"
                 f"📊 Geral: {score_text()}"
             )
         else:
