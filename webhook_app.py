@@ -26,8 +26,7 @@ Principais pontos:
   * "ENTRADA CONFIRMADA" do fonte -> escolhe 1 número via n-gram (GEN) e publica.
   * "Estamos no 1° gale" -> marca G1; "Estamos no 2° gale" -> marca G2.
   * Heurística para desfecho:
-      - GREEN: encerra com anúncio informando o estágio (G0/G1/G2).
-      - LOSS: só anuncia quando for definitivo (após falhar G2).
+      - Se aparecer "green", "✅", "win" no texto do fonte -> encerra como GREEN.
       - Se vier uma NOVA "ENTRADA CONFIRMADA" e a pendência anterior já estava em G2,
         encerra a anterior como LOSS.
 """
@@ -54,7 +53,7 @@ if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
 # ========= App =========
-app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="2.0.0")
+app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="2.1.0")
 
 # ========= Utils =========
 def now_ts() -> int:
@@ -113,9 +112,44 @@ def migrate_db():
     if not _column_exists(con, "pending", "seen"):
         cur.execute("ALTER TABLE pending ADD COLUMN seen TEXT")
 
+    # score (geral de GREEN/LOSS)
+    cur.execute("""CREATE TABLE IF NOT EXISTS score (
+        id INTEGER PRIMARY KEY CHECK (id=1),
+        green INTEGER DEFAULT 0,
+        loss INTEGER DEFAULT 0
+    )""")
+    # seed linha 1 se precisar
+    row = con.execute("SELECT 1 FROM score WHERE id=1").fetchone()
+    if not row:
+        cur.execute("INSERT INTO score (id, green, loss) VALUES (1,0,0)")
+
     con.commit(); con.close()
 
 migrate_db()
+
+# ========= Score helpers (GERAL) =========
+def bump_score(outcome: str) -> Tuple[int, int]:
+    con = _connect(); cur = con.cursor()
+    row = cur.execute("SELECT green, loss FROM score WHERE id=1").fetchone()
+    g, l = (row["green"], row["loss"]) if row else (0, 0)
+    if outcome.upper() == "GREEN":
+        g += 1
+    elif outcome.upper() == "LOSS":
+        l += 1
+    cur.execute("INSERT OR REPLACE INTO score (id, green, loss) VALUES (1,?,?)", (g, l))
+    con.commit(); con.close()
+    return g, l
+
+def score_text() -> str:
+    con = _connect()
+    row = con.execute("SELECT green, loss FROM score WHERE id=1").fetchone()
+    con.close()
+    if not row:
+        return "0 GREEN × 0 LOSS — 0.0%"
+    g, l = int(row["green"]), int(row["loss"])
+    total = g + l
+    acc = (g/total*100.0) if total > 0 else 0.0
+    return f"{g} GREEN × {l} LOSS — {acc:.1f}%"
 
 # ========= N-gram memória =========
 def get_tail(limit:int=400) -> List[int]:
@@ -265,6 +299,13 @@ def close_pending(outcome:str):
     cur.execute("UPDATE pending SET open=0, seen=? WHERE open=1", (outcome,))
     con.commit(); con.close()
 
+def _stage_label(stage_val: Optional[int]) -> str:
+    try:
+        s = int(stage_val or 0)
+    except Exception:
+        s = 0
+    return "G0" if s == 0 else ("G1" if s == 1 else "G2")
+
 # ========= Telegram =========
 async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
     if not TG_BOT_TOKEN: return
@@ -310,25 +351,31 @@ async def webhook(token: str, request: Request):
             await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>2° gale (G2)</b>")
         return {"ok": True, "noted": "g2"}
 
-    # GREEN: encerra e anuncia com estágio correto (G0/G1/G2)
     if GREEN_RX.search(text):
         pend = get_open_pending()
         if pend:
-            stage = int(pend["stage"] or 0)
+            stage_lbl = _stage_label(pend["stage"])
             close_pending("GREEN")
-            await tg_send_text(TARGET_CHANNEL, f"🟢 <b>GREEN</b> — finalizado em <b>G{stage}</b>.")
+            bump_score("GREEN")
+            await tg_send_text(
+                TARGET_CHANNEL,
+                f"🟢 <b>GREEN</b> — finalizado (<b>{stage_lbl}</b>).\n"
+                f"📊 Geral: {score_text()}"
+            )
         return {"ok": True, "closed": "green"}
 
-    # LOSS: só anuncia quando for definitivo (após G2). Se “loss” vier antes, ignora.
     if LOSS_RX.search(text):
         pend = get_open_pending()
         if pend:
-            stage = int(pend["stage"] or 0)
-            if stage >= 2:
-                close_pending("LOSS")
-                await tg_send_text(TARGET_CHANNEL, "🔴 <b>LOSS</b> — finalizado (após G2).")
-            # else: ignora loss antecipado (G0/G1)
-        return {"ok": True, "closed": "loss_if_g2"}
+            stage_lbl = _stage_label(pend["stage"])
+            close_pending("LOSS")
+            bump_score("LOSS")
+            await tg_send_text(
+                TARGET_CHANNEL,
+                f"🔴 <b>LOSS</b> — finalizado (<b>{stage_lbl}</b>).\n"
+                f"📊 Geral: {score_text()}"
+            )
+        return {"ok": True, "closed": "loss"}
 
     # 2) Nova entrada
     parsed = parse_entry_text(text)
@@ -340,8 +387,14 @@ async def webhook(token: str, request: Request):
     if pend:
         # heurística: se já estávamos em G2 e chegou outra entrada, considera LOSS da anterior
         if int(pend["stage"] or 0) >= 2:
+            stage_lbl = _stage_label(pend["stage"])
             close_pending("LOSS")
-            await tg_send_text(TARGET_CHANNEL, "🔴 <b>LOSS (G2)</b> — anterior encerrada.")
+            bump_score("LOSS")
+            await tg_send_text(
+                TARGET_CHANNEL,
+                f"🔴 <b>LOSS (G2)</b> — anterior encerrada (<b>{stage_lbl}</b>).\n"
+                f"📊 Geral: {score_text()}"
+            )
         else:
             # ignora abertura até encerrar
             return {"ok": True, "ignored": "ja_existe_pendente"}
@@ -349,8 +402,6 @@ async def webhook(token: str, request: Request):
     # Alimenta memória de sequência (se vier algo), antes de decidir
     seq = parsed["seq"] or []
     if seq:
-        # OBS: a sequência do fonte costuma vir da direita p/ esquerda nas últimas chamadas;
-        # aqui apenas registramos como fornecida (não altera a estrutura).
         append_seq(seq)
 
     after = parsed["after"]
