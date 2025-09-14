@@ -1,158 +1,160 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-webhook_app.py — Guardião (modo GEN apenas)
-- Não gera sinal sozinho; reage somente ao canal-fonte.
-- Lê "ENTRADA CONFIRMADA" do canal-fonte, escolhe 1 número (1..4) por n-grams (histórico),
-  publica no TARGET_CHANNEL e acompanha G0→G1→G2 até GREEN ou LOSS.
-- Ignora novas entradas enquanto houver pendência aberta.
-- Resumo/placar a cada 5 minutos e reset diário 00:00 UTC.
+Webhook único (GEN 100%) — com SQLite robusto (retries) e placar periódico.
+- Gatilho: mensagens "ENTRADA CONFIRMADA" do canal-fonte
+- Decide SEMPRE 1 número seco via n-grams (GEN), ignora pares/ímpares/big/small
+- Mantém janela aberta (G0→G2); não aceita novo gatilho até fechar com GREEN/LOSS
+- Captura GREEN/LOSS do próprio canal (APOSTA ENCERRADA/LOSS) para fechar a janela
+- Placar a cada 5 minutos, reset às 00:00 UTC
 
-ENV obrigatórias:
-  TG_BOT_TOKEN     -> token do bot
-  WEBHOOK_TOKEN    -> token simples usado na rota /webhook/<token>
-
-ENV recomendadas:
-  TARGET_CHANNEL       -> chat_id destino (ex.: -1002796105884)
-  SOURCE_CHANNEL_ID    -> chat_id do canal-fonte (ex.: -1002810508717). Se setado, só aceita dele.
-  DB_PATH              -> caminho do sqlite (default: /data/mini_ref.db)
-
-Endpoints:
-  GET  /                 ping
-  POST /webhook/<token>  recebe updates do Telegram
+ENV esperadas:
+  TG_BOT_TOKEN      (obrigatório)
+  WEBHOOK_TOKEN     (obrigatório)
+  TARGET_CHANNEL    (canal destino; ex: -1002796105884)
+  DB_PATH           (opcional, default: /data/mini_ref.db)
 """
-
-import os, re, json, time, sqlite3, asyncio
-from typing import List, Optional, Tuple, Dict
+import os, re, json, time, sqlite3, asyncio, random
+from typing import List, Optional, Dict, Tuple
 from datetime import datetime, timezone, timedelta
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 
-# ========= ENV =========
-TG_BOT_TOKEN       = os.getenv("TG_BOT_TOKEN", "").strip()
-WEBHOOK_TOKEN      = os.getenv("WEBHOOK_TOKEN", "").strip()
-TARGET_CHANNEL     = os.getenv("TARGET_CHANNEL", "").strip() or "-1002796105884"
-SOURCE_CHANNEL_ID  = os.getenv("SOURCE_CHANNEL_ID", "").strip()   # opcional (se setado, filtra)
-DB_PATH            = os.getenv("DB_PATH", "/data/mini_ref.db").strip() or "/data/mini_ref.db"
+# ================= ENV / Telegram =================
+TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
+WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
+TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1002796105884").strip()
+DB_PATH        = os.getenv("DB_PATH", "/data/mini_ref.db").strip() or "/data/mini_ref.db"
+TELEGRAM_API   = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
-TELEGRAM_API       = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
+# ================= FastAPI =================
+app = FastAPI(title="Guardião GEN — Webhook único", version="2.2.0")
 
-# ========= App =========
-app = FastAPI(title="Guardião GEN — webhook", version="2.0.0")
+# ================= Util =================
+def now_ts() -> int: return int(time.time())
+def today_key_utc() -> str: return datetime.now(timezone.utc).strftime("%Y%m%d")
 
-# ========= DB helpers =========
+# ================= SQLite helpers (robustos) =================
 def _connect() -> sqlite3.Connection:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    con = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=20.0)
+    con = sqlite3.connect(DB_PATH, timeout=30.0, check_same_thread=False, isolation_level=None)
     con.row_factory = sqlite3.Row
-    con.execute("PRAGMA journal_mode=WAL;")
-    con.execute("PRAGMA synchronous=NORMAL;")
+    cur = con.cursor()
+    cur.execute("PRAGMA journal_mode=WAL;")
+    cur.execute("PRAGMA synchronous=NORMAL;")
+    cur.execute("PRAGMA busy_timeout=60000;")  # 60s
     return con
 
-def init_db():
+def exec_write(sql: str, params: tuple = (), retries: int = 8, base_wait: float = 0.15):
+    """Executa escrita com retries exponenciais se DB estiver bloqueado."""
+    last_err = None
+    for i in range(retries):
+        try:
+            con = _connect()
+            with con:
+                con.execute(sql, params)
+            con.close()
+            return
+        except sqlite3.OperationalError as e:
+            msg = str(e).lower()
+            last_err = e
+            if "locked" in msg or "busy" in msg or "database is locked" in msg:
+                time.sleep(base_wait * (2**i) + random.random()*0.05)
+                continue
+            raise
+    raise last_err or sqlite3.OperationalError("DB write failed")
+
+def query_all(sql: str, params: tuple = ()) -> List[sqlite3.Row]:
     con = _connect()
-    cur = con.cursor()
+    rows = con.execute(sql, params).fetchall()
+    con.close()
+    return rows
+
+def query_one(sql: str, params: tuple = ()) -> Optional[sqlite3.Row]:
+    con = _connect()
+    row = con.execute(sql, params).fetchone()
+    con.close()
+    return row
+
+# ================= DB init =================
+def init_db():
+    con = _connect(); cur = con.cursor()
     cur.execute("""CREATE TABLE IF NOT EXISTS timeline (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         created_at INTEGER NOT NULL,
         number INTEGER NOT NULL
     )""")
-    # n-grams 2..5
     cur.execute("""CREATE TABLE IF NOT EXISTS ngram (
         n INTEGER NOT NULL, ctx TEXT NOT NULL, nxt INTEGER NOT NULL, w REAL NOT NULL,
         PRIMARY KEY (n, ctx, nxt)
     )""")
-    # pendência atual (uma por vez)
-    cur.execute("""CREATE TABLE IF NOT EXISTS pending_outcome (
+    cur.execute("""CREATE TABLE IF NOT EXISTS pending (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        created_at INTEGER NOT NULL,
+        opened_at INTEGER NOT NULL,
         suggested INTEGER NOT NULL,
-        stage INTEGER NOT NULL,       -- 0=G0, 1=G1, 2=G2
-        open INTEGER NOT NULL,        -- 1 aberto, 0 fechado
-        seen_numbers TEXT DEFAULT '', -- concat de números observados: "3|1|4"
-        announced INTEGER NOT NULL DEFAULT 0
+        stage INTEGER NOT NULL,    -- 0=g0,1=g1,2=g2
+        open INTEGER NOT NULL      -- 1=open, 0=closed
     )""")
-    # placar diário (G0 only + loss), como combinado
     cur.execute("""CREATE TABLE IF NOT EXISTS daily_score (
         yyyymmdd TEXT PRIMARY KEY,
         g0 INTEGER NOT NULL DEFAULT 0,
-        loss INTEGER NOT NULL DEFAULT 0,
-        streak INTEGER NOT NULL DEFAULT 0
+        g1 INTEGER NOT NULL DEFAULT 0,
+        g2 INTEGER NOT NULL DEFAULT 0,
+        loss INTEGER NOT NULL DEFAULT 0
     )""")
-    con.commit()
     con.close()
 
 init_db()
 
-def now_ts() -> int:
-    return int(time.time())
+# ================= n-grams (GEN) =================
+WINDOW = 400
+DECAY  = 0.985
+W4,W3,W2,W1 = 0.40,0.30,0.20,0.10
 
-def today_key_utc() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%d")
-
-# ========= n-grams =========
-def get_tail(limit:int=400) -> List[int]:
-    con = _connect()
-    rows = con.execute("SELECT number FROM timeline ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-    con.close()
+def get_tail(limit:int=WINDOW) -> List[int]:
+    rows = query_all("SELECT number FROM timeline ORDER BY id DESC LIMIT ?", (limit,))
     return [int(r["number"]) for r in rows][::-1]
 
 def append_seq(seq: List[int]):
     if not seq: return
-    con = _connect()
-    cur = con.cursor()
     for n in seq:
-        cur.execute("INSERT INTO timeline (created_at, number) VALUES (?,?)", (now_ts(), int(n)))
-    con.commit()
-    con.close()
+        exec_write("INSERT INTO timeline (created_at, number) VALUES (?,?)", (now_ts(), int(n)))
     _update_ngrams()
 
-def append_one(n: int):
-    append_seq([int(n)])
-
-def _update_ngrams(decay: float=0.985, max_n:int=5, window:int=400):
-    tail = get_tail(window)
+def _update_ngrams(max_n:int=5):
+    tail = get_tail(WINDOW)
     if len(tail) < 2: return
-    con = _connect(); cur = con.cursor()
     for t in range(1, len(tail)):
-        nxt = int(tail[t])
+        nxt = tail[t]
         dist = (len(tail)-1) - t
-        w = decay ** dist
+        w = DECAY ** dist
         for n in range(2, max_n+1):
             if t-(n-1) < 0: break
             ctx = tail[t-(n-1):t]
             ctx_key = ",".join(str(x) for x in ctx)
-            cur.execute("""
+            exec_write("""
               INSERT INTO ngram (n, ctx, nxt, w)
               VALUES (?,?,?,?)
-              ON CONFLICT(n, ctx, nxt) DO UPDATE SET w = w + excluded.w
-            """, (n, ctx_key, nxt, float(w)))
-    con.commit(); con.close()
+              ON CONFLICT(n,ctx,nxt) DO UPDATE SET w = w + excluded.w
+            """, (n, ctx_key, int(nxt), float(w)))
 
 def _prob_from_ngrams(ctx: List[int], cand: int) -> float:
-    n = len(ctx) + 1
-    if n < 2 or n > 5: return 0.0
+    n = len(ctx)+1
+    if n<2 or n>5: return 0.0
     ctx_key = ",".join(str(x) for x in ctx)
-    con = _connect()
-    row_tot = con.execute("SELECT SUM(w) AS s FROM ngram WHERE n=? AND ctx=?", (n, ctx_key)).fetchone()
-    tot = (row_tot["s"] or 0.0) if row_tot else 0.0
-    if tot <= 0:
-        con.close(); return 0.0
-    row_c = con.execute("SELECT w FROM ngram WHERE n=? AND ctx=? AND nxt=?", (n, ctx_key, int(cand))).fetchone()
-    w = (row_c["w"] or 0.0) if row_c else 0.0
-    con.close()
-    return w / tot
+    row_tot = query_one("SELECT SUM(w) s FROM ngram WHERE n=? AND ctx=?", (n, ctx_key))
+    tot = float(row_tot["s"] or 0.0) if row_tot else 0.0
+    if tot <= 0: return 0.0
+    row_c = query_one("SELECT w FROM ngram WHERE n=? AND ctx=? AND nxt=?", (n, ctx_key, int(cand)))
+    w = float(row_c["w"] or 0.0) if row_c else 0.0
+    return w/tot if tot>0 else 0.0
 
-# pesos backoff
-W4, W3, W2, W1 = 0.40, 0.30, 0.20, 0.10
-
-def _ngram_backoff(tail: List[int], cand:int, after: Optional[int]) -> float:
-    if not tail: return 0.0
-    # Se “após X”, corta o contexto no último X (se existir)
+def choose_single_number(after: Optional[int]) -> Tuple[int,float,int]:
+    tail = get_tail(WINDOW)
+    # Recorte por "após X" se existir na cauda
     if after is not None and after in tail:
-        idxs = [i for i,v in enumerate(tail) if v == after]
-        i = idxs[-1]
+        i = max(i for i,v in enumerate(tail) if v==after)
         ctx1 = tail[max(0,i):i+1]
         ctx2 = tail[max(0,i-1):i+1] if i-1>=0 else []
         ctx3 = tail[max(0,i-2):i+1] if i-2>=0 else []
@@ -162,38 +164,28 @@ def _ngram_backoff(tail: List[int], cand:int, after: Optional[int]) -> float:
         ctx3 = tail[-3:] if len(tail)>=3 else []
         ctx2 = tail[-2:] if len(tail)>=2 else []
         ctx1 = tail[-1:] if len(tail)>=1 else []
-    s = 0.0
-    if len(ctx4)==4: s += W4 * _prob_from_ngrams(ctx4[:-1], cand)
-    if len(ctx3)==3: s += W3 * _prob_from_ngrams(ctx3[:-1], cand)
-    if len(ctx2)==2: s += W2 * _prob_from_ngrams(ctx2[:-1], cand)
-    if len(ctx1)==1: s += W1 * _prob_from_ngrams(ctx1[:-1], cand)
-    return s
-
-def choose_single_number_GEN(after: Optional[int]) -> Tuple[int, float, int]:
-    """Escolhe 1 número dentre [1,2,3,4] SEM restrição por BIG/SMALL/ODD/EVEN."""
-    tail = get_tail(400)
-    cands = [1,2,3,4]
-    scores = {c: _ngram_backoff(tail, c, after) for c in cands}
-
-    # se tudo zero, desempata por menor frequência recente (variância)
-    if all(v == 0.0 for v in scores.values()):
-        last = tail[-50:] if len(tail) >= 50 else tail
-        freq = {c: last.count(c) for c in cands}
-        best = sorted(cands, key=lambda x: (freq.get(x,0), x))[0]
-        conf = 0.50
-        return best, conf, len(tail)
-
-    total = sum(scores.values()) or 1e-9
-    post = {k: v/total for k,v in scores.items()}
+    scores = {}
+    for c in (1,2,3,4):
+        s=0.0
+        if len(ctx4)==4: s += W4*_prob_from_ngrams(ctx4[:-1], c)
+        if len(ctx3)==3: s += W3*_prob_from_ngrams(ctx3[:-1], c)
+        if len(ctx2)==2: s += W2*_prob_from_ngrams(ctx2[:-1], c)
+        if len(ctx1)==1: s += W1*_prob_from_ngrams(ctx1[:-1], c)
+        scores[c]=s
+    if all(v==0.0 for v in scores.values()):
+        last = tail[-50:] if len(tail)>=50 else tail
+        freq = {c:last.count(c) for c in (1,2,3,4)}
+        best = sorted((1,2,3,4), key=lambda x:(freq.get(x,0), x))[0]
+        return best, 0.50, len(tail)
+    tot = sum(scores.values()) or 1e-9
+    post = {k: v/tot for k,v in scores.items()}
     best = max(post.items(), key=lambda kv: kv[1])[0]
-    conf = post[best]
-    return best, conf, len(tail)
+    return best, float(post[best]), len(tail)
 
-# ========= Parsers =========
+# ================= Parsers canal-fonte =================
 ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
 SEQ_RX   = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
-AFTER_RX = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
-
+AFTER_RX = re.compile(r"Entrar\s+ap[oó]s\s+o\s+([1-4])", re.I)
 GALE1_RX = re.compile(r"Estamos\s+no\s*1[ºo]\s*gale", re.I)
 GALE2_RX = re.compile(r"Estamos\s+no\s*2[ºo]\s*gale", re.I)
 
@@ -201,178 +193,125 @@ GREEN_PATTERNS = [
     re.compile(r"APOSTA\s+ENCERRADA.*?\bGREEN\b.*?\(([1-4])\)", re.I | re.S),
     re.compile(r"\bGREEN\b.*?Número[:\s]*([1-4])", re.I | re.S),
 ]
-RED_PATTERNS = [
-    re.compile(r"APOSTA\s+ENCERRADA.*?\b(RED|LOSS)\b.*?\(([1-4])\)", re.I | re.S),
-    re.compile(r"\b(RED|LOSS)\b.*?Número[:\s]*([1-4])", re.I | re.S),
+LOSS_PATTERNS = [
+    re.compile(r"\bLOSS\b.*?Número[:\s]*([1-4])", re.I | re.S),
+    re.compile(r"APOSTA\s+ENCERRADA.*?\bRED\b", re.I | re.S),
 ]
 
-def parse_entry(text: str) -> Optional[Dict]:
+def parse_entry(text:str) -> Optional[Dict]:
     t = re.sub(r"\s+", " ", text).strip()
     if not ENTRY_RX.search(t):
         return None
-    seq = []
+    seq=[]; after=None
     mseq = SEQ_RX.search(t)
     if mseq:
-        nums = re.findall(r"[1-4]", mseq.group(1))
-        seq = [int(x) for x in nums]
+        parts = re.findall(r"[1-4]", mseq.group(1))
+        seq = [int(x) for x in parts]
     mafter = AFTER_RX.search(t)
-    after = int(mafter.group(1)) if mafter else None
-    return {"seq": seq, "after": after, "raw": t}
+    if mafter: after = int(mafter.group(1))
+    return {"seq":seq, "after":after, "raw":t}
 
-def extract_green(text: str) -> Optional[int]:
+def extract_green(text:str) -> Optional[int]:
     t = re.sub(r"\s+", " ", text)
     for rx in GREEN_PATTERNS:
         m = rx.search(t)
         if m:
-            return int(m.group(1))
+            nums = re.findall(r"[1-4]", m.group(1))
+            if nums: return int(nums[0])
     return None
 
-def extract_red_number(text: str) -> Optional[int]:
+def is_loss_text(text:str) -> bool:
     t = re.sub(r"\s+", " ", text)
-    for rx in RED_PATTERNS:
-        m = rx.search(t)
-        if m:
-            # grupo 2 é o número
-            try:
-                return int(m.group(2))
-            except Exception:
-                pass
-    return None
+    return any(rx.search(t) for rx in LOSS_PATTERNS)
 
-# ========= Pending & Score =========
-def has_open_pending() -> bool:
-    con = _connect()
-    row = con.execute("SELECT 1 FROM pending_outcome WHERE open=1 LIMIT 1").fetchone()
-    con.close()
-    return bool(row)
-
-def open_pending(suggested:int):
-    con = _connect()
-    con.execute("""INSERT INTO pending_outcome (created_at, suggested, stage, open, seen_numbers, announced)
-                   VALUES (?,?,?,?,?,?)""",
-                (now_ts(), int(suggested), 0, 1, "", 1))
-    con.commit(); con.close()
-
-def _append_seen(pid:int, n:int):
-    con = _connect()
-    row = con.execute("SELECT seen_numbers FROM pending_outcome WHERE id=?", (pid,)).fetchone()
-    seen = (row["seen_numbers"] or "") if row else ""
-    seen2 = (seen + ("|" if seen else "") + str(int(n)))
-    con.execute("UPDATE pending_outcome SET seen_numbers=? WHERE id=?", (seen2, pid))
-    con.commit(); con.close()
-
-def _get_open():
-    con = _connect()
-    row = con.execute("""SELECT id, suggested, stage, open, seen_numbers FROM pending_outcome
-                         WHERE open=1 ORDER BY id LIMIT 1""").fetchone()
-    con.close()
-    return row
-
-def _set_stage(pid:int, stage:int):
-    con = _connect()
-    con.execute("UPDATE pending_outcome SET stage=? WHERE id=?", (int(stage), pid))
-    con.commit(); con.close()
-
-def _close_pending(pid:int):
-    con = _connect()
-    con.execute("UPDATE pending_outcome SET open=0 WHERE id=?", (pid,))
-    con.commit(); con.close()
-
-def update_daily_score(hit: bool, stage: int):
-    y = today_key_utc()
-    con = _connect()
-    row = con.execute("SELECT g0,loss,streak FROM daily_score WHERE yyyymmdd=?", (y,)).fetchone()
-    g0 = row["g0"] if row else 0
-    loss = row["loss"] if row else 0
-    streak = row["streak"] if row else 0
-
-    if hit and stage == 0:
-        g0 += 1; streak += 1
-    elif not hit and stage == 0:
-        loss += 1; streak = 0
-    # se GREEN sair em G1/G2, a conversão G0/Loss -> GREEN não é feita aqui (modo simples)
-
-    con.execute("""INSERT OR REPLACE INTO daily_score (yyyymmdd,g0,loss,streak)
-                   VALUES (?,?,?,?)""", (y, g0, loss, streak))
-    con.commit(); con.close()
-
-async def send_scoreboard():
-    y = today_key_utc()
-    con = _connect()
-    row = con.execute("SELECT g0,loss,streak FROM daily_score WHERE yyyymmdd=?", (y,)).fetchone()
-    con.close()
-    g0 = row["g0"] if row else 0
-    loss = row["loss"] if row else 0
-    streak = row["streak"] if row else 0
-    total = g0 + loss
-    acc = (g0/total*100.0) if total else 0.0
-    txt = (f"📊 <b>Placar do dia</b>\n"
-           f"🟢 G0:{g0}  🔴 Loss:{loss}\n"
-           f"✅ Acerto: {acc:.2f}%\n"
-           f"🔥 Streak: {streak} GREEN(s)")
-    await tg_send_text(TARGET_CHANNEL, txt, "HTML")
-
-# ========= Telegram =========
-async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
-    if not TG_BOT_TOKEN or not chat_id: return
+# ================= Telegram send =================
+async def tg_send_text(chat_id: str, text: str, parse: str = "HTML"):
+    if not TG_BOT_TOKEN: return
     async with httpx.AsyncClient(timeout=15) as client:
         await client.post(f"{TELEGRAM_API}/sendMessage",
                           json={"chat_id": chat_id, "text": text, "parse_mode": parse,
                                 "disable_web_page_preview": True})
 
-# ========= Tarefas periódicas =========
+# ================= Placar =================
+def _bump_score(stage:int, won:bool):
+    y = today_key_utc()
+    row = query_one("SELECT g0,g1,g2,loss FROM daily_score WHERE yyyymmdd=?", (y,))
+    g0=g1=g2=loss=0
+    if row: g0,g1,g2,loss = row["g0"],row["g1"],row["g2"],row["loss"]
+    if won:
+        if stage==0: g0+=1
+        elif stage==1: g1+=1
+        else: g2+=1
+    else:
+        loss+=1
+    exec_write("""
+      INSERT INTO daily_score (yyyymmdd,g0,g1,g2,loss)
+      VALUES (?,?,?,?,?)
+      ON CONFLICT(yyyymmdd) DO UPDATE SET
+        g0=excluded.g0, g1=excluded.g1, g2=excluded.g2, loss=excluded.loss
+    """, (y,g0,g1,g2,loss))
+
 async def _scoreboard_task():
     while True:
         try:
-            await send_scoreboard()
-        except Exception as e:
-            print(f"[scoreboard] erro: {e}")
-        await asyncio.sleep(300)  # 5 min
-
-async def _daily_reset_task():
-    while True:
-        try:
-            now = datetime.now(timezone.utc)
-            tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-            await asyncio.sleep(max(1.0, (tomorrow - now).total_seconds()))
-            # zera placar
             y = today_key_utc()
-            con = _connect()
-            con.execute("""INSERT OR REPLACE INTO daily_score (yyyymmdd,g0,loss,streak)
-                           VALUES (?,0,0,0)""", (y,))
-            con.commit(); con.close()
-            await tg_send_text(TARGET_CHANNEL, "🕛 <b>Reset diário (00:00 UTC)</b> — placar zerado.", "HTML")
+            row = query_one("SELECT g0,g1,g2,loss FROM daily_score WHERE yyyymmdd=?", (y,))
+            g0=g1=g2=loss=0
+            if row: g0,g1,g2,loss = row["g0"],row["g1"],row["g2"],row["loss"]
+            total = g0+g1+g2+loss
+            acc = ((g0+g1+g2)/total*100.0) if total else 0.0
+            txt = (f"📊 <b>Placar do dia</b>\n"
+                   f"G0:{g0}  G1:{g1}  G2:{g2}  Loss:{loss}\n"
+                   f"✅ Acerto: {acc:.2f}% (total {total})")
+            await tg_send_text(TARGET_CHANNEL, txt, "HTML")
         except Exception as e:
-            print(f"[reset] erro: {e}")
-            await asyncio.sleep(60)
+            # silencioso no loop
+            pass
+        # espera até completar 5 min exatos (reduz drift)
+        await asyncio.sleep(300)
+
+async def _midnight_reset_task():
+    while True:
+        now = datetime.now(timezone.utc)
+        tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        wait = (tomorrow - now).total_seconds()
+        await asyncio.sleep(max(1, wait))
+        # reset placar
+        y = today_key_utc()
+        exec_write("""INSERT OR REPLACE INTO daily_score (yyyymmdd,g0,g1,g2,loss) VALUES (?,0,0,0,0)""",(y,))
+        await tg_send_text(TARGET_CHANNEL, "🕛 Reset diário executado (00:00 UTC).", "HTML")
 
 @app.on_event("startup")
 async def _boot():
-    # inicia placar 5min + reset 00:00
-    try:
-        asyncio.create_task(_scoreboard_task())
-    except Exception as e:
-        print(f"[boot] scoreboard_task erro: {e}")
-    try:
-        asyncio.create_task(_daily_reset_task())
-    except Exception as e:
-        print(f"[boot] daily_reset_task erro: {e}")
+    asyncio.create_task(_scoreboard_task())
+    asyncio.create_task(_midnight_reset_task())
 
-# ========= Rotas =========
+# ================ Core: janela (G0→G2) =================
+def _has_open_pending() -> Optional[sqlite3.Row]:
+    return query_one("SELECT id,suggested,stage FROM pending WHERE open=1 ORDER BY id LIMIT 1")
+
+def _open_pending(suggested:int):
+    exec_write("INSERT INTO pending (opened_at,suggested,stage,open) VALUES (?,?,0,1)",
+               (now_ts(), int(suggested)))
+
+def _advance_or_close(hit: bool):
+    row = _has_open_pending()
+    if not row: return
+    pid, sug, stage = int(row["id"]), int(row["suggested"]), int(row["stage"])
+    if hit:
+        _bump_score(stage, True)
+        exec_write("UPDATE pending SET open=0 WHERE id=?", (pid,))
+    else:
+        if stage >= 2:
+            _bump_score(stage, False)
+            exec_write("UPDATE pending SET open=0 WHERE id=?", (pid,))
+        else:
+            exec_write("UPDATE pending SET stage=stage+1 WHERE id=?", (pid,))
+
+# ================ Rotas =================
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "Guardião GEN — webhook"}
-
-def _from_source_chat(msg: Dict) -> bool:
-    """Se SOURCE_CHANNEL_ID estiver setado, garante que a msg vem dele."""
-    try:
-        chat = msg.get("chat") or {}
-        cid = str(chat.get("id", ""))
-        if SOURCE_CHANNEL_ID:
-            return cid == SOURCE_CHANNEL_ID
-        return True
-    except Exception:
-        return not bool(SOURCE_CHANNEL_ID)
+    return {"ok": True, "service": "guardiao-gen-webhook"}
 
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
@@ -380,94 +319,49 @@ async def webhook(token: str, request: Request):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     data = await request.json()
-
     msg = data.get("channel_post") or data.get("message") \
           or data.get("edited_channel_post") or data.get("edited_message") or {}
     text = (msg.get("text") or msg.get("caption") or "").strip()
-
-    # filtra por canal-fonte, se configurado
-    if not _from_source_chat(msg):
-        return {"ok": True, "skipped": "not_from_source"}
-
     if not text:
         return {"ok": True, "skipped": "no_text"}
 
-    # 1) GREEN/RED -> registra número real e fecha/atualiza pendência
-    g = extract_green(text)
-    r = extract_red_number(text)
-    if g is not None or r is not None:
-        n_observed = g if g is not None else r
-        append_one(n_observed)  # alimenta histórico
-        # fecha/avança pendência
-        row = _get_open()
-        if not row:
-            return {"ok": True, "observed": n_observed, "note": "no_open_pending"}
-        pid, suggested, stage = int(row["id"]), int(row["suggested"]), int(row["stage"])
-        _append_seen(pid, n_observed)
+    # 1) GREEN/LOSS fecha/avança janela aberta
+    green_num = extract_green(text)
+    if green_num is not None or is_loss_text(text):
+        row = _has_open_pending()
+        if row:
+            sug = int(row["suggested"])
+            hit = (green_num == sug) if green_num is not None else False
+            _advance_or_close(hit)
+            if green_num is not None:
+                await tg_send_text(TARGET_CHANNEL,
+                    f"✅ <b>Resultado:</b> {'GREEN' if hit else 'LOSS'} — Número real <b>{green_num}</b> (sug: <b>{sug}</b>)",
+                    "HTML")
+        return {"ok": True, "result_event": True}
 
-        hit = (n_observed == suggested)
-        if hit:
-            # GREEN em stage atual
-            await tg_send_text(TARGET_CHANNEL, f"✅ <b>GREEN</b> em <b>G{stage}</b> — Número: <b>{suggested}</b>", "HTML")
-            if stage == 0:
-                update_daily_score(True, 0)  # conta só G0/Loss
-            _close_pending(pid)
-        else:
-            # não bateu no stage atual
-            if stage >= 2:
-                # fim em G2 -> LOSS
-                await tg_send_text(TARGET_CHANNEL, f"❌ <b>LOSS</b> — Número: <b>{suggested}</b> (até G2)", "HTML")
-                if stage == 0:
-                    update_daily_score(False, 0)
-                _close_pending(pid)
-            else:
-                # avança p/ próximo gale (G1 ou G2)
-                new_stage = stage + 1
-                _set_stage(pid, new_stage)
+    # 2) “Estamos no 1º/2º gale” → avança sem fechar (se aberto e se não foi hit)
+    if GALE1_RX.search(text) or GALE2_RX.search(text):
+        _advance_or_close(False)  # avança stage
+        return {"ok": True, "gale_progress": True}
 
-        return {"ok": True, "observed": n_observed, "hit": hit}
-
-    # 2) Marcadores de gale (espelho do fonte)
-    if GALE1_RX.search(text):
-        if has_open_pending():
-            await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>1° gale</b>", "HTML")
-        return {"ok": True, "gale": 1}
-    if GALE2_RX.search(text):
-        if has_open_pending():
-            await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>2° gale</b>", "HTML")
-        return {"ok": True, "gale": 2}
-
-    # 3) ENTRADA CONFIRMADA — só se NÃO houver pendência aberta
+    # 3) ENTRADA CONFIRMADA → se não há pendência, decide GEN e publica
     parsed = parse_entry(text)
     if parsed:
-        if has_open_pending():
-            return {"ok": True, "skipped": "pending_open"}
+        if _has_open_pending():
+            # ignorar novo gatilho até fechar janela atual
+            return {"ok": True, "ignored": "pending_open"}
 
-        # alimenta histórico com a sequência passada
         seq = parsed["seq"] or []
         after = parsed["after"]
-        if seq:
-            append_seq(seq)
-
-        # escolhe 1 número (GEN puro, 1..4)
-        best, conf, samples = choose_single_number_GEN(after)
-
-        # abre pendência e publica
-        open_pending(best)
+        # Alimenta histórico com a sequência anterior
+        append_seq(seq)
+        best, conf, samples = choose_single_number(after)
+        _open_pending(best)
         aft_txt = f" após {after}" if after else ""
         out = (f"🎯 <b>Número seco (G0):</b> <b>{best}</b>\n"
                f"🧩 <b>Padrão:</b> GEN{aft_txt}\n"
                f"📊 Conf: <b>{conf*100:.2f}%</b> | Amostra≈<b>{samples}</b>")
         await tg_send_text(TARGET_CHANNEL, out, "HTML")
-        return {"ok": True, "sent": True, "best": best, "conf": conf, "samples": samples}
+        return {"ok": True, "posted": True, "best": best, "conf": conf, "samples": samples}
 
-    # 4) Se a mensagem tiver só "Sequência: ..." (ex.: análises), usamos para histórico
-    mseq = SEQ_RX.search(text)
-    if mseq and not ENTRY_RX.search(text):
-        nums = re.findall(r"[1-4]", mseq.group(1))
-        seq = [int(x) for x in nums]
-        append_seq(seq)
-        return {"ok": True, "fed_seq": len(seq)}
-
-    # nada relevante
-    return {"ok": True, "skipped": "unmatched"}
+    return {"ok": True, "skipped": "unrelated"}
