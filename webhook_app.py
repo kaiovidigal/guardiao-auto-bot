@@ -7,15 +7,6 @@ FastAPI + Telegram webhook para refletir sinais do canal-fonte e publicar
 um "número seco" (modo GEN = sem restrição de paridade/tamanho) no canal-alvo.
 Também acompanha os gales (G1/G2) com base nas mensagens do canal-fonte.
 
-Mudanças (v2.2.0):
-- Fechamento baseado APENAS no número observado no canal-fonte:
-  * 1º número após a entrada = G0
-  * 2º número após a entrada = G1
-  * 3º número após a entrada = G2
-  * Se nenhum desses iguala ao sugerido → LOSS ao registrar o 3º diferente
-- Mensagens GREEN/LOSS incluem o número que saiu e o estágio correto (G0/G1/G2)
-- Placar geral ao lado da mensagem, sem alterar a estrutura do DB
-
 Principais pontos:
 - ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
 - ENV opcionais:
@@ -28,7 +19,15 @@ Principais pontos:
 - Banco:
   * timeline / ngram -> memória leve para n-grams (2..5) com decaimento
   * pending -> controle do sinal em aberto (um por vez):
-      id, created_at, suggested, stage(0|1|2), open(0|1), seen(TEXT CSV com resultados observados)
+      id, created_at, suggested, stage(0|1|2), open(0|1), seen(TEXT)
+
+- Regras resumidas:
+  * Só abre novo sinal quando não há pendência aberta.
+  * "ENTRADA CONFIRMADA" do fonte -> escolhe 1 número via n-gram (GEN) e publica.
+  * "Estamos no 1° gale" -> marca G1; "Estamos no 2° gale" -> marca G2.
+  * Fechamento:
+      - Lê a mensagem final do fonte (GREEN/RED + "(...|...|...)"), extrai a sequência real
+        e confere se o NOSSO número sugerido apareceu em G0/G1/G2. Fecha com GREEN/LOSS e estágio correto.
 """
 
 import os, re, json, time, sqlite3, asyncio
@@ -246,6 +245,7 @@ def choose_single_number(after: Optional[int]) -> Tuple[int, float, int]:
     if all(v == 0.0 for v in scores.values()):
         last = tail[-50:] if len(tail) >= 50 else tail
         freq = {c: last.count(c) for c in cands}
+        # escolhe o MENOS frequente recente
         best = sorted(cands, key=lambda x: (freq.get(x,0), x))[0]
         conf = 0.50
         return best, conf, len(tail)
@@ -260,10 +260,12 @@ ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
 SEQ_RX = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
 AFTER_RX = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
 
-# Observação de resultado (aceita muitos formatos simples; ignora quando for sequência):
-# Regra: se NÃO for mensagem de "Sequência:" e houver exatamente UM dígito [1-4] no texto,
-# interpretamos como o número que saiu na mesa.
-RESULT_ONE_RX = re.compile(r"[1-4]")
+# Marcadores de gales (mantidos, mas fechamento real é por sequência final)
+GALE1_RX = re.compile(r"Estamos\s+no\s*1[ºo]\s*gale", re.I)
+GALE2_RX = re.compile(r"Estamos\s+no\s*2[ºo]\s*gale", re.I)
+
+# Resultado final: GREEN/RED/LOSS + sequência (x | y | z)
+OUTCOME_SEQ_RX = re.compile(r"(GREEN|WIN|✅|RED|LOSS|❌).*?\(([^)]*)\)", re.I | re.S)
 
 def parse_entry_text(text: str) -> Optional[Dict]:
     t = re.sub(r"\s+", " ", text).strip()
@@ -278,25 +280,23 @@ def parse_entry_text(text: str) -> Optional[Dict]:
     after_num = int(mafter.group(1)) if mafter else None
     return {"seq": seq, "after": after_num, "raw": t}
 
-def extract_result_number(text: str) -> Optional[int]:
-    """Retorna o número 1..4 quando o texto aparenta ser o resultado da rodada.
-       Heurística: ignorar mensagens que contenham 'Sequência:'; se o resto do texto
-       tiver exatamente 1 dígito 1..4, tomamos como resultado.
+def parse_outcome_and_sequence(text: str) -> Optional[Tuple[str, List[int]]]:
+    """
+    Retorna ('GREEN' ou 'LOSS'), [n1, n2, n3] quando a mensagem final trouxer
+    o fechamento com a sequência dentro de parênteses. Ex.: "RED ❌ (1 | 4 | 4)".
     """
     t = re.sub(r"\s+", " ", text).strip()
-    if SEQ_RX.search(t):
+    m = OUTCOME_SEQ_RX.search(t)
+    if not m:
         return None
-    nums = RESULT_ONE_RX.findall(t)
-    # manter apenas 1..4
-    nums = [int(x) for x in nums if x in ("1","2","3","4")]
-    # deduplicar mantendo ordem
-    seen = []
-    for x in nums:
-        if x not in seen:
-            seen.append(x)
-    if len(seen) == 1:
-        return seen[0]
-    return None
+    outcome_raw = m.group(1).upper()
+    if "GREEN" in outcome_raw or "WIN" in outcome_raw or "✅" in outcome_raw:
+        outcome = "GREEN"
+    else:
+        outcome = "LOSS"
+    nums = re.findall(r"[1-4]", m.group(2))
+    seq = [int(x) for x in nums]
+    return outcome, seq
 
 # ========= Pending helpers =========
 def get_open_pending() -> Optional[sqlite3.Row]:
@@ -313,20 +313,6 @@ def open_pending(suggested: int):
 def set_stage(stage:int):
     con = _connect(); cur = con.cursor()
     cur.execute("UPDATE pending SET stage=? WHERE open=1", (int(stage),))
-    con.commit(); con.close()
-
-def _append_seen_and_stage(res_number:int):
-    """Acrescenta o número observado em pending.seen (CSV) e atualiza pending.stage
-       para refletir quantos resultados já passaram (0 = G0, 1 = G1, 2 = G2)."""
-    con = _connect(); cur = con.cursor()
-    row = cur.execute("SELECT id, seen FROM pending WHERE open=1 ORDER BY id DESC LIMIT 1").fetchone()
-    if not row:
-        con.close(); return
-    pid = row["id"]
-    seen = (row["seen"] or "").strip()
-    new_seen = (f"{seen},{res_number}" if seen else f"{res_number}")
-    stage_idx = new_seen.count(",")  # 0 => G0, 1 => G1, 2 => G2
-    cur.execute("UPDATE pending SET seen=?, stage=? WHERE id=?", (new_seen, stage_idx, pid))
     con.commit(); con.close()
 
 def close_pending(outcome:str):
@@ -373,78 +359,101 @@ async def webhook(token: str, request: Request):
     if not text:
         return {"ok": True, "skipped": "sem_texto"}
 
-    # 0) Se for um "resultado" (um único número 1..4 fora de 'Sequência:'), processa conferência
-    res = extract_result_number(text)
-    if res is not None:
+    # 0) Se vier uma mensagem de fechamento com sequência (GREEN/RED + "(...)"),
+    #    usamos essa conferência por NÚMERO para fechar corretamente.
+    parsed_out = parse_outcome_and_sequence(text)
+    if parsed_out:
+        outcome_msg, seq_final = parsed_out  # outcome_msg: 'GREEN' ou 'LOSS'
         pend = get_open_pending()
         if pend:
-            suggested = int(pend["suggested"] or 0)
-            # Anota o resultado e atualiza stage conforme quantos já saíram
-            _append_seen_and_stage(res)
-            # re-lê a pendência para saber o stage atualizado
-            pend2 = get_open_pending()
-            if pend2:
-                stage_lbl = _stage_label(pend2["stage"])
-                # GREEN se bateu
-                if res == suggested:
-                    close_pending("GREEN")
-                    bump_score("GREEN")
-                    await tg_send_text(
-                        TARGET_CHANNEL,
-                        f"🟢 <b>GREEN</b> — número: <b>{res}</b> (<b>{stage_lbl}</b>).\n"
-                        f"📊 Geral: {score_text()}"
-                    )
-                else:
-                    # Se já computamos 3 resultados (G2 é o 3º) sem bater → LOSS
-                    # pend2['stage'] já representa 0 (G0), 1 (G1), 2 (G2)
-                    if int(pend2["stage"] or 0) >= 2:
-                        close_pending("LOSS")
-                        bump_score("LOSS")
-                        await tg_send_text(
-                            TARGET_CHANNEL,
-                            f"🔴 <b>LOSS</b> — número: <b>{res}</b> (<b>{stage_lbl}</b>).\n"
-                            f"📊 Geral: {score_text()}"
-                        )
-        return {"ok": True, "noted": "resultado", "value": res}
+            sug = int(pend["suggested"])
+            # procura em qual posição (0,1,2) nosso número bateu
+            hit_idx = None
+            for i, n in enumerate(seq_final):
+                if n == sug:
+                    hit_idx = i
+                    break
+            if hit_idx is not None:
+                # GREEN no estágio correto
+                stage_lbl = ["G0", "G1", "G2"][min(hit_idx, 2)]
+                close_pending("GREEN")
+                bump_score("GREEN")
+                await tg_send_text(
+                    TARGET_CHANNEL,
+                    f"🟢 <b>GREEN</b> — finalizado (<b>{stage_lbl}</b>, número <b>{sug}</b>).\n"
+                    f"📊 Geral: {score_text()}"
+                )
+                return {"ok": True, "closed": "green_by_seq", "stage": stage_lbl, "seq": seq_final}
+            else:
+                # Não bateu em nenhuma das 3 posições: LOSS (considera G2)
+                stage_lbl = "G2"
+                close_pending("LOSS")
+                bump_score("LOSS")
+                # número “que fechou” = último da sequência se existir
+                last_num = seq_final[-1] if seq_final else "—"
+                await tg_send_text(
+                    TARGET_CHANNEL,
+                    f"🔴 <b>LOSS</b> — finalizado (<b>{stage_lbl}</b>, número <b>{last_num}</b>).\n"
+                    f"📊 Geral: {score_text()}"
+                )
+                return {"ok": True, "closed": "loss_by_seq", "seq": seq_final}
+        # Se não há pendência, apenas ignora
+        return {"ok": True, "noted_outcome_seq": True}
 
-    # 1) ENTRADA CONFIRMADA → abre pendência e publica o G0
+    # 1) Gales informativos (mantidos, mas o fechamento real ocorre por sequência)
+    if GALE1_RX.search(text):
+        if get_open_pending():
+            set_stage(1)
+            await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>1° gale (G1)</b>")
+        return {"ok": True, "noted": "g1"}
+
+    if GALE2_RX.search(text):
+        if get_open_pending():
+            set_stage(2)
+            await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>2° gale (G2)</b>")
+        return {"ok": True, "noted": "g2"}
+
+    # 2) Nova entrada
     parsed = parse_entry_text(text)
-    if parsed:
-        # Se já existe pendência aberta, não abrimos outra.
-        pend = get_open_pending()
-        if pend:
+    if not parsed:
+        return {"ok": True, "skipped": "nao_eh_entrada_confirmada"}
+
+    # Se já existe pendência aberta:
+    pend = get_open_pending()
+    if pend:
+        # heurística antiga: se já estávamos em G2 e chegou outra entrada, considera LOSS da anterior
+        if int(pend["stage"] or 0) >= 2:
+            stage_lbl = _stage_label(pend["stage"])
+            close_pending("LOSS")
+            bump_score("LOSS")
+            await tg_send_text(
+                TARGET_CHANNEL,
+                f"🔴 <b>LOSS (G2)</b> — anterior encerrada (<b>{stage_lbl}</b>).\n"
+                f"📊 Geral: {score_text()}"
+            )
+        else:
+            # ignora abertura até encerrar
             return {"ok": True, "ignored": "ja_existe_pendente"}
 
-        # Alimenta memória de sequência (se vier algo), antes de decidir
-        seq = parsed["seq"] or []
-        if seq:
-            append_seq(seq)
+    # Alimenta memória de sequência (se vier algo), antes de decidir
+    seq = parsed["seq"] or []
+    if seq:
+        append_seq(seq)
 
-        after = parsed["after"]
-        best, conf, samples = choose_single_number(after)
+    after = parsed["after"]
+    best, conf, samples = choose_single_number(after)
 
-        # Abre pendência e publica
-        open_pending(best)
-        aft_txt = f" após {after}" if after else ""
-        txt = (
-            f"🎯 <b>Número seco (G0):</b> <b>{best}</b>\n"
-            f"🧩 <b>Padrão:</b> GEN{aft_txt}\n"
-            f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples}"
-        )
-        await tg_send_text(TARGET_CHANNEL, txt)
+    # Abre pendência e publica
+    open_pending(best)
+    aft_txt = f" após {after}" if after else ""
+    txt = (
+        f"🎯 <b>Número seco (G0):</b> <b>{best}</b>\n"
+        f"🧩 <b>Padrão:</b> GEN{aft_txt}\n"
+        f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples}"
+    )
+    await tg_send_text(TARGET_CHANNEL, txt)
 
-        return {"ok": True, "posted": True, "best": best, "conf": conf, "samples": samples}
-
-    # 2) Se vier "Sequência:" fora de entrada confirmada, apenas alimenta memória
-    if SEQ_RX.search(text):
-        parts = re.findall(r"[1-4]", text)
-        seq = [int(x) for x in parts]
-        if seq:
-            append_seq(seq)
-        return {"ok": True, "noted": "sequencia", "len": len(seq)}
-
-    # Outros textos: ignorar
-    return {"ok": True, "skipped": "texto_nao_relevante"}
+    return {"ok": True, "posted": True, "best": best, "conf": conf, "samples": samples}
 
 # ===== Debug/help endpoints (opcionais) =====
 @app.get("/health")
