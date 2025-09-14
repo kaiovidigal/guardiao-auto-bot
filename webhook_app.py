@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
 webhook_app.py
 --------------
 FastAPI + Telegram webhook para refletir sinais do canal-fonte e publicar
@@ -23,7 +26,8 @@ Principais pontos:
   * "ENTRADA CONFIRMADA" do fonte -> escolhe 1 número via n-gram (GEN) e publica.
   * "Estamos no 1° gale" -> marca G1; "Estamos no 2° gale" -> marca G2.
   * Heurística para desfecho:
-      - Se aparecer "green", "✅", "win" no texto do fonte -> encerra como GREEN.
+      - GREEN: encerra com anúncio informando o estágio (G0/G1/G2).
+      - LOSS: só anuncia quando for definitivo (após falhar G2).
       - Se vier uma NOVA "ENTRADA CONFIRMADA" e a pendência anterior já estava em G2,
         encerra a anterior como LOSS.
 """
@@ -306,17 +310,25 @@ async def webhook(token: str, request: Request):
             await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>2° gale (G2)</b>")
         return {"ok": True, "noted": "g2"}
 
+    # GREEN: encerra e anuncia com estágio correto (G0/G1/G2)
     if GREEN_RX.search(text):
-        if get_open_pending():
+        pend = get_open_pending()
+        if pend:
+            stage = int(pend["stage"] or 0)
             close_pending("GREEN")
-            await tg_send_text(TARGET_CHANNEL, "🟢 <b>GREEN</b> — finalizado.")
+            await tg_send_text(TARGET_CHANNEL, f"🟢 <b>GREEN</b> — finalizado em <b>G{stage}</b>.")
         return {"ok": True, "closed": "green"}
 
+    # LOSS: só anuncia quando for definitivo (após G2). Se “loss” vier antes, ignora.
     if LOSS_RX.search(text):
-        if get_open_pending():
-            close_pending("LOSS")
-            await tg_send_text(TARGET_CHANNEL, "🔴 <b>LOSS</b> — finalizado.")
-        return {"ok": True, "closed": "loss"}
+        pend = get_open_pending()
+        if pend:
+            stage = int(pend["stage"] or 0)
+            if stage >= 2:
+                close_pending("LOSS")
+                await tg_send_text(TARGET_CHANNEL, "🔴 <b>LOSS</b> — finalizado (após G2).")
+            # else: ignora loss antecipado (G0/G1)
+        return {"ok": True, "closed": "loss_if_g2"}
 
     # 2) Nova entrada
     parsed = parse_entry_text(text)
@@ -337,6 +349,8 @@ async def webhook(token: str, request: Request):
     # Alimenta memória de sequência (se vier algo), antes de decidir
     seq = parsed["seq"] or []
     if seq:
+        # OBS: a sequência do fonte costuma vir da direita p/ esquerda nas últimas chamadas;
+        # aqui apenas registramos como fornecida (não altera a estrutura).
         append_seq(seq)
 
     after = parsed["after"]
