@@ -7,19 +7,36 @@ FastAPI + Telegram webhook para refletir sinais do canal-fonte e publicar
 um "número seco" (modo GEN = sem restrição de paridade/tamanho) no canal-alvo.
 Também acompanha os gales (G1/G2) com base nas mensagens do canal-fonte.
 
-Agora com:
-- Placar diário (zera 00:00 America/Sao_Paulo)
-- Mensagens de GREEN/LOSS contendo estágio (G0/G1/G2) + placar do dia
-- Publicação automática do placar a cada hora
+Principais pontos:
+- ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
+- ENV opcionais:
+    TARGET_CHANNEL   -> canal onde será publicado o tiro seco (ex.: -1002796105884)
+    SOURCE_CHANNEL   -> canal-fonte que disparam os gatilhos (ex.: -1002810508717)
+    DB_PATH          -> caminho do sqlite (default: /var/data/data.db)
+- Webhook: POST /webhook/{WEBHOOK_TOKEN}
+  Configure no Telegram com setWebhook apontando para essa URL.
+
+- Banco:
+  * timeline / ngram -> memória leve para n-grams (2..5) com decaimento
+  * pending -> controle do sinal em aberto (um por vez):
+      id, created_at, suggested, stage(0|1|2), open(0|1), seen(TEXT)
+
+- Regras resumidas:
+  * Só abre novo sinal quando não há pendência aberta.
+  * "ENTRADA CONFIRMADA" do fonte -> escolhe 1 número via n-gram (GEN) e publica.
+  * "Estamos no 1° gale" -> marca G1; "Estamos no 2° gale" -> marca G2.
+  * Heurística para desfecho:
+      - Se aparecer "green", "✅", "win" no texto do fonte -> encerra como GREEN.
+      - Se vier uma NOVA "ENTRADA CONFIRMADA" e a pendência anterior já estava em G2,
+        encerra a anterior como LOSS.
 """
 
-import os, re, time, sqlite3, asyncio
+import os, re, json, time, sqlite3, asyncio
 from typing import List, Optional, Tuple, Dict
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
-from zoneinfo import ZoneInfo
 
 # ========= ENV =========
 TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
@@ -36,28 +53,22 @@ if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
 # ========= App =========
-app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="3.0.0")
+app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="2.0.0")
 
 # ========= Utils =========
-SP_TZ = ZoneInfo("America/Sao_Paulo")
-
 def now_ts() -> int:
     return int(time.time())
 
 def ts_str(ts=None) -> str:
     if ts is None: ts = now_ts()
-    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%SZ")
-
-def today_sp_str() -> str:
-    """YYYY-MM-DD na timezone America/Sao_Paulo"""
-    return datetime.now(SP_TZ).strftime("%Y-%m-%d")
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 # ========= DB helpers =========
 def _connect() -> sqlite3.Connection:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     con = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30.0)
     con.row_factory = sqlite3.Row
-    # reduzir "database is locked"
+    # tentar reduzir "database is locked"
     con.execute("PRAGMA journal_mode=WAL;")
     con.execute("PRAGMA synchronous=NORMAL;")
     con.execute("PRAGMA busy_timeout=10000;")
@@ -101,53 +112,9 @@ def migrate_db():
     if not _column_exists(con, "pending", "seen"):
         cur.execute("ALTER TABLE pending ADD COLUMN seen TEXT")
 
-    # stats_day: placar por dia (zera naturalmente ao trocar a data)
-    cur.execute("""CREATE TABLE IF NOT EXISTS stats_day (
-        day   TEXT PRIMARY KEY,   -- 'YYYY-MM-DD' America/Sao_Paulo
-        total INTEGER NOT NULL,
-        green INTEGER NOT NULL,
-        loss  INTEGER NOT NULL
-    )""")
-
     con.commit(); con.close()
 
 migrate_db()
-
-# ========= Stats por dia (placar) =========
-def _stats_day_get(d: str) -> Dict[str, int]:
-    con = _connect()
-    row = con.execute("SELECT total, green, loss FROM stats_day WHERE day=?", (d,)).fetchone()
-    con.close()
-    if not row:
-        return {"total": 0, "green": 0, "loss": 0}
-    return {"total": int(row["total"]), "green": int(row["green"]), "loss": int(row["loss"])}
-
-def _stats_day_inc(outcome: str):
-    d = today_sp_str()
-    for attempt in range(6):
-        try:
-            con = _connect(); cur = con.cursor()
-            cur.execute("""INSERT INTO stats_day(day,total,green,loss)
-                           VALUES (?,0,0,0)
-                           ON CONFLICT(day) DO NOTHING""", (d,))
-            cur.execute("UPDATE stats_day SET total = total + 1 WHERE day=?", (d,))
-            if (outcome or "").upper() == "GREEN":
-                cur.execute("UPDATE stats_day SET green = green + 1 WHERE day=?", (d,))
-            else:
-                cur.execute("UPDATE stats_day SET loss  = loss  + 1 WHERE day=?", (d,))
-            con.commit(); con.close(); return
-        except sqlite3.OperationalError as e:
-            if "locked" in str(e).lower() or "busy" in str(e).lower():
-                time.sleep(0.25*(attempt+1)); continue
-            raise
-
-def format_scoreboard_today() -> str:
-    d = today_sp_str()
-    s = _stats_day_get(d)
-    total, green, loss = s["total"], s["green"], s["loss"]
-    acc = (green / total * 100.0) if total > 0 else 0.0
-    return (f"📆 {d} (America/Sao_Paulo)\n"
-            f"📈 Placar geral: {green} GREEN / {loss} LOSS — Acerto: {acc:.1f}% (N={total})")
 
 # ========= N-gram memória =========
 def get_tail(limit:int=400) -> List[int]:
@@ -244,8 +211,7 @@ def choose_single_number(after: Optional[int]) -> Tuple[int, float, int]:
     if all(v == 0.0 for v in scores.values()):
         last = tail[-50:] if len(tail) >= 50 else tail
         freq = {c: last.count(c) for c in cands}
-        # desempata pelo menor índice para dar variedade
-        best = sorted(cands, key=lambda x: (-freq.get(x,0), -x))[0]
+        best = sorted(cands, key=lambda x: (freq.get(x,0), x))[0]
         conf = 0.50
         return best, conf, len(tail)
     total = sum(scores.values()) or 1e-9
@@ -254,17 +220,14 @@ def choose_single_number(after: Optional[int]) -> Tuple[int, float, int]:
     conf = float(post[best])
     return best, conf, len(tail)
 
-# ========= Regex =========
+# ========= Parse =========
 ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
 SEQ_RX = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
 AFTER_RX = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
-
 GALE1_RX = re.compile(r"Estamos\s+no\s*1[ºo]\s*gale", re.I)
 GALE2_RX = re.compile(r"Estamos\s+no\s*2[ºo]\s*gale", re.I)
-
-# Desfechos (mais exigentes para evitar falsos positivos em posts de resumo)
-GREEN_RX = re.compile(r"(resultado|final|GREEN)\s*.*?(green|✅|win)", re.I)
-LOSS_RX  = re.compile(r"(resultado|final|LOSS)\s*.*?(loss|perdemos|❌)", re.I)
+GREEN_RX = re.compile(r"(green|✅|win)", re.I)
+LOSS_RX  = re.compile(r"(loss|perdemos|❌)", re.I)
 
 def parse_entry_text(text: str) -> Optional[Dict]:
     t = re.sub(r"\s+", " ", text).strip()
@@ -309,42 +272,10 @@ async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
                           json={"chat_id": chat_id, "text": text, "parse_mode": parse,
                                 "disable_web_page_preview": True})
 
-# ========= Tarefa periódica: placar horário =========
-async def hourly_scoreboard_publisher():
-    # publica no “fechar da hora”: 01:00, 02:00, 03:00, ...
-    while True:
-        now = datetime.now(SP_TZ)
-        next_hour = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
-        await asyncio.sleep(max(1.0, (next_hour - now).total_seconds()))
-        try:
-            sb = format_scoreboard_today()
-            await tg_send_text(TARGET_CHANNEL, sb)
-        except Exception:
-            # evita travar o loop se der erro transitório
-            pass
-
-@app.on_event("startup")
-async def _startup_tasks():
-    asyncio.create_task(hourly_scoreboard_publisher())
-
 # ========= Rotas =========
 @app.get("/")
 async def root():
     return {"ok": True, "service": "guardiao-auto-bot (GEN webhook)"}
-
-@app.get("/health")
-async def health():
-    pend = bool(get_open_pending())
-    return {"ok": True, "db": DB_PATH, "pending_open": pend, "time": ts_str()}
-
-@app.get("/placar")
-async def placar():
-    d = today_sp_str()
-    s = _stats_day_get(d)
-    acc = (s["green"]/s["total"]*100.0) if s["total"]>0 else 0.0
-    return {"ok": True, "day": d, "tz": "America/Sao_Paulo",
-            "total": s["total"], "green": s["green"], "loss": s["loss"],
-            "accuracy_pct": round(acc, 2)}
 
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
@@ -358,21 +289,14 @@ async def webhook(token: str, request: Request):
     text = (msg.get("text") or msg.get("caption") or "").strip()
     chat = msg.get("chat") or {}
     chat_id = str(chat.get("id") or "")
-
-    # se SOURCE_CHANNEL estiver definido, filtra por ele
+    # se SOURCE_CHANNEL estiver definido, filtra
     if SOURCE_CHANNEL and chat_id != str(SOURCE_CHANNEL):
         return {"ok": True, "skipped": "outro_chat"}
 
     if not text:
         return {"ok": True, "skipped": "sem_texto"}
 
-    # Comando manual para mostrar o placar do dia
-    if text.strip().lower() in ("/placar", "placar", "/placar@seubot"):
-        sb = format_scoreboard_today()
-        await tg_send_text(TARGET_CHANNEL, sb)
-        return {"ok": True, "posted": "placar_hoje"}
-
-    # === Eventos de Gale
+    # 1) Gales/Green/Loss
     if GALE1_RX.search(text):
         if get_open_pending():
             set_stage(1)
@@ -385,36 +309,19 @@ async def webhook(token: str, request: Request):
             await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>2° gale (G2)</b>")
         return {"ok": True, "noted": "g2"}
 
-    # === Desfechos GREEN / LOSS (com estágio + placar do dia)
     if GREEN_RX.search(text):
-        pend = get_open_pending()
-        if pend:
-            stage_val = int(pend["stage"] or 0)
-            stage_label = f"G{stage_val}" if stage_val in (1,2) else "G0"
+        if get_open_pending():
             close_pending("GREEN")
-            _stats_day_inc("GREEN")
-            sb = format_scoreboard_today()
-            await tg_send_text(
-                TARGET_CHANNEL,
-                f"🟢 <b>GREEN</b> (<b>{stage_label}</b>) — finalizado.\n" + sb
-            )
+            await tg_send_text(TARGET_CHANNEL, "🟢 <b>GREEN</b> — finalizado.")
         return {"ok": True, "closed": "green"}
 
     if LOSS_RX.search(text):
-        pend = get_open_pending()
-        if pend:
-            stage_val = int(pend["stage"] or 0)
-            stage_label = f"G{stage_val}" if stage_val in (1,2) else "G0"
+        if get_open_pending():
             close_pending("LOSS")
-            _stats_day_inc("LOSS")
-            sb = format_scoreboard_today()
-            await tg_send_text(
-                TARGET_CHANNEL,
-                f"🔴 <b>LOSS</b> (<b>{stage_label}</b>) — finalizado.\n" + sb
-            )
+            await tg_send_text(TARGET_CHANNEL, "🔴 <b>LOSS</b> — finalizado.")
         return {"ok": True, "closed": "loss"}
 
-    # === Nova entrada
+    # 2) Nova entrada
     parsed = parse_entry_text(text)
     if not parsed:
         return {"ok": True, "skipped": "nao_eh_entrada_confirmada"}
@@ -424,15 +331,8 @@ async def webhook(token: str, request: Request):
     if pend:
         # heurística: se já estávamos em G2 e chegou outra entrada, considera LOSS da anterior
         if int(pend["stage"] or 0) >= 2:
-            stage_val = int(pend["stage"] or 0)  # deve ser 2 aqui
-            stage_label = f"G{stage_val}" if stage_val in (1,2) else "G0"
             close_pending("LOSS")
-            _stats_day_inc("LOSS")
-            sb = format_scoreboard_today()
-            await tg_send_text(
-                TARGET_CHANNEL,
-                f"🔴 <b>LOSS</b> (<b>{stage_label}</b>) — anterior encerrada.\n" + sb
-            )
+            await tg_send_text(TARGET_CHANNEL, "🔴 <b>LOSS (G2)</b> — anterior encerrada.")
         else:
             # ignora abertura até encerrar
             return {"ok": True, "ignored": "ja_existe_pendente"}
@@ -456,3 +356,9 @@ async def webhook(token: str, request: Request):
     await tg_send_text(TARGET_CHANNEL, txt)
 
     return {"ok": True, "posted": True, "best": best, "conf": conf, "samples": samples}
+
+# ===== Debug/help endpoints (opcionais) =====
+@app.get("/health")
+async def health():
+    pend = bool(get_open_pending())
+    return {"ok": True, "db": DB_PATH, "pending_open": pend, "time": ts_str()}
