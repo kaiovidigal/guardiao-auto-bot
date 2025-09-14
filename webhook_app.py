@@ -7,26 +7,11 @@ FastAPI + Telegram webhook para refletir sinais do canal-fonte e publicar
 um "número seco" (modo GEN = sem restrição de paridade/tamanho) no canal-alvo.
 Também acompanha os gales (G1/G2) com base nas mensagens do canal-fonte.
 
-Principais pontos:
-- ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
-- ENV opcionais:
-    TARGET_CHANNEL   -> canal onde será publicado o tiro seco (ex.: -1002796105884)
-    SOURCE_CHANNEL   -> canal-fonte que disparam os gatilhos (ex.: -1002810508717)
-    DB_PATH          -> caminho do sqlite (default: /var/data/data.db)
-- Webhook: POST /webhook/{WEBHOOK_TOKEN}
-  Configure no Telegram com setWebhook apontando para essa URL.
-
-- Banco:
-  * timeline / ngram -> memória leve para n-grams (2..5) com decaimento
-  * pending -> controle do sinal em aberto (um por vez):
-      id, created_at, suggested, stage(0|1|2), open(0|1), seen(TEXT)
-
-- Regras resumidas:
-  * Só abre novo sinal quando não há pendência aberta.
-  * "ENTRADA CONFIRMADA" do fonte -> escolhe 1 número via n-gram (GEN) e publica.
-  * "Estamos no 1° gale" -> marca G1; "Estamos no 2° gale" -> marca G2.
-  * Fechamento **somente** quando vier o relatório com 3 números (ex.: "(1 | 4 | 4)"):
-      - 1º = GREEN em G0; 2º = GREEN em G1; 3º = GREEN em G2; senão = LOSS.
+Regras reforçadas:
+- Só fecha GREEN/LOSS após conferir 3 números.
+- Se o fonte encerrar antes (ex.: GREEN no G1), o bot espera a próxima
+  ENTRADA CONFIRMADA e usa os 3 primeiros números da nova "🚥 Sequência" para
+  completar a conferência do sinal anterior.
 """
 
 import os, re, json, time, sqlite3, asyncio
@@ -244,7 +229,6 @@ def choose_single_number(after: Optional[int]) -> Tuple[int, float, int]:
     if all(v == 0.0 for v in scores.values()):
         last = tail[-50:] if len(tail) >= 50 else tail
         freq = {c: last.count(c) for c in cands}
-        # menor frequência recente vira "melhor" palpite quando sem n-gram
         best = sorted(cands, key=lambda x: (freq.get(x,0), x))[0]
         conf = 0.50
         return best, conf, len(tail)
@@ -261,8 +245,9 @@ AFTER_RX = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
 GALE1_RX = re.compile(r"Estamos\s+no\s*1[ºo]\s*gale", re.I)
 GALE2_RX = re.compile(r"Estamos\s+no\s*2[ºo]\s*gale", re.I)
 
-# Fechamento por TRINCA de números: captura "(1 | 4 | 4)" em qualquer lugar do texto
-TRIPLE_RX = re.compile(r"\(\s*([1-4])\s*\|\s*([1-4])\s*\|\s*([1-4])\s*\)")
+# Resultados no "APOSTA ENCERRADA": extrai números dentro de parênteses, ex. "(1 | 4 | 4)" ou "(4 | 2)"
+PAREN_GROUP_RX = re.compile(r"\(([^)]*)\)")
+DIGIT_RX = re.compile(r"[1-4]")
 
 def parse_entry_text(text: str) -> Optional[Dict]:
     t = re.sub(r"\s+", " ", text).strip()
@@ -277,13 +262,16 @@ def parse_entry_text(text: str) -> Optional[Dict]:
     after_num = int(mafter.group(1)) if mafter else None
     return {"seq": seq, "after": after_num, "raw": t}
 
-def parse_triple(text: str) -> Optional[Tuple[int, int, int]]:
-    t = re.sub(r"\s+", " ", text).strip()
-    m = TRIPLE_RX.search(t)
-    if not m:
-        return None
-    a, b, c = int(m.group(1)), int(m.group(2)), int(m.group(3))
-    return (a, b, c)
+def extract_result_numbers(text: str) -> List[int]:
+    """Tenta pegar os números de resultado do 'APOSTA ENCERRADA' (GREEN/RED) do fonte."""
+    t = re.sub(r"\s+", " ", text)
+    groups = PAREN_GROUP_RX.findall(t)
+    if not groups:
+        return []
+    # Usa o último grupo de parênteses (normalmente o que contém 1|4|4 ou 4|2)
+    last = groups[-1]
+    nums = DIGIT_RX.findall(last)
+    return [int(x) for x in nums]
 
 # ========= Pending helpers =========
 def get_open_pending() -> Optional[sqlite3.Row]:
@@ -302,10 +290,40 @@ def set_stage(stage:int):
     cur.execute("UPDATE pending SET stage=? WHERE open=1", (int(stage),))
     con.commit(); con.close()
 
+def set_seen_list(lst: List[int]):
+    s = ",".join(str(x) for x in lst[:3])
+    con = _connect(); cur = con.cursor()
+    cur.execute("UPDATE pending SET seen=? WHERE open=1", (s,))
+    con.commit(); con.close()
+
+def append_seen_numbers(nums: List[int]):
+    if not nums:
+        return
+    con = _connect(); cur = con.cursor()
+    row = cur.execute("SELECT seen FROM pending WHERE open=1 ORDER BY id DESC LIMIT 1").fetchone()
+    if not row:
+        con.close(); return
+    seen = (row["seen"] or "").strip()
+    current = [int(x) for x in seen.split(",") if x.strip().isdigit()]
+    for n in nums:
+        if len(current) >= 3:
+            break
+        current.append(int(n))
+    s = ",".join(str(x) for x in current[:3])
+    cur.execute("UPDATE pending SET seen=? WHERE open=1", (s,))
+    con.commit(); con.close()
+
+def get_seen_list_from_row(pend_row: sqlite3.Row) -> List[int]:
+    seen = (pend_row["seen"] or "").strip()
+    return [int(x) for x in seen.split(",") if x.strip().isdigit()]
+
 def close_pending(outcome:str):
     con = _connect(); cur = con.cursor()
     cur.execute("UPDATE pending SET open=0, seen=? WHERE open=1", (outcome,))
     con.commit(); con.close()
+
+def _stage_label_from_index(idx: int) -> str:
+    return "G0" if idx == 0 else ("G1" if idx == 1 else "G2")
 
 def _stage_label(stage_val: Optional[int]) -> str:
     try:
@@ -313,6 +331,39 @@ def _stage_label(stage_val: Optional[int]) -> str:
     except Exception:
         s = 0
     return "G0" if s == 0 else ("G1" if s == 1 else "G2")
+
+def _resolve_if_ready_and_close():
+    """Se já houver 3 números em seen, resolve imediatamente e fecha."""
+    pend = get_open_pending()
+    if not pend:
+        return None
+    seen_list = get_seen_list_from_row(pend)
+    if len(seen_list) < 3:
+        return None
+
+    suggested = int(pend["suggested"])
+    outcome = "LOSS"
+    stage_lbl = "G2"
+    # encontra primeira ocorrência do sugerido entre os 3:
+    try:
+        idx = seen_list.index(suggested)
+        if idx in (0,1,2):
+            outcome = "GREEN"
+            stage_lbl = _stage_label_from_index(idx)
+    except ValueError:
+        outcome = "LOSS"
+        stage_lbl = "G2"
+
+    close_pending(outcome)
+    bump_score(outcome)
+
+    # Mensagem com número sugerido e geral:
+    icon = "🟢" if outcome == "GREEN" else "🔴"
+    txt = (
+        f"{icon} <b>{outcome}</b> — finalizado (<b>{stage_lbl}</b>, número <b>{suggested}</b>).\n"
+        f"📊 Geral: {score_text()}"
+    )
+    return txt
 
 # ========= Telegram =========
 async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
@@ -346,7 +397,22 @@ async def webhook(token: str, request: Request):
     if not text:
         return {"ok": True, "skipped": "sem_texto"}
 
-    # 1) Atualizações de gales (apenas marcam estágio; não fecham)
+    t_norm = re.sub(r"\s+", " ", text)
+
+    # ===== 0) Se for "APOSTA ENCERRADA": tente coletar números do resultado (1..3) e resolver se conseguir 3
+    if "APOSTA ENCERRADA" in t_norm.upper():
+        nums = extract_result_numbers(text)  # pode retornar 1, 2 ou 3 números
+        if nums and get_open_pending():
+            append_seen_numbers(nums)
+            # tenta resolver se já tem 3
+            maybe_msg = _resolve_if_ready_and_close()
+            if maybe_msg:
+                await tg_send_text(TARGET_CHANNEL, maybe_msg)
+                return {"ok": True, "closed_by_result": True}
+        # mesmo sem números suficientes, só anota — fechamento ficará para a próxima ENTRADA
+        return {"ok": True, "result_noted": True, "nums": nums}
+
+    # ===== 1) Gales — apenas anotam estágio; não fecham
     if GALE1_RX.search(text):
         if get_open_pending():
             set_stage(1)
@@ -359,66 +425,55 @@ async def webhook(token: str, request: Request):
             await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>2° gale (G2)</b>")
         return {"ok": True, "noted": "g2"}
 
-    # 2) Fechamento por TRINCA (sempre esperar (a | b | c))
-    triple = parse_triple(text)
-    if triple:
-        pend = get_open_pending()
-        if not pend:
-            return {"ok": True, "closed_ignored": "sem_pendente"}
-        a, b, c = triple
-        suggested = int(pend["suggested"])
-        # decide resultado pelo índice de acerto
-        result_stage = None
-        hit_number = None
-        if suggested == a:
-            result_stage = "G0"; hit_number = a
-            outcome = "GREEN"
-        elif suggested == b:
-            result_stage = "G1"; hit_number = b
-            outcome = "GREEN"
-        elif suggested == c:
-            result_stage = "G2"; hit_number = c
-            outcome = "GREEN"
-        else:
-            result_stage = "G2"; hit_number = c
-            outcome = "LOSS"
-
-        close_pending(outcome)
-        bump_score(outcome)
-
-        if outcome == "GREEN":
-            await tg_send_text(
-                TARGET_CHANNEL,
-                f"🟢 <b>GREEN</b> — finalizado (<b>{result_stage}</b>, número <b>{hit_number}</b>).\n"
-                f"📊 Geral: {score_text()}"
-            )
-        else:
-            await tg_send_text(
-                TARGET_CHANNEL,
-                f"🔴 <b>LOSS</b> — finalizado (<b>{result_stage}</b>, número <b>{hit_number}</b>).\n"
-                f"📊 Geral: {score_text()}"
-            )
-        return {"ok": True, "closed_by_triple": True, "outcome": outcome, "stage": result_stage, "hit": hit_number}
-
-    # 3) Nova entrada (só abre se não houver pendência; não fecha por heurística)
+    # ===== 2) Nova ENTRADA CONFIRMADA
     parsed = parse_entry_text(text)
     if not parsed:
         return {"ok": True, "skipped": "nao_eh_entrada_confirmada"}
 
+    # (2.a) Se existir pendência aberta e ela ainda não tem 3 números,
+    # use os 3 primeiros da nova "Sequência" para completar a conferência do sinal anterior.
     pend = get_open_pending()
     if pend:
-        # Não fecha por “nova entrada em G2”. Aguarda trinca oficial.
-        return {"ok": True, "ignored": "ja_existe_pendente_aguardando_trinca"}
+        seen_list = get_seen_list_from_row(pend)
+        if len(seen_list) < 3:
+            seq = parsed["seq"] or []
+            fill = seq[:3 - len(seen_list)]
+            if fill:
+                new_seen = seen_list + fill
+                set_seen_list(new_seen)
+            # tenta resolver agora
+            maybe_msg = _resolve_if_ready_and_close()
+            if maybe_msg:
+                await tg_send_text(TARGET_CHANNEL, maybe_msg)
+            else:
+                # se mesmo assim não completou 3, mantém pendente e não abre novo
+                if len(get_seen_list_from_row(get_open_pending())) < 3:
+                    return {"ok": True, "kept_open_waiting_3": True}
 
-    # Alimenta memória de sequência (se vier algo), antes de decidir
-    seq = parsed["seq"] or []
-    if seq:
-        append_seq(seq)
+            # após fechar (se fechou), continua e abre a nova pendência normalmente
+
+        else:
+            # já tinha 3 por algum motivo; resolve e depois abre novo
+            maybe_msg = _resolve_if_ready_and_close()
+            if maybe_msg:
+                await tg_send_text(TARGET_CHANNEL, maybe_msg)
+
+        # Recarrega pendência — pode ter fechado
+        pend = get_open_pending()
+
+        # Se ainda existir aberta aqui, é porque não conseguiu completar 3; então não abra outra
+        if pend:
+            return {"ok": True, "ignored": "ja_existe_pendente_sem_3_numeros"}
+
+    # (2.b) Alimenta memória de sequência (se vier algo), antes de decidir
+    seq_new = parsed["seq"] or []
+    if seq_new:
+        append_seq(seq_new)
 
     after = parsed["after"]
     best, conf, samples = choose_single_number(after)
 
-    # Abre pendência e publica
+    # (2.c) Abre pendência e publica novo tiro seco
     open_pending(best)
     aft_txt = f" após {after}" if after else ""
     txt = (
