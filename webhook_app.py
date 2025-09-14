@@ -34,7 +34,7 @@ Principais pontos:
 import os, re, json, time, sqlite3, asyncio
 from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timezone
-from collections import Counter  # <— novo import
+from collections import Counter
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -54,7 +54,7 @@ if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
 # ========= App =========
-app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="2.1.1")
+app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="2.2.0")
 
 # ========= Utils =========
 def now_ts() -> int:
@@ -183,7 +183,7 @@ def append_seq(seq: List[int]):
                     (now_ts(), int(n)))
     _update_ngrams()
 
-def _update_ngrams(decay: float=0.980, max_n:int=5, window:int=400):  # <- decay ajustado
+def _update_ngrams(decay: float=0.980, max_n:int=5, window:int=400):
     tail = get_tail(window)
     if len(tail) < 2: return
     con = _connect(); cur = con.cursor()
@@ -313,21 +313,28 @@ SEQ_RX = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
 AFTER_RX = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
 GALE1_RX = re.compile(r"Estamos\s+no\s*1[ºo]\s*gale", re.I)
 GALE2_RX = re.compile(r"Estamos\s+no\s*2[ºo]\s*gale", re.I)
-GREEN_RX = re.compile(r"(green|✅|win)", re.I)
-LOSS_RX  = re.compile(r"(loss|perdemos|❌)", re.I)
+GREEN_RX = re.compile(r"(green|greem|✅|win)", re.I)  # aceita "greem"
+LOSS_RX  = re.compile(r"(loss|perdemos|❌|red)", re.I)
 
-def parse_entry_text(text: str) -> Optional[Dict]:
-    t = re.sub(r"\s+", " ", text).strip()
-    if not ENTRY_RX.search(t):
-        return None
-    mseq = SEQ_RX.search(t)
-    seq = []
-    if mseq:
-        parts = re.findall(r"[1-4]", mseq.group(1))
-        seq = [int(x) for x in parts]
-    mafter = AFTER_RX.search(t)
-    after_num = int(mafter.group(1)) if mafter else None
-    return {"seq": seq, "after": after_num, "raw": t}
+# === Extração dos números observados no fechamento ===
+# Ex.: "GREEN ... (4 | 2)" ou "RED ❌ (1 | 4 | 4)"
+GREEN_NUMS_RX = re.compile(r"GREEN[^()]*\(([^)]+)\)", re.I | re.S)
+LOSS_NUMS_RX  = re.compile(r"(?:RED|LOSS)[^()]*\(([^)]+)\)", re.I | re.S)
+
+def _extract_numbers_block(s: str) -> List[int]:
+    """Extrai todos os dígitos 1..4 de um bloco dentro de parênteses."""
+    return [int(x) for x in re.findall(r"[1-4]", s)]
+
+def extract_observed_numbers(text: str) -> List[int]:
+    t = re.sub(r"\s+", " ", text)
+    m = GREEN_NUMS_RX.search(t)
+    if m:
+        return _extract_numbers_block(m.group(1))
+    m = LOSS_NUMS_RX.search(t)
+    if m:
+        return _extract_numbers_block(m.group(1))
+    # fallback: nenhum bloco identificado
+    return []
 
 # ========= Pending helpers =========
 def get_open_pending() -> Optional[sqlite3.Row]:
@@ -357,6 +364,27 @@ def _stage_label(stage_val: Optional[int]) -> str:
     except Exception:
         s = 0
     return "G0" if s == 0 else ("G1" if s == 1 else "G2")
+
+def _stage_from_observed(obs: List[int], suggested: int, fallback_stage: int) -> Tuple[str, str]:
+    """
+    Determina o stage textual com base na primeira ocorrência do nosso número nos observados.
+    Se não aparecer, devolve o stage pelo tamanho dos observados (1->G0, 2->G1, >=3->G2)
+    e usa 'número x'.
+    Retorna (stage_label, numero_texto).
+    """
+    if obs:
+        try:
+            idx = obs.index(int(suggested))  # 0,1,2...
+            stage_lbl = "G0" if idx == 0 else ("G1" if idx == 1 else "G2")
+            return stage_lbl, str(suggested)
+        except ValueError:
+            pass
+        # não achou: deduz pelo tamanho
+        n = len(obs)
+        stage_lbl = "G0" if n == 1 else ("G1" if n == 2 else "G2")
+        return stage_lbl, "x"
+    # sem observados no texto: usa fallback do pending
+    return _stage_label(fallback_stage), "x"
 
 # ========= Telegram =========
 async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
@@ -406,26 +434,32 @@ async def webhook(token: str, request: Request):
     if GREEN_RX.search(text):
         pend = get_open_pending()
         if pend:
-            stage_lbl = _stage_label(pend["stage"])
+            suggested = int(pend["suggested"])
+            obs = extract_observed_numbers(text)  # ex.: [4,2]
+            stage_lbl, num_txt = _stage_from_observed(obs, suggested, fallback_stage=pend["stage"])
             close_pending("GREEN")
             bump_score("GREEN")
+            extra = f"\n🔎 Conferência: nosso={suggested} | observados={' | '.join(map(str,obs)) if obs else '—'}"
             await tg_send_text(
                 TARGET_CHANNEL,
-                f"🟢 <b>GREEN</b> — finalizado (<b>{stage_lbl}</b>).\n"
-                f"📊 Geral: {score_text()}"
+                f"🟢 <b>GREEN</b> — finalizado (<b>{stage_lbl}</b>, número {num_txt}).\n"
+                f"📊 Geral: {score_text()}{extra}"
             )
         return {"ok": True, "closed": "green"}
 
     if LOSS_RX.search(text):
         pend = get_open_pending()
         if pend:
-            stage_lbl = _stage_label(pend["stage"])
+            suggested = int(pend["suggested"])
+            obs = extract_observed_numbers(text)  # ex.: [1,4,4]
+            stage_lbl, num_txt = _stage_from_observed(obs, suggested, fallback_stage=pend["stage"])
             close_pending("LOSS")
             bump_score("LOSS")
+            extra = f"\n🔎 Conferência: nosso={suggested} | observados={' | '.join(map(str,obs)) if obs else '—'}"
             await tg_send_text(
                 TARGET_CHANNEL,
-                f"🔴 <b>LOSS</b> — finalizado (<b>{stage_lbl}</b>).\n"
-                f"📊 Geral: {score_text()}"
+                f"🔴 <b>LOSS</b> — finalizado (<b>{stage_lbl}</b>, número {num_txt}).\n"
+                f"📊 Geral: {score_text()}{extra}"
             )
         return {"ok": True, "closed": "loss"}
 
@@ -439,12 +473,13 @@ async def webhook(token: str, request: Request):
     if pend:
         # heurística: se já estávamos em G2 e chegou outra entrada, considera LOSS da anterior
         if int(pend["stage"] or 0) >= 2:
-            stage_lbl = _stage_label(pend["stage"])
+            suggested = int(pend["suggested"])
+            # sem info de observados aqui; apenas encerra anterior como loss (G2, x)
             close_pending("LOSS")
             bump_score("LOSS")
             await tg_send_text(
                 TARGET_CHANNEL,
-                f"🔴 <b>LOSS (G2)</b> — anterior encerrada (<b>{stage_lbl}</b>).\n"
+                f"🔴 <b>LOSS (G2)</b> — anterior encerrada (<b>G2</b>, número x).\n"
                 f"📊 Geral: {score_text()}"
             )
         else:
