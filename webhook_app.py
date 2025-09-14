@@ -1,109 +1,153 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Webhook único — MODO GEN PURO
-# - Gatilho: "💰 ENTRADA CONFIRMADA 💰" do canal-fonte
-# - Decide 1 número (G0) usando n-grams (GEN) em {1,2,3,4}
-# - Mantém uma pendência (G0→G2). Só abre nova após GREEN/LOSS
-# - Aprende com "Sequência:" para alimentar histórico
-# - Placar a cada 5 min e reset 00:00 UTC
-#
-# ENV obrigatórias:
-#   TG_BOT_TOKEN, WEBHOOK_TOKEN
-# ENV recomendadas:
-#   TARGET_CHANNEL (ex.: -1002796105884)
-#   SOURCE_CHANNEL_ID (ex.: -1002810508717)  -> filtra apenas o canal-fonte
-#   DB_PATH (ex.: /var/data/mini_ref.db)
+"""
+webhook_app.py
+--------------
+FastAPI + Telegram webhook para refletir sinais do canal-fonte e publicar
+um "número seco" (modo GEN = sem restrição de paridade/tamanho) no canal-alvo.
+Também acompanha os gales (G1/G2) com base nas mensagens do canal-fonte.
+
+Principais pontos:
+- ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
+- ENV opcionais:
+    TARGET_CHANNEL   -> canal onde será publicado o tiro seco (ex.: -1002796105884)
+    SOURCE_CHANNEL   -> canal-fonte que disparam os gatilhos (ex.: -1002810508717)
+    DB_PATH          -> caminho do sqlite (default: /var/data/data.db)
+- Webhook: POST /webhook/{WEBHOOK_TOKEN}
+  Configure no Telegram com setWebhook apontando para essa URL.
+
+- Banco:
+  * timeline / ngram -> memória leve para n-grams (2..5) com decaimento
+  * pending -> controle do sinal em aberto (um por vez):
+      id, created_at, suggested, stage(0|1|2), open(0|1), seen(TEXT)
+
+- Regras resumidas:
+  * Só abre novo sinal quando não há pendência aberta.
+  * "ENTRADA CONFIRMADA" do fonte -> escolhe 1 número via n-gram (GEN) e publica.
+  * "Estamos no 1° gale" -> marca G1; "Estamos no 2° gale" -> marca G2.
+  * Heurística para desfecho:
+      - Se aparecer "green", "✅", "win" no texto do fonte -> encerra como GREEN.
+      - Se vier uma NOVA "ENTRADA CONFIRMADA" e a pendência anterior já estava em G2,
+        encerra a anterior como LOSS.
+"""
 
 import os, re, json, time, sqlite3, asyncio
 from typing import List, Optional, Tuple, Dict
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 
-# ================== ENV / CONFIG ==================
+# ========= ENV =========
 TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
 WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
+TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1002796105884").strip()
+SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "").strip()  # se vazio, não filtra
 
-TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1002796105884").strip()       # destino
-SOURCE_CHANNEL_ID = os.getenv("SOURCE_CHANNEL_ID", "").strip()               # fonte (opcional)
-
-DB_PATH        = os.getenv("DB_PATH", "/var/data/mini_ref.db").strip() or "/var/data/mini_ref.db"
+DB_PATH        = os.getenv("DB_PATH", "/var/data/data.db").strip() or "/var/data/data.db"
 TELEGRAM_API   = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
-# n-grams
-WINDOW = 400
-DECAY  = 0.985
-W4, W3, W2, W1 = 0.40, 0.30, 0.20, 0.10
+if not TG_BOT_TOKEN:
+    raise RuntimeError("Defina TG_BOT_TOKEN no ambiente.")
+if not WEBHOOK_TOKEN:
+    raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
-# pendência (G0 + até G2 = 3 tentativas)
-MAX_STAGE = 3  # G0(0), G1(1), G2(2)
+# ========= App =========
+app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="2.0.0")
 
-# scoreboard
-SCOREBOARD_INTERVAL_SEC = 300  # 5 min
+# ========= Utils =========
+def now_ts() -> int:
+    return int(time.time())
 
-app = FastAPI(title="guardiao — GEN puro (webhook)", version="2.1.0")
+def ts_str(ts=None) -> str:
+    if ts is None: ts = now_ts()
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-# ================== DB helpers ==================
+# ========= DB helpers =========
 def _connect() -> sqlite3.Connection:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    con = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=20.0)
+    con = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30.0)
     con.row_factory = sqlite3.Row
+    # tentar reduzir "database is locked"
     con.execute("PRAGMA journal_mode=WAL;")
     con.execute("PRAGMA synchronous=NORMAL;")
+    con.execute("PRAGMA busy_timeout=10000;")
     return con
 
-def init_db():
+def _column_exists(con: sqlite3.Connection, table: str, col: str) -> bool:
+    r = con.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(row["name"] == col or row[1] == col for row in r)
+
+def migrate_db():
     con = _connect(); cur = con.cursor()
+    # timeline
     cur.execute("""CREATE TABLE IF NOT EXISTS timeline (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         created_at INTEGER NOT NULL,
         number INTEGER NOT NULL
     )""")
+    # ngram
     cur.execute("""CREATE TABLE IF NOT EXISTS ngram (
         n INTEGER NOT NULL, ctx TEXT NOT NULL, nxt INTEGER NOT NULL, w REAL NOT NULL,
         PRIMARY KEY (n, ctx, nxt)
     )""")
+    # pending
     cur.execute("""CREATE TABLE IF NOT EXISTS pending (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        created_at INTEGER NOT NULL,
-        suggested INTEGER NOT NULL,
-        stage INTEGER NOT NULL,   -- 0=G0,1=G1,2=G2
-        open INTEGER NOT NULL,    -- 1 em aberto
-        seen TEXT NOT NULL DEFAULT '' -- números reais vistos na janela
+        created_at INTEGER,
+        suggested INTEGER,
+        stage INTEGER DEFAULT 0,
+        open INTEGER DEFAULT 1,
+        seen TEXT
     )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS daily_score (
-        yyyymmdd TEXT PRIMARY KEY,
-        g0 INTEGER NOT NULL DEFAULT 0,
-        loss INTEGER NOT NULL DEFAULT 0,
-        streak INTEGER NOT NULL DEFAULT 0
-    )""")
+    # garantir colunas (idempotente)
+    if not _column_exists(con, "pending", "created_at"):
+        cur.execute("ALTER TABLE pending ADD COLUMN created_at INTEGER")
+    if not _column_exists(con, "pending", "suggested"):
+        cur.execute("ALTER TABLE pending ADD COLUMN suggested INTEGER")
+    if not _column_exists(con, "pending", "stage"):
+        cur.execute("ALTER TABLE pending ADD COLUMN stage INTEGER DEFAULT 0")
+    if not _column_exists(con, "pending", "open"):
+        cur.execute("ALTER TABLE pending ADD COLUMN open INTEGER DEFAULT 1")
+    if not _column_exists(con, "pending", "seen"):
+        cur.execute("ALTER TABLE pending ADD COLUMN seen TEXT")
+
     con.commit(); con.close()
 
-init_db()
+migrate_db()
 
-def now_ts() -> int:
-    return int(time.time())
-
-def today_key_utc() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%d")
-
-# ================== n-grams ==================
-def get_tail(limit:int=WINDOW) -> List[int]:
+# ========= N-gram memória =========
+def get_tail(limit:int=400) -> List[int]:
     con = _connect()
     rows = con.execute("SELECT number FROM timeline ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
     con.close()
     return [int(r["number"]) for r in rows][::-1]
 
+def _exec_write(sql: str, params: tuple=()):
+    # robust com retry para "database is locked"
+    for attempt in range(6):
+        try:
+            con = _connect()
+            cur = con.cursor()
+            cur.execute(sql, params)
+            con.commit()
+            con.close()
+            return
+        except sqlite3.OperationalError as e:
+            emsg = str(e).lower()
+            if "locked" in emsg or "busy" in emsg:
+                time.sleep(0.25*(attempt+1))
+                continue
+            raise
+
 def append_seq(seq: List[int]):
     if not seq: return
-    con = _connect(); cur = con.cursor()
     for n in seq:
-        cur.execute("INSERT INTO timeline (created_at, number) VALUES (?,?)", (now_ts(), int(n)))
-    con.commit(); con.close()
+        _exec_write("INSERT INTO timeline (created_at, number) VALUES (?,?)",
+                    (now_ts(), int(n)))
     _update_ngrams()
 
-def _update_ngrams(decay: float=DECAY, max_n:int=5, window:int=WINDOW):
+def _update_ngrams(decay: float=0.985, max_n:int=5, window:int=400):
     tail = get_tail(window)
     if len(tail) < 2: return
     con = _connect(); cur = con.cursor()
@@ -127,16 +171,19 @@ def _prob_from_ngrams(ctx: List[int], cand: int) -> float:
     if n < 2 or n > 5: return 0.0
     ctx_key = ",".join(str(x) for x in ctx)
     con = _connect()
-    row_tot = con.execute("SELECT SUM(w) AS s FROM ngram WHERE n=? AND ctx=?", (n, ctx_key)).fetchone()
+    row_tot = con.execute("SELECT SUM(w) AS s FROM ngram WHERE n=? AND ctx=?",
+                          (n, ctx_key)).fetchone()
     tot = (row_tot["s"] or 0.0) if row_tot else 0.0
     if tot <= 0:
         con.close(); return 0.0
-    row_c = con.execute("SELECT w FROM ngram WHERE n=? AND ctx=? AND nxt=?", (n, ctx_key, int(cand))).fetchone()
+    row_c = con.execute("SELECT w FROM ngram WHERE n=? AND ctx=? AND nxt=?",
+                        (n, ctx_key, int(cand))).fetchone()
     w = (row_c["w"] or 0.0) if row_c else 0.0
     con.close()
     return w / tot
 
-def _ngram_backoff(tail: List[int], cand:int, after: Optional[int]) -> float:
+W4, W3, W2, W1 = 0.40, 0.30, 0.20, 0.10
+def _ngram_backoff(tail: List[int], after: Optional[int], cand:int) -> float:
     if not tail: return 0.0
     if after is not None and after in tail:
         idxs = [i for i,v in enumerate(tail) if v == after]
@@ -157,182 +204,78 @@ def _ngram_backoff(tail: List[int], cand:int, after: Optional[int]) -> float:
     if len(ctx1)==1: s += W1 * _prob_from_ngrams(ctx1[:-1], cand)
     return s
 
-def choose_gen_number(after: Optional[int]) -> Tuple[int, float, int]:
-    """Escolhe 1 número em {1,2,3,4} pelo GEN (n-grams) — nunca abstem."""
+def choose_single_number(after: Optional[int]) -> Tuple[int, float, int]:
     cands = [1,2,3,4]
-    tail = get_tail(WINDOW)
-    scores = {c: _ngram_backoff(tail, c, after) for c in cands}
+    tail = get_tail(400)
+    scores = {c: _ngram_backoff(tail, after, c) for c in cands}
     if all(v == 0.0 for v in scores.values()):
-        # desempate: saiu menos nos últimos 50
-        last = tail[-50:] if len(tail)>=50 else tail
+        last = tail[-50:] if len(tail) >= 50 else tail
         freq = {c: last.count(c) for c in cands}
         best = sorted(cands, key=lambda x: (freq.get(x,0), x))[0]
-        return best, 0.50, len(tail)
+        conf = 0.50
+        return best, conf, len(tail)
     total = sum(scores.values()) or 1e-9
     post = {k: v/total for k,v in scores.items()}
     best = max(post.items(), key=lambda kv: kv[1])[0]
-    return best, post[best], len(tail)
+    conf = float(post[best])
+    return best, conf, len(tail)
 
-# ================== Parsers ==================
+# ========= Parse =========
 ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
-SEQ_RX   = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
+SEQ_RX = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
 AFTER_RX = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
+GALE1_RX = re.compile(r"Estamos\s+no\s*1[ºo]\s*gale", re.I)
+GALE2_RX = re.compile(r"Estamos\s+no\s*2[ºo]\s*gale", re.I)
+GREEN_RX = re.compile(r"(green|✅|win)", re.I)
+LOSS_RX  = re.compile(r"(loss|perdemos|❌)", re.I)
 
-# Resultados comuns nos canais
-GREEN_PATTERNS = [
-    re.compile(r"\bGREEN\b.*?\(([1-4])\)", re.I|re.S),
-    re.compile(r"APOSTA\s+ENCERRADA.*?\bGREEN\b.*?\(([1-4])\)", re.I|re.S),
-]
-RED_PATTERNS = [
-    re.compile(r"\bRED\b.*?\(([1-4])\)", re.I|re.S),
-    re.compile(r"\bLOSS\b.*?Número[:\s]*([1-4])", re.I|re.S),
-    re.compile(r"APOSTA\s+ENCERRADA.*?\bRED\b.*?\(([1-4])\)", re.I|re.S),
-]
-
-GALE1_RX = re.compile(r"Estamos\s+no\s*1[oº]\s*gale", re.I)
-GALE2_RX = re.compile(r"Estamos\s+no\s*2[oº]\s*gale", re.I)
-
-def parse_entry(text: str) -> Optional[Dict]:
+def parse_entry_text(text: str) -> Optional[Dict]:
     t = re.sub(r"\s+", " ", text).strip()
-    if not ENTRY_RX.search(t): return None
-    seq, after = [], None
+    if not ENTRY_RX.search(t):
+        return None
     mseq = SEQ_RX.search(t)
+    seq = []
     if mseq:
         parts = re.findall(r"[1-4]", mseq.group(1))
         seq = [int(x) for x in parts]
     mafter = AFTER_RX.search(t)
-    after = int(mafter.group(1)) if mafter else None
-    return {"seq": seq, "after": after, "raw": t}
+    after_num = int(mafter.group(1)) if mafter else None
+    return {"seq": seq, "after": after_num, "raw": t}
 
-def parse_green(text:str) -> Optional[int]:
-    t = re.sub(r"\s+", " ", text)
-    for rx in GREEN_PATTERNS:
-        m = rx.search(t)
-        if m:
-            nums = re.findall(r"[1-4]", m.group(1))
-            if nums: return int(nums[0])
-    return None
-
-def parse_red(text:str) -> Optional[int]:
-    t = re.sub(r"\s+", " ", text)
-    for rx in RED_PATTERNS:
-        m = rx.search(t)
-        if m:
-            nums = re.findall(r"[1-4]", m.group(1))
-            if nums: return int(nums[0])
-    return None
-
-def extract_seq(text:str) -> List[int]:
-    m = SEQ_RX.search(text)
-    if not m: return []
-    return [int(x) for x in re.findall(r"[1-4]", m.group(1))]
-
-# ================== Pendências & Placar ==================
-def has_open_pending() -> Optional[sqlite3.Row]:
+# ========= Pending helpers =========
+def get_open_pending() -> Optional[sqlite3.Row]:
     con = _connect()
-    r = con.execute("SELECT * FROM pending WHERE open=1 ORDER BY id LIMIT 1").fetchone()
+    row = con.execute("SELECT * FROM pending WHERE open=1 ORDER BY id DESC LIMIT 1").fetchone()
     con.close()
-    return r
+    return row
 
-def open_pending(suggested:int):
+def open_pending(suggested: int):
+    _exec_write("""INSERT INTO pending (created_at, suggested, stage, open, seen)
+                   VALUES (?,?,?,?,?)""",
+                (now_ts(), int(suggested), 0, 1, ""))
+
+def set_stage(stage:int):
     con = _connect(); cur = con.cursor()
-    cur.execute("""INSERT INTO pending (created_at, suggested, stage, open, seen)
-                   VALUES (?,?,?,?,?)""", (now_ts(), int(suggested), 0, 1, ""))
+    cur.execute("UPDATE pending SET stage=? WHERE open=1", (int(stage),))
     con.commit(); con.close()
 
-def register_seen(n:int):
-    r = has_open_pending()
-    if not r: return
-    pid = int(r["id"])
-    seen = (r["seen"] or "")
-    seen2 = (seen + ("|" if seen else "") + str(int(n)))
+def close_pending(outcome:str):
     con = _connect(); cur = con.cursor()
-    cur.execute("UPDATE pending SET seen=? WHERE id=?", (seen2, pid))
+    cur.execute("UPDATE pending SET open=0, seen=? WHERE open=1", (outcome,))
     con.commit(); con.close()
 
-def _update_score(win: bool):
-    y = today_key_utc()
-    con = _connect(); cur = con.cursor()
-    row = cur.execute("SELECT g0,loss,streak FROM daily_score WHERE yyyymmdd=?", (y,)).fetchone()
-    g0 = (row["g0"] if row else 0); loss = (row["loss"] if row else 0); streak = (row["streak"] if row else 0)
-    if win:
-        g0 += 1; streak += 1
-    else:
-        loss += 1; streak = 0
-    cur.execute("""INSERT OR REPLACE INTO daily_score (yyyymmdd,g0,loss,streak)
-                   VALUES (?,?,?,?)""", (y, g0, loss, streak))
-    con.commit(); con.close()
-    return g0, loss, streak
-
-async def _send_scoreboard():
-    y = today_key_utc()
-    con = _connect()
-    row = con.execute("SELECT g0,loss,streak FROM daily_score WHERE yyyymmdd=?", (y,)).fetchone()
-    con.close()
-    g0 = (row["g0"] if row else 0); loss = (row["loss"] if row else 0); streak = (row["streak"] if row else 0)
-    total = g0 + loss
-    acc = (g0/total*100.0) if total else 0.0
-    txt = (f"📊 <b>Placar do dia</b>\n"
-           f"🟢 G0:{g0}  🔴 Loss:{loss}\n"
-           f"✅ Acerto: {acc:.2f}%\n"
-           f"🔥 Streak: {streak} GREEN(s)")
-    await tg_send_text(TARGET_CHANNEL, txt, "HTML")
-
-def _reset_daily():
-    y = today_key_utc()
-    con = _connect(); cur = con.cursor()
-    cur.execute("""INSERT OR REPLACE INTO daily_score (yyyymmdd,g0,loss,streak)
-                   VALUES (?,?,?,?)""", (y,0,0,0))
-    con.commit(); con.close()
-
-async def _loop_scoreboard():
-    while True:
-        try:
-            await _send_scoreboard()
-        except Exception:
-            pass
-        await asyncio.sleep(SCOREBOARD_INTERVAL_SEC)
-
-async def _loop_midnight_reset():
-    while True:
-        now = datetime.now(timezone.utc)
-        midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        wait = max(1.0, (midnight - now).total_seconds())
-        await asyncio.sleep(wait)
-        try:
-            _reset_daily()
-            await tg_send_text(TARGET_CHANNEL, "🕛 Reset diário executado (00:00 UTC)", "HTML")
-        except Exception:
-            pass
-
-# ================== Telegram helpers ==================
+# ========= Telegram =========
 async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
-    if not TG_BOT_TOKEN or not chat_id: return
+    if not TG_BOT_TOKEN: return
     async with httpx.AsyncClient(timeout=15) as client:
         await client.post(f"{TELEGRAM_API}/sendMessage",
                           json={"chat_id": chat_id, "text": text, "parse_mode": parse,
                                 "disable_web_page_preview": True})
 
-# ================== App lifecycle ==================
-@app.on_event("startup")
-async def _boot():
-    try:
-        asyncio.create_task(_loop_scoreboard())
-        asyncio.create_task(_loop_midnight_reset())
-    except Exception:
-        pass
-
-# ================== Routes ==================
+# ========= Rotas =========
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "guardiao-auto-bot (GEN puro)"}
-
-def _from_source_chat(msg: dict) -> bool:
-    if not SOURCE_CHANNEL_ID:
-        return True
-    chat = msg.get("chat") or {}
-    cid = str(chat.get("id", ""))
-    return cid == SOURCE_CHANNEL_ID
+    return {"ok": True, "service": "guardiao-auto-bot (GEN webhook)"}
 
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
@@ -340,74 +283,82 @@ async def webhook(token: str, request: Request):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     data = await request.json()
-
-    # Extrai o pacote de mensagem
     msg = data.get("channel_post") or data.get("message") \
-          or data.get("edited_channel_post") or data.get("edited_message") or {}
-
-    # Filtra por origem (se configurado)
-    if not _from_source_chat(msg):
-        return {"ok": True, "skipped": "wrong_source"}
+        or data.get("edited_channel_post") or data.get("edited_message") or {}
 
     text = (msg.get("text") or msg.get("caption") or "").strip()
+    chat = msg.get("chat") or {}
+    chat_id = str(chat.get("id") or "")
+    # se SOURCE_CHANNEL estiver definido, filtra
+    if SOURCE_CHANNEL and chat_id != str(SOURCE_CHANNEL):
+        return {"ok": True, "skipped": "outro_chat"}
+
     if not text:
         return {"ok": True, "skipped": "sem_texto"}
 
-    # 1) GREEN/RED → fecha/avança pendência
-    gnum = parse_green(text)
-    rnum = parse_red(text)
-    openp = has_open_pending()
+    # 1) Gales/Green/Loss
+    if GALE1_RX.search(text):
+        if get_open_pending():
+            set_stage(1)
+            await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>1° gale (G1)</b>")
+        return {"ok": True, "noted": "g1"}
 
-    if gnum is not None or rnum is not None:
-        n_observed = gnum if gnum is not None else rnum
-        if openp:
-            # registra número real visto
-            register_seen(n_observed)
-            sug  = int(openp["suggested"])
-            stg  = int(openp["stage"])
-            pid  = int(openp["id"])
+    if GALE2_RX.search(text):
+        if get_open_pending():
+            set_stage(2)
+            await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>2° gale (G2)</b>")
+        return {"ok": True, "noted": "g2"}
 
-            if n_observed == sug:
-                # GREEN
-                g0, loss, streak = _update_score(True)
-                await tg_send_text(TARGET_CHANNEL, f"✅ <b>GREEN</b> em <b>G{stg}</b> — Número: <b>{sug}</b>", "HTML")
-                # fecha
-                con=_connect(); con.execute("UPDATE pending SET open=0 WHERE id=?", (pid,)); con.commit(); con.close()
-            else:
-                # MISS → avança estágio ou fecha LOSS
-                stg2 = stg + 1
-                if stg2 >= MAX_STAGE:
-                    g0, loss, streak = _update_score(False)
-                    await tg_send_text(TARGET_CHANNEL, f"❌ <b>LOSS</b> — Número: <b>{sug}</b>", "HTML")
-                    con=_connect(); con.execute("UPDATE pending SET open=0, stage=? WHERE id=?", (stg2, pid)); con.commit(); con.close()
-                else:
-                    con=_connect(); con.execute("UPDATE pending SET stage=? WHERE id=?", (stg2, pid)); con.commit(); con.close()
-        return {"ok": True, "observed": n_observed, "green": gnum is not None}
+    if GREEN_RX.search(text):
+        if get_open_pending():
+            close_pending("GREEN")
+            await tg_send_text(TARGET_CHANNEL, "🟢 <b>GREEN</b> — finalizado.")
+        return {"ok": True, "closed": "green"}
 
-    # 2) Alimenta histórico com "Sequência:" (sem disparar nada)
-    seq_only = extract_seq(text)
-    if seq_only:
-        append_seq(seq_only)
+    if LOSS_RX.search(text):
+        if get_open_pending():
+            close_pending("LOSS")
+            await tg_send_text(TARGET_CHANNEL, "🔴 <b>LOSS</b> — finalizado.")
+        return {"ok": True, "closed": "loss"}
 
-    # 3) ENTRADA CONFIRMADA → se NÃO há pendência aberta, decide GEN e dispara G0
-    parsed = parse_entry(text)
-    if parsed:
-        if has_open_pending():
-            # já existe janela; não bagunçar
-            return {"ok": True, "skipped": "pending_open"}
-        seq = parsed["seq"] or []
-        after = parsed["after"]
-        # alimenta histórico antes de decidir
+    # 2) Nova entrada
+    parsed = parse_entry_text(text)
+    if not parsed:
+        return {"ok": True, "skipped": "nao_eh_entrada_confirmada"}
+
+    # Se já existe pendência aberta:
+    pend = get_open_pending()
+    if pend:
+        # heurística: se já estávamos em G2 e chegou outra entrada, considera LOSS da anterior
+        if int(pend["stage"] or 0) >= 2:
+            close_pending("LOSS")
+            await tg_send_text(TARGET_CHANNEL, "🔴 <b>LOSS (G2)</b> — anterior encerrada.")
+        else:
+            # ignora abertura até encerrar
+            return {"ok": True, "ignored": "ja_existe_pendente"}
+
+    # Alimenta memória de sequência (se vier algo), antes de decidir
+    seq = parsed["seq"] or []
+    if seq:
         append_seq(seq)
-        # decide GEN
-        best, conf, samples = choose_gen_number(after)
-        # abre pendência
-        open_pending(best)
-        aft_txt = f" após {after}" if after else ""
-        out = (f"🎯 <b>Número seco (G0):</b> <b>{best}</b>\n"
-               f"🧩 <b>Padrão:</b> GEN{aft_txt}\n"
-               f"📊 Conf: <b>{conf*100:.2f}%</b> | Amostra≈<b>{samples}</b>")
-        await tg_send_text(TARGET_CHANNEL, out, "HTML")
-        return {"ok": True, "posted": True, "best": best, "conf": conf, "samples": samples}
 
-    return {"ok": True, "noop": True}
+    after = parsed["after"]
+    best, conf, samples = choose_single_number(after)
+
+    # Abre pendência e publica
+    open_pending(best)
+    aft_txt = f" após {after}" if after else ""
+    txt = (
+        f"🎯 <b>Número seco (G0):</b> <b>{best}</b>\n"
+        f"🧩 <b>Padrão:</b> GEN{aft_txt}\n"
+        f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples}"
+    )
+    await tg_send_text(TARGET_CHANNEL, txt)
+
+    return {"ok": True, "posted": True, "best": best, "conf": conf, "samples": samples}
+
+# ===== Debug/help endpoints (opcionais) =====
+@app.get("/health")
+async def health():
+    pend = bool(get_open_pending())
+    return {"ok": True, "db": DB_PATH, "pending_open": pend, "time": ts_str()}
