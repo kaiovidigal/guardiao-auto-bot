@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Webhook único: lê "ENTRADA CONFIRMADA" do canal-fonte, decide 1 número seco e publica no canal alvo.
+# Webhook único: lê "ENTRADA CONFIRMADA", decide 1 número seco, publica no alvo,
+# e marca GREEN/LOSS quando o canal-fonte publicar o resultado.
 
 import os, re, json, time, sqlite3
 from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timezone
 
 import httpx
-from fastapi import FastAPI, Request, HTTPException, Response
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Request, HTTPException
 
 # ========= ENV =========
 TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
 WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
 
-# Canal destino (onde publica o tiro seco)
-TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1002796105884").strip()
+# Canal ALVO (onde você quer publicar o tiro seco + resultado)
+TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1002796105884").strip()   # @iafantan
 
-# Canal-fonte (de onde o bot COLETA as mensagens de entrada confirmada)
-SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "").strip()  # ex.: -1002810508717
+# Canal FONTE (de onde chegam as mensagens do grupo de sinais)
+SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "").strip()  # ex.: "-1002810508717"
 
 # Banco local simples (persiste histórico leve)
 DB_PATH        = os.getenv("DB_PATH", "/data/mini_ref.db").strip() or "/data/mini_ref.db"
@@ -45,9 +45,16 @@ def init_db():
         created_at INTEGER NOT NULL,
         number INTEGER NOT NULL
     )""")
+    # n-grams 2..5
     cur.execute("""CREATE TABLE IF NOT EXISTS ngram (
         n INTEGER NOT NULL, ctx TEXT NOT NULL, nxt INTEGER NOT NULL, w REAL NOT NULL,
         PRIMARY KEY (n, ctx, nxt)
+    )""")
+    # guarda última sugestão “em aberto”
+    cur.execute("""CREATE TABLE IF NOT EXISTS last_pick (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        suggested INTEGER NOT NULL
     )""")
     con.commit(); con.close()
 
@@ -134,9 +141,10 @@ def target_to_candidates(target: Optional[str]) -> List[int]:
     return [1,2,3,4]
 
 # ========= Scoring (sempre escolhe 1 número) =========
-W4, W3, W2, W1 = 0.40, 0.30, 0.20, 0.10
+W4, W3, W2, W1 = 0.40, 0.30, 0.20, 0.10   # pesos do backoff
 def _ngram_backoff(tail: List[int], after: Optional[int], cand:int) -> float:
     if not tail: return 0.0
+    # Se “após X”, corta o contexto no último X (se houver)
     if after is not None and after in tail:
         idxs = [i for i,v in enumerate(tail) if v == after]
         i = idxs[-1]
@@ -157,15 +165,18 @@ def _ngram_backoff(tail: List[int], after: Optional[int], cand:int) -> float:
     return s
 
 def choose_single_number(cands: List[int], after: Optional[int]) -> Tuple[int, float, int]:
+    """Retorna (melhor, conf_normalizada, amostras~) — nunca abstem."""
     tail = get_tail(400)
     scores = {c: _ngram_backoff(tail, after, c) for c in cands}
+    # Se todos 0, usa desempate por frequência recente (quem saiu menos nos últimos 50)
     if all(v == 0.0 for v in scores.values()):
         last = tail[-50:] if len(tail) >= 50 else tail
         freq = {c: last.count(c) for c in cands}
-        best = sorted(cands, key=lambda x: (freq.get(x,0), x))[0]
+        best = sorted(cands, key=lambda x: (freq.get(x,0), x))[0]  # escolhe o que saiu MENOS recentemente
         conf = 0.50
         samples = len(tail)
         return best, conf, samples
+    # normaliza como pseudo-confiança
     total = sum(scores.values()) or 1e-9
     post = {k: v/total for k,v in scores.items()}
     best = max(post.items(), key=lambda kv: kv[1])[0]
@@ -173,28 +184,61 @@ def choose_single_number(cands: List[int], after: Optional[int]) -> Tuple[int, f
     samples = len(tail)
     return best, conf, samples
 
+# ========= Resultado (GREEN/LOSS) =========
+GREEN_PATTERNS = [
+    re.compile(r"APOSTA\s+ENCERRADA.*?\bGREEN\b.*?\(([1-4])\)", re.I | re.S),
+    re.compile(r"\bGREEN\b.*?Número[:\s]*([1-4])", re.I | re.S),
+    re.compile(r"\bGREEN\b.*?\(([1-4])\)", re.I | re.S),
+]
+LOSS_PATTERNS = [
+    re.compile(r"APOSTA\s+ENCERRADA.*?\bRED\b.*?\(([1-4])\)", re.I | re.S),
+    re.compile(r"\bLOSS\b.*?Número[:\s]*([1-4])", re.I | re.S),
+    re.compile(r"\bRED\b.*?\(([1-4])\)", re.I | re.S),
+]
+
+def extract_green_number(text: str) -> Optional[int]:
+    t = re.sub(r"\s+", " ", text)
+    for rx in GREEN_PATTERNS:
+        m = rx.search(t)
+        if m:
+            return int(re.findall(r"[1-4]", m.group(1))[0])
+    return None
+
+def extract_loss_number(text: str) -> Optional[int]:
+    t = re.sub(r"\s+", " ", text)
+    for rx in LOSS_PATTERNS:
+        m = rx.search(t)
+        if m:
+            return int(re.findall(r"[1-4]", m.group(1))[0])
+    return None
+
+def save_last_pick(n: int):
+    con = _connect()
+    con.execute("INSERT INTO last_pick (ts, suggested) VALUES (?,?)", (int(time.time()), int(n)))
+    con.commit(); con.close()
+
+def get_last_pick(max_age_sec: int = 15*60) -> Optional[int]:
+    """Pega a última sugestão recente (janela de 15 min por padrão)."""
+    con = _connect()
+    row = con.execute("SELECT ts, suggested FROM last_pick ORDER BY id DESC LIMIT 1").fetchone()
+    con.close()
+    if not row: return None
+    if int(time.time()) - int(row["ts"]) > max_age_sec:
+        return None
+    return int(row["suggested"])
+
 # ========= Telegram =========
 async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
     if not TG_BOT_TOKEN: return
     async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(f"{TELEGRAM_API}/sendMessage",
-                              json={"chat_id": chat_id, "text": text, "parse_mode": parse,
-                                    "disable_web_page_preview": True})
-        if r.status_code != 200:
-            print(f"[TG] sendMessage {r.status_code}: {r.text[:200]}")
+        await client.post(f"{TELEGRAM_API}/sendMessage",
+                          json={"chat_id": chat_id, "text": text, "parse_mode": parse,
+                                "disable_web_page_preview": True})
 
 # ========= Rotas =========
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "guardiao-auto-bot (webhook único)", "source": SOURCE_CHANNEL, "target": TARGET_CHANNEL}
-
-@app.head("/")
-async def head_ok():
-    return Response(status_code=200)
-
-@app.get("/health")
-async def health():
-    return {"ok": True}
+    return {"ok": True, "service": "guardiao-auto-bot (webhook único)"}
 
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
@@ -202,19 +246,40 @@ async def webhook(token: str, request: Request):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     data = await request.json()
+
+    # Extrai o texto (canal/mensagem/edit)
     msg = data.get("channel_post") or data.get("message") \
           or data.get("edited_channel_post") or data.get("edited_message") or {}
-
-    # valida origem: só processa se vier do canal-fonte
-    chat_id = str((msg.get("chat") or {}).get("id", ""))
-    if SOURCE_CHANNEL and chat_id != SOURCE_CHANNEL:
-        print(f"[SKIP] update de {chat_id} (esperado {SOURCE_CHANNEL})")
-        return {"ok": True, "skipped": "canal_nao_autorizado"}
-
     text = (msg.get("text") or msg.get("caption") or "").strip()
     if not text:
-        return {"ok": True, "skipped": "sem_texto"}
+        return {"ok": True, "skipped": "sem texto"}
 
+    # (opcional) processe apenas o canal-fonte se SOURCE_CHANNEL estiver setado
+    chat = msg.get("chat") or {}
+    chat_id = str(chat.get("id") or "")
+    if SOURCE_CHANNEL and chat_id != SOURCE_CHANNEL:
+        return {"ok": True, "skipped": "outro_canal"}
+
+    # 1) Resultado: GREEN/LOSS -> compara com a última sugestão
+    gnum = extract_green_number(text)
+    lnum = extract_loss_number(text)
+    if gnum is not None or lnum is not None:
+        real = int(gnum if gnum is not None else lnum)
+        # alimenta histórico com o número que saiu
+        append_seq([real])
+        # compara com último pick recente
+        last = get_last_pick()
+        if last is not None:
+            hit = (int(last) == real)
+            if hit:
+                out = f"✅ <b>GREEN</b> — Número: <b>{real}</b>"
+            else:
+                out = f"❌ <b>LOSS</b> — Número: <b>{real}</b> (sugerido foi <b>{last}</b>)"
+            if TG_BOT_TOKEN and TARGET_CHANNEL:
+                await tg_send_text(TARGET_CHANNEL, out, "HTML")
+        return {"ok": True, "observed": real, "green": gnum is not None}
+
+    # 2) ENTRADA CONFIRMADA — processa nova sugestão
     parsed = parse_entry_text(text)
     if not parsed:
         return {"ok": True, "skipped": "nao_eh_entrada_confirmada"}
@@ -223,21 +288,28 @@ async def webhook(token: str, request: Request):
     after = parsed["after"]
     target = parsed["target"] or "GEN"
 
-    append_seq(seq)  # alimenta histórico
+    # Alimenta histórico com a sequência (do passado) antes de decidir
+    # A sequência costuma vir em ordem “left→right”; guardamos na ordem informada
+    append_seq(seq)
 
     cands = target_to_candidates(target)
     best, conf, samples = choose_single_number(cands, after)
 
+    # Monta texto final
     aft_txt = f" após {after}" if after else ""
-    out = (
+    txt = (
         f"🎯 <b>Número seco (G0):</b> <b>{best}</b>\n"
         f"🧩 <b>Padrão:</b> {target}{aft_txt}\n"
         f"📊 Conf: <b>{conf*100:.2f}%</b> | Amostra≈<b>{samples}</b>"
     )
 
+    # Publica no canal-alvo
     if TG_BOT_TOKEN and TARGET_CHANNEL:
-        await tg_send_text(TARGET_CHANNEL, out, "HTML")
-        print(f"[TX] publicado em {TARGET_CHANNEL}: best={best} conf={conf:.3f} target={target} after={after}")
+        await tg_send_text(TARGET_CHANNEL, txt, "HTML")
 
+    # Salva a sugestão como "pendente" para comparar com o resultado
+    save_last_pick(int(best))
+
+    # Também responde OK
     return {"ok": True, "posted": True, "best": best, "conf": conf, "samples": samples,
             "cands": cands, "target": target, "after": after}
