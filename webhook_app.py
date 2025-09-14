@@ -14,17 +14,15 @@ Fechamento robusto:
   • Se não surgir o 3º observado em tempo hábil (timeout), fecha como LOSS com "X" no(s) faltante(s).
 Mensagens finais:
   🟢 GREEN — finalizado (G1, nosso=3, observados=1-3-4).
-  🔴 LOSS  — finalizado (G2, nosso=2, observados=1-4-X).
+  🔴 LOSS  — finalizado (G2, nosso=X, observados=1-4-X).   <-- número X no LOSS
 E sempre adiciona "📊 Geral: <greens> GREEN × <loss> LOSS — <acc>%".
 
-Qualidade (modelo “sem travas de ritmo, mas com filtros”):
+Qualidade (aproveita todos os sinais; só filtros leves):
 - decay = 0.980
 - W4=0.42, W3=0.30, W2=0.18, W1=0.10
-- MIN_SAMPLES = 1500
-- CONF_MIN = 0.60
-- GAP_MIN = 0.050
-- GAP_SOFT (empate técnico) = 0.015 → cai para fallback leve por frequência
-- *Sem antispam/limites de hora ou cooldown pós-loss (aproveita todos os sinais)*
+- GAP_SOFT (empate técnico) = 0.015 → fallback leve por frequência
+- SEM bloqueio por MIN_SAMPLES/CONF_MIN/GAP_MIN
+- Timeout para completar com X: 180s
 
 ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
 ENV opcionais: TARGET_CHANNEL, SOURCE_CHANNEL, DB_PATH
@@ -55,13 +53,10 @@ if not WEBHOOK_TOKEN:
 # ========= App =========
 app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="2.3.1")
 
-# ========= Parâmetros de qualidade =========
+# ========= Parâmetros =========
 DECAY = 0.980
 W4, W3, W2, W1 = 0.42, 0.30, 0.18, 0.10
-MIN_SAMPLES = 1500
-CONF_MIN    = 0.60
-GAP_MIN     = 0.050         # gap mínimo para atirar
-GAP_SOFT    = 0.015         # anti-empate técnico (se <, usa fallback leve)
+GAP_SOFT    = 0.015         # anti-empate técnico (fallback leve)
 OBS_TIMEOUT_SEC = 180       # se não vier 3º número em ~3min, fecha com X
 
 # ========= Utils =========
@@ -77,7 +72,6 @@ def _connect() -> sqlite3.Connection:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     con = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30.0)
     con.row_factory = sqlite3.Row
-    # minimizar "database is locked"
     con.execute("PRAGMA journal_mode=WAL;")
     con.execute("PRAGMA synchronous=NORMAL;")
     con.execute("PRAGMA busy_timeout=10000;")
@@ -100,7 +94,7 @@ def migrate_db():
         n INTEGER NOT NULL, ctx TEXT NOT NULL, nxt INTEGER NOT NULL, w REAL NOT NULL,
         PRIMARY KEY (n, ctx, nxt)
     )""")
-    # pending (1 por vez)
+    # pending
     cur.execute("""CREATE TABLE IF NOT EXISTS pending (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         created_at INTEGER,
@@ -111,7 +105,6 @@ def migrate_db():
         opened_at INTEGER,
         observed_from_close INTEGER DEFAULT 0
     )""")
-    # garantir colunas (idempotente)
     for col, ddl in [
         ("created_at", "ALTER TABLE pending ADD COLUMN created_at INTEGER"),
         ("suggested",  "ALTER TABLE pending ADD COLUMN suggested INTEGER"),
@@ -125,7 +118,7 @@ def migrate_db():
             try: cur.execute(ddl)
             except sqlite3.OperationalError: pass
 
-    # score (geral GREEN/LOSS)
+    # score
     cur.execute("""CREATE TABLE IF NOT EXISTS score (
         id INTEGER PRIMARY KEY CHECK (id=1),
         green INTEGER DEFAULT 0,
@@ -178,7 +171,7 @@ def score_text() -> str:
     acc = (g/total*100.0) if total > 0 else 0.0
     return f"{g} GREEN × {l} LOSS — {acc:.1f}%"
 
-# ========= N-gram memória =========
+# ========= N-gram =========
 def get_tail(limit:int=400) -> List[int]:
     con = _connect()
     rows = con.execute("SELECT number FROM timeline ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
@@ -335,28 +328,18 @@ def _seen_append(row: sqlite3.Row, new_items: List[str], from_close: bool=False)
                 (seen_txt, 1 if from_close else (row["observed_from_close"] or 0), int(row["id"])))
     con.commit(); con.close()
 
-def _stage_label(stage_val: Optional[int]) -> str:
-    try:
-        s = int(stage_val or 0)
-    except Exception:
-        s = 0
-    return "G0" if s == 0 else ("G1" if s == 1 else "G2")
-
 def _stage_from_observed(suggested: int, obs: List[int]) -> Tuple[str, str]:
-    """
-    Retorna (outcome, stage_label) dados os observados (até 3) e o nosso sugerido.
-    """
     if not obs:
         return ("LOSS", "G2")
-    if len(obs) >= 1 and obs[0] == suggested:
-        return ("GREEN", "G0")
-    if len(obs) >= 2 and obs[1] == suggested:
-        return ("GREEN", "G1")
-    if len(obs) >= 3 and obs[2] == suggested:
-        return ("GREEN", "G2")
+    if len(obs) >= 1 and obs[0] == suggested: return ("GREEN", "G0")
+    if len(obs) >= 2 and obs[1] == suggested: return ("GREEN", "G1")
+    if len(obs) >= 3 and obs[2] == suggested: return ("GREEN", "G2")
     return ("LOSS", "G2")
 
-def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, our_stage_label: str, our_num: int|str):
+def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_lbl: str, suggested: int):
+    # LOSS deve mostrar "número X" para não confundir
+    our_num_display = suggested if outcome.upper()=="GREEN" else "X"
+
     con = _connect(); cur = con.cursor()
     cur.execute("UPDATE pending SET open=0, seen=? WHERE id=?", (final_seen, int(row["id"])))
     con.commit(); con.close()
@@ -365,7 +348,7 @@ def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, our_sta
     msg = (
         f"{'🟢' if outcome.upper()=='GREEN' else '🔴'} "
         f"<b>{outcome.upper()}</b> — finalizado "
-        f"(<b>{our_stage_label}</b>, nosso={our_num}, observados={final_seen}).\n"
+        f"(<b>{stage_lbl}</b>, nosso={our_num_display}, observados={final_seen}).\n"
         f"📊 Geral: {score_text()}"
     )
     return msg
@@ -379,15 +362,13 @@ def _maybe_close_by_timeout():
         return None
     seen_list = _seen_list(row)
     if 1 <= len(seen_list) < 3:
-        # completa com X e fecha
         while len(seen_list) < 3:
             seen_list.append("X")
         final_seen = "-".join(seen_list[:3])
         suggested = int(row["suggested"] or 0)
         obs_nums = [int(x) for x in seen_list if x.isdigit()]
         outcome, stage_lbl = _stage_from_observed(suggested, obs_nums)
-        msg = _close_with_outcome(row, outcome, final_seen, stage_lbl, suggested)
-        return msg
+        return _close_with_outcome(row, outcome, final_seen, stage_lbl, suggested)
     return None
 
 def close_pending(outcome:str):
@@ -401,8 +382,7 @@ def close_pending(outcome:str):
     suggested = int(row["suggested"] or 0)
     obs_nums = [int(x) for x in seen_list if x.isdigit()]
     outcome2, stage_lbl = _stage_from_observed(suggested, obs_nums)
-    msg = _close_with_outcome(row, outcome2, final_seen, stage_lbl, suggested)
-    return msg
+    return _close_with_outcome(row, outcome2, final_seen, stage_lbl, suggested)
 
 # ========= Telegram =========
 async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
@@ -422,7 +402,7 @@ async def webhook(token: str, request: Request):
     if token != WEBHOOK_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    # fecha por timeout (se travado aguardando 3º número)
+    # timeout pode fechar pendência antiga
     timeout_msg = _maybe_close_by_timeout()
     if timeout_msg:
         await tg_send_text(TARGET_CHANNEL, timeout_msg)
@@ -434,36 +414,34 @@ async def webhook(token: str, request: Request):
     text = (msg.get("text") or msg.get("caption") or "").strip()
     chat = msg.get("chat") or {}
     chat_id = str(chat.get("id") or "")
-    # se SOURCE_CHANNEL estiver definido, filtra
     if SOURCE_CHANNEL and chat_id != str(SOURCE_CHANNEL):
         return {"ok": True, "skipped": "outro_chat"}
-
     if not text:
         return {"ok": True, "skipped": "sem_texto"}
 
-    # 1) Mensagens informativas de gales
+    # 1) Gales (informativo)
     if GALE1_RX.search(text):
         if get_open_pending():
             set_stage(1)
             await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>1° gale (G1)</b>")
         return {"ok": True, "noted": "g1"}
-
     if GALE2_RX.search(text):
         if get_open_pending():
             set_stage(2)
             await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>2° gale (G2)</b>")
         return {"ok": True, "noted": "g2"}
 
-    # 2) Fechamentos do fonte: GREEN/LOSS + números (quando houver)
+    # 2) Fechamentos do fonte (GREEN/LOSS, com ou sem 3 números)
     if GREEN_RX.search(text) or LOSS_RX.search(text):
         pend = get_open_pending()
         if pend:
-            nums = parse_close_numbers(text)  # [n1, n2, n3]? às vezes vem só 1-2
+            nums = parse_close_numbers(text)  # pode ter 1, 2 ou 3
             if nums:
+                # marca que vimos números vindos do "APOSTA ENCERRADA"
                 _seen_append(pend, [str(n) for n in nums], from_close=True)
                 pend = get_open_pending()
+
             seen_list = _seen_list(pend) if pend else []
-            # fecha apenas quando já temos 3 observados (ou timeout fará X)
             if pend and len(seen_list) >= 3:
                 suggested = int(pend["suggested"] or 0)
                 obs_nums = [int(x) for x in seen_list if x.isdigit()]
@@ -474,50 +452,52 @@ async def webhook(token: str, request: Request):
                 return {"ok": True, "closed": outcome.lower(), "seen": final_seen}
         return {"ok": True, "noted_close": True}
 
-    # 3) Nova ENTRADA
+    # 3) Nova ENTRADA: pode completar o 3º observado do sinal anterior
     parsed = parse_entry_text(text)
     if not parsed:
         return {"ok": True, "skipped": "nao_eh_entrada_confirmada"}
 
-    # Se já existe pendência aberta:
     pend = get_open_pending()
     if pend:
-        # se está com 1-2 observados pendentes, completa com X e fecha agora
         seen_list = _seen_list(pend)
-        if 1 <= len(seen_list) < 3:
-            while len(seen_list) < 3:
-                seen_list.append("X")
-            final_seen = "-".join(seen_list[:3])
-            suggested = int(pend["suggested"] or 0)
-            obs_nums = [int(x) for x in seen_list if x.isdigit()]
-            outcome, stage_lbl = _stage_from_observed(suggested, obs_nums)
-            out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
-            await tg_send_text(TARGET_CHANNEL, out_msg)
-        else:
-            # se já tinha 3 observados mas faltou fechar por algum motivo, força fechar
-            if len(seen_list) >= 3:
+        need = 3 - len(seen_list)
+        if need > 0:
+            # só usamos a próxima Sequência para completar se o observado veio do fechamento do fonte
+            if int(pend["observed_from_close"] or 0) == 1:
+                fill = (parsed["seq"] or [])[:need]
+                if fill:
+                    _seen_append(pend, [str(x) for x in fill], from_close=False)
+                    pend = get_open_pending()
+                    seen_list = _seen_list(pend)
+
+            # se ainda faltar, completa com X e fecha já
+            if len(seen_list) < 3:
+                while len(seen_list) < 3:
+                    seen_list.append("X")
                 final_seen = "-".join(seen_list[:3])
                 suggested = int(pend["suggested"] or 0)
                 obs_nums = [int(x) for x in seen_list if x.isdigit()]
                 outcome, stage_lbl = _stage_from_observed(suggested, obs_nums)
                 out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
                 await tg_send_text(TARGET_CHANNEL, out_msg)
-        # segue para abrir a nova entrada
+        else:
+            # já tinha 3 e não fechou por algum motivo: força fechar
+            final_seen = "-".join(seen_list[:3])
+            suggested = int(pend["suggested"] or 0)
+            obs_nums = [int(x) for x in seen_list if x.isdigit()]
+            outcome, stage_lbl = _stage_from_observed(suggested, obs_nums)
+            out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
+            await tg_send_text(TARGET_CHANNEL, out_msg)
+        # depois de resolver (se foi resolvido), seguimos para abrir a nova
 
-    # Alimenta memória de sequência (se vier algo), antes de decidir
+    # Alimenta memória e decide novo tiro (sem travas por min/conf/gap)
     seq = parsed["seq"] or []
-    if seq:
-        append_seq(seq)
+    if seq: append_seq(seq)
 
     after = parsed["after"]
     best, conf, samples, post = choose_single_number(after)
 
-    # >>> Avaliação mantida só para log/monitoramento — NÃO bloqueia o tiro <<<
-    top2 = sorted(post.items(), key=lambda kv: kv[1], reverse=True)[:2]
-    gap = (top2[0][1] - (top2[1][1] if len(top2)>1 else 0.0)) if top2 else 0.0
-    # (sem returns por MIN_SAMPLES / CONF_MIN / GAP_MIN)
-
-    # Abre pendência e publica (SEM travas de ritmo)
+    # Publica novo tiro
     open_pending(best)
     aft_txt = f" após {after}" if after else ""
     txt = (
@@ -526,8 +506,7 @@ async def webhook(token: str, request: Request):
         f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples}"
     )
     await tg_send_text(TARGET_CHANNEL, txt)
-
-    return {"ok": True, "posted": True, "best": best, "conf": conf, "samples": samples, "gap": gap}
+    return {"ok": True, "posted": True, "best": best, "conf": conf, "samples": samples}
 
 # ===== Debug/help endpoint =====
 @app.get("/health")
@@ -535,10 +514,4 @@ async def health():
     pend = get_open_pending()
     pend_open = bool(pend)
     seen = (pend["seen"] if pend else "")
-    return {
-        "ok": True,
-        "db": DB_PATH,
-        "pending_open": pend_open,
-        "pending_seen": seen,
-        "time": ts_str()
-    }
+    return {"ok": True, "db": DB_PATH, "pending_open": pend_open, "pending_seen": seen, "time": ts_str()}
