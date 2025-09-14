@@ -14,8 +14,8 @@ Fechamento robusto (mantido):
   • Se vierem apenas 2 observados, o 3º vira "X" (no próximo ENTRADA CONFIRMADA
     ou por timeout), e fecha. Se só houver 1 observado, mantém aberto.
 Mensagens finais:
-  🟢 GREEN — finalizado (G1, nosso=3, observados=1-3-4).
-  🔴 LOSS  — finalizado (G2, nosso=X, observados=1-4-X).   <-- número X no LOSS
+  🟢 GREEN (n) — finalizado (Gk, nosso=n, observados=...).
+  🔴 LOSS  (X) — finalizado (G2, nosso=X, observados=...).
 Sempre adiciona "📊 Geral: <greens> GREEN × <loss> LOSS — <acc>%".
 
 Qualidade (aproveita todos os sinais; filtros leves apenas no empate técnico):
@@ -52,7 +52,7 @@ if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
 # ========= App =========
-app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="2.3.2")
+app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="2.3.3")
 
 # ========= Parâmetros =========
 DECAY = 0.980
@@ -267,11 +267,13 @@ def choose_single_number(after: Optional[int]) -> Tuple[int, float, int, Dict[in
 ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
 SEQ_RX   = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
 AFTER_RX = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
-GALE1_RX = re.compile(r"Estamos\s+no\s*1[ºo]\s*gale", re.I)
-GALE2_RX = re.compile(r"Estamos\s+no\s*2[ºo]\s*gale", re.I)
-GREEN_RX = re.compile(r"(green|✅|win)", re.I)
-LOSS_RX  = re.compile(r"(loss|red|❌|perdemos)", re.I)
-CLOSE_NUMS_RX = re.compile(r"\(([^)]+)\)")
+
+# Tolerantes a "greem/gren", "los/loss/red"
+GREEN_RX = re.compile(r"(?:\bgr+e+e?n\b|✅|win)", re.I)
+LOSS_RX  = re.compile(r"(?:\blo+s+s?\b|\bred\b|❌|perdemos)", re.I)
+
+# Números dentro de parênteses no fechamento
+CLOSE_NUMS_PAREN_RX = re.compile(r"\(([^)]+)\)")
 
 def parse_entry_text(text: str) -> Optional[Dict]:
     t = re.sub(r"\s+", " ", text).strip()
@@ -287,11 +289,23 @@ def parse_entry_text(text: str) -> Optional[Dict]:
     return {"seq": seq, "after": after_num, "raw": t}
 
 def parse_close_numbers(text: str) -> List[int]:
-    """Extrai números dentro de parênteses no fechamento. Ex.: '(1 | 4 | 4)' -> [1,4,4]."""
-    m = CLOSE_NUMS_RX.search(re.sub(r"\s+", " ", text))
-    if not m:
-        return []
-    nums = re.findall(r"[1-4]", m.group(1))
+    """
+    Extrai números do fechamento.
+    1) Se houver parênteses: usa como antes. Ex.: '(1 | 4 | 4)' -> [1,4,4]
+    2) Senão, remove qualquer 'Sequência: ...' e pega até 3 números 1..4
+       que apareçam no restante do texto. Ex.: 'GREEN 4 2' -> [4,2]
+    """
+    t = re.sub(r"\s+", " ", text)
+
+    # 1) Parênteses
+    m = CLOSE_NUMS_PAREN_RX.search(t)
+    if m:
+        nums = re.findall(r"[1-4]", m.group(1))
+        return [int(x) for x in nums][:3]
+
+    # 2) Sem parênteses: remove "Sequência: ..." para não confundir
+    t_wo_seq = re.sub(r"Sequ[eê]ncia\s*:\s*[^\n\r]+", " ", t, flags=re.I)
+    nums = re.findall(r"[1-4]", t_wo_seq)
     return [int(x) for x in nums][:3]
 
 # ========= Pending helpers =========
@@ -307,7 +321,6 @@ def open_pending(suggested: int):
                 (now_ts(), int(suggested), 0, 1, "", now_ts()))
 
 def set_stage(stage:int):
-    # apenas informativo
     con = _connect(); cur = con.cursor()
     cur.execute("UPDATE pending SET stage=? WHERE open=1", (int(stage),))
     con.commit(); con.close()
@@ -335,7 +348,9 @@ def _stage_from_observed(suggested: int, obs: List[int]) -> Tuple[str, str]:
     return ("LOSS", "G2")
 
 def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_lbl: str, suggested: int):
-    # LOSS deve mostrar "número X" para não confundir
+    # Para o título: (n) no GREEN, (X) no LOSS
+    head_num = suggested if outcome.upper()=="GREEN" else "X"
+    # Corpo mantém "nosso=X" em LOSS para não confundir
     our_num_display = suggested if outcome.upper()=="GREEN" else "X"
 
     con = _connect(); cur = con.cursor()
@@ -345,7 +360,7 @@ def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_l
     bump_score(outcome.upper())
     msg = (
         f"{'🟢' if outcome.upper()=='GREEN' else '🔴'} "
-        f"<b>{outcome.upper()}</b> — finalizado "
+        f"<b>{outcome.upper()} ({head_num})</b> — finalizado "
         f"(<b>{stage_lbl}</b>, nosso={our_num_display}, observados={final_seen}).\n"
         f"📊 Geral: {score_text()}"
     )
@@ -354,7 +369,7 @@ def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_l
 def _maybe_close_by_timeout():
     """
     Se passou muito tempo e temos EXATAMENTE 2 observados, completa com X e fecha.
-    Se só houver 1 observado, mantém aberto (não coloca X na 2ª posição).
+    Se só houver 1 observado, mantém aberto.
     """
     row = get_open_pending()
     if not row: return None
@@ -424,12 +439,12 @@ async def webhook(token: str, request: Request):
         return {"ok": True, "skipped": "sem_texto"}
 
     # 1) Gales (informativo)
-    if GALE1_RX.search(text):
+    if re.search(r"1[ºo]\s*gale", text, re.I):
         if get_open_pending():
             set_stage(1)
             await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>1° gale (G1)</b>")
         return {"ok": True, "noted": "g1"}
-    if GALE2_RX.search(text):
+    if re.search(r"2[ºo]\s*gale", text, re.I):
         if get_open_pending():
             set_stage(2)
             await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>2° gale (G2)</b>")
@@ -443,7 +458,6 @@ async def webhook(token: str, request: Request):
             if nums:
                 _seen_append(pend, [str(n) for n in nums])
                 pend = get_open_pending()
-
             seen_list = _seen_list(pend) if pend else []
             if pend and len(seen_list) >= 3:
                 suggested = int(pend["suggested"] or 0)
@@ -455,15 +469,13 @@ async def webhook(token: str, request: Request):
                 return {"ok": True, "closed": outcome.lower(), "seen": final_seen}
         return {"ok": True, "noted_close": True}
 
-    # 3) Nova ENTRADA: NÃO usa a nova sequência para completar;
-    #    se houver 2 observados no sinal anterior, fecha agora com X no 3º.
+    # 3) Nova ENTRADA: se houver 2 observados pendentes, fecha agora com X no 3º.
     parsed = parse_entry_text(text)
     if not parsed:
         return {"ok": True, "skipped": "nao_eh_entrada_confirmada"}
 
     pend = get_open_pending()
     if pend:
-        # se já houver 3, força fechar antes de qualquer coisa
         seen_list = _seen_list(pend)
         if len(seen_list) >= 3:
             suggested = int(pend["suggested"] or 0)
@@ -473,15 +485,11 @@ async def webhook(token: str, request: Request):
             out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
             await tg_send_text(TARGET_CHANNEL, out_msg)
             pend = get_open_pending()
-
-        # se ficou com 2 observados, fecha com X no 3º AGORA
         if pend:
             msgx = close_pending_force_fill_third_with_X_if_two()
             if msgx:
                 await tg_send_text(TARGET_CHANNEL, msgx)
                 pend = get_open_pending()
-
-        # se ainda existir pendente (ex.: só 1 observado), NÃO abre novo
         if pend:
             return {"ok": True, "kept_open_waiting_more_observed": True}
 
