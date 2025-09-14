@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Webhook único: lê "ENTRADA CONFIRMADA", decide 1 número seco, publica no alvo,
-# e marca GREEN/LOSS quando o canal-fonte publicar o resultado.
+# Webhook único: replica sinais do canal-fonte, decide 1 número seco e publica,
+# acompanhando G0 -> G1 -> G2 e marcando GREEN/LOSS ao final.
 
 import os, re, json, time, sqlite3
 from typing import List, Optional, Tuple, Dict
@@ -14,19 +14,15 @@ from fastapi import FastAPI, Request, HTTPException
 TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
 WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
 
-# Canal ALVO (onde você quer publicar o tiro seco + resultado)
+# Canal destino (onde você quer publicar o tiro seco)
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1002796105884").strip()   # @iafantan
 
-# Canal FONTE (de onde chegam as mensagens do grupo de sinais)
-SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "").strip()  # ex.: "-1002810508717"
-
-# Banco local simples (persiste histórico leve)
+# Banco local simples (persiste histórico leve + pendência)
 DB_PATH        = os.getenv("DB_PATH", "/data/mini_ref.db").strip() or "/data/mini_ref.db"
 
 TELEGRAM_API   = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
-# ========= App =========
-app = FastAPI(title="guardiao-auto-bot (webhook único)", version="1.1.0")
+app = FastAPI(title="guardiao-auto-bot (webhook único com G1/G2 + GREEN/LOSS)", version="1.2.0")
 
 # ========= DB helpers =========
 def _connect() -> sqlite3.Connection:
@@ -40,6 +36,7 @@ def _connect() -> sqlite3.Connection:
 def init_db():
     con = _connect()
     cur = con.cursor()
+    # histórico de números (para n-gram)
     cur.execute("""CREATE TABLE IF NOT EXISTS timeline (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         created_at INTEGER NOT NULL,
@@ -50,11 +47,14 @@ def init_db():
         n INTEGER NOT NULL, ctx TEXT NOT NULL, nxt INTEGER NOT NULL, w REAL NOT NULL,
         PRIMARY KEY (n, ctx, nxt)
     )""")
-    # guarda última sugestão “em aberto”
-    cur.execute("""CREATE TABLE IF NOT EXISTS last_pick (
+    # pendência de uma janela (G0->G2), por origem
+    cur.execute("""CREATE TABLE IF NOT EXISTS pending (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts INTEGER NOT NULL,
-        suggested INTEGER NOT NULL
+        source_msg_id INTEGER,
+        stage INTEGER NOT NULL,             -- 0=G0, 1=G1, 2=G2
+        suggested INTEGER NOT NULL,         -- número seco escolhido
+        open INTEGER NOT NULL,              -- 1=aberta, 0=fechada
+        created_at INTEGER NOT NULL
     )""")
     con.commit(); con.close()
 
@@ -63,6 +63,7 @@ init_db()
 def now_ts() -> int:
     return int(time.time())
 
+# ========= Timeline / ngram =========
 def get_tail(limit:int=400) -> List[int]:
     con = _connect()
     rows = con.execute("SELECT number FROM timeline ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
@@ -111,26 +112,72 @@ def _prob_from_ngrams(ctx: List[int], cand: int) -> float:
     con.close()
     return w / tot
 
-# ========= Parser =========
-ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
-SEQ_RX = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
-AFTER_RX = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
-TARGET_RX = re.compile(r"apostar?\s+em\s+(BIG|SMALL|ODD|EVEN)", re.I)
+# ========= Parsers do canal-fonte =========
+ENTRY_RX   = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
+SEQ_RX     = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
+AFTER_RX   = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
+TARGET_RX  = re.compile(r"apostar?\s+em\s+(BIG|SMALL|ODD|EVEN)", re.I)
+
+GALE1_RX   = re.compile(r"Estamos\s+no\s*1[ºo]\s*gale", re.I)
+GALE2_RX   = re.compile(r"Estamos\s+no\s*2[ºo]\s*gale", re.I)
+
+# Encerramento GREEN/RED (vários formatos possíveis)
+GREEN_RXS = [
+    re.compile(r"APOSTA\s+ENCERRADA.*?\bGREEN\b.*?\(([1-4])\)", re.I | re.S),
+    re.compile(r"\bGREEN\b.*?Número[:\s]*([1-4])", re.I | re.S),
+    re.compile(r"\bGREEN\b.*?\(([1-4])\)", re.I | re.S),
+]
+RED_RXS = [
+    re.compile(r"APOSTA\s+ENCERRADA.*?\bRED\b.*?\(([1-4])\)", re.I | re.S),
+    re.compile(r"\bRED\b.*?\(([1-4])\)", re.I | re.S),
+]
 
 def parse_entry_text(text: str) -> Optional[Dict]:
+    """Extrai os campos da Entrada Confirmada."""
     t = re.sub(r"\s+", " ", text).strip()
     if not ENTRY_RX.search(t):
         return None
+
     mseq = SEQ_RX.search(t)
     seq = []
     if mseq:
         parts = re.findall(r"[1-4]", mseq.group(1))
         seq = [int(x) for x in parts]
+
     mafter = AFTER_RX.search(t)
     after_num = int(mafter.group(1)) if mafter else None
+
     mtarget = TARGET_RX.search(t)
     target = mtarget.group(1).upper() if mtarget else None
+
     return {"seq": seq, "after": after_num, "target": target, "raw": t}
+
+def is_gale1(text:str) -> bool:
+    return bool(GALE1_RX.search(re.sub(r"\s+", " ", text)))
+
+def is_gale2(text:str) -> bool:
+    return bool(GALE2_RX.search(re.sub(r"\s+", " ", text)))
+
+def extract_green(text:str) -> Optional[int]:
+    t = re.sub(r"\s+", " ", text)
+    for rx in GREEN_RXS:
+        m = rx.search(t); 
+        if m:
+            nums = re.findall(r"[1-4]", m.group(1))
+            if nums: return int(nums[0])
+    return None
+
+def extract_red(text:str) -> Optional[int]:
+    t = re.sub(r"\s+", " ", text)
+    for rx in RED_RXS:
+        m = rx.search(t)
+        if m:
+            nums = re.findall(r"[1-4]", m.group(1))
+            if nums: return int(nums[0])
+    return None
+
+# ========= Estratégia de decisão (sempre escolhe 1 número) =========
+W4, W3, W2, W1 = 0.40, 0.30, 0.20, 0.10
 
 def target_to_candidates(target: Optional[str]) -> List[int]:
     if not target: return [1,2,3,4]
@@ -140,8 +187,6 @@ def target_to_candidates(target: Optional[str]) -> List[int]:
     if target == "EVEN":  return [2,4]
     return [1,2,3,4]
 
-# ========= Scoring (sempre escolhe 1 número) =========
-W4, W3, W2, W1 = 0.40, 0.30, 0.20, 0.10   # pesos do backoff
 def _ngram_backoff(tail: List[int], after: Optional[int], cand:int) -> float:
     if not tail: return 0.0
     # Se “após X”, corta o contexto no último X (se houver)
@@ -168,64 +213,21 @@ def choose_single_number(cands: List[int], after: Optional[int]) -> Tuple[int, f
     """Retorna (melhor, conf_normalizada, amostras~) — nunca abstem."""
     tail = get_tail(400)
     scores = {c: _ngram_backoff(tail, after, c) for c in cands}
-    # Se todos 0, usa desempate por frequência recente (quem saiu menos nos últimos 50)
+    # Se todos 0, desempata por quem saiu MENOS nos últimos 50
     if all(v == 0.0 for v in scores.values()):
         last = tail[-50:] if len(tail) >= 50 else tail
         freq = {c: last.count(c) for c in cands}
-        best = sorted(cands, key=lambda x: (freq.get(x,0), x))[0]  # escolhe o que saiu MENOS recentemente
+        best = sorted(cands, key=lambda x: (freq.get(x,0), x))[0]
         conf = 0.50
         samples = len(tail)
         return best, conf, samples
-    # normaliza como pseudo-confiança
+
     total = sum(scores.values()) or 1e-9
     post = {k: v/total for k,v in scores.items()}
     best = max(post.items(), key=lambda kv: kv[1])[0]
     conf = post[best]
     samples = len(tail)
     return best, conf, samples
-
-# ========= Resultado (GREEN/LOSS) =========
-GREEN_PATTERNS = [
-    re.compile(r"APOSTA\s+ENCERRADA.*?\bGREEN\b.*?\(([1-4])\)", re.I | re.S),
-    re.compile(r"\bGREEN\b.*?Número[:\s]*([1-4])", re.I | re.S),
-    re.compile(r"\bGREEN\b.*?\(([1-4])\)", re.I | re.S),
-]
-LOSS_PATTERNS = [
-    re.compile(r"APOSTA\s+ENCERRADA.*?\bRED\b.*?\(([1-4])\)", re.I | re.S),
-    re.compile(r"\bLOSS\b.*?Número[:\s]*([1-4])", re.I | re.S),
-    re.compile(r"\bRED\b.*?\(([1-4])\)", re.I | re.S),
-]
-
-def extract_green_number(text: str) -> Optional[int]:
-    t = re.sub(r"\s+", " ", text)
-    for rx in GREEN_PATTERNS:
-        m = rx.search(t)
-        if m:
-            return int(re.findall(r"[1-4]", m.group(1))[0])
-    return None
-
-def extract_loss_number(text: str) -> Optional[int]:
-    t = re.sub(r"\s+", " ", text)
-    for rx in LOSS_PATTERNS:
-        m = rx.search(t)
-        if m:
-            return int(re.findall(r"[1-4]", m.group(1))[0])
-    return None
-
-def save_last_pick(n: int):
-    con = _connect()
-    con.execute("INSERT INTO last_pick (ts, suggested) VALUES (?,?)", (int(time.time()), int(n)))
-    con.commit(); con.close()
-
-def get_last_pick(max_age_sec: int = 15*60) -> Optional[int]:
-    """Pega a última sugestão recente (janela de 15 min por padrão)."""
-    con = _connect()
-    row = con.execute("SELECT ts, suggested FROM last_pick ORDER BY id DESC LIMIT 1").fetchone()
-    con.close()
-    if not row: return None
-    if int(time.time()) - int(row["ts"]) > max_age_sec:
-        return None
-    return int(row["suggested"])
 
 # ========= Telegram =========
 async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
@@ -235,10 +237,33 @@ async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
                           json={"chat_id": chat_id, "text": text, "parse_mode": parse,
                                 "disable_web_page_preview": True})
 
+# ========= Pendente (G0->G2) =========
+def pend_get_open() -> Optional[sqlite3.Row]:
+    con = _connect()
+    row = con.execute("SELECT * FROM pending WHERE open=1 ORDER BY id DESC LIMIT 1").fetchone()
+    con.close()
+    return row
+
+def pend_open(source_msg_id: Optional[int], suggested:int):
+    con = _connect()
+    con.execute("""INSERT INTO pending (source_msg_id, stage, suggested, open, created_at)
+                   VALUES (?,?,?,?,?)""", (int(source_msg_id or 0), 0, int(suggested), 1, now_ts()))
+    con.commit(); con.close()
+
+def pend_stage(next_stage:int):
+    con = _connect()
+    con.execute("UPDATE pending SET stage=? WHERE open=1", (int(next_stage),))
+    con.commit(); con.close()
+
+def pend_close():
+    con = _connect()
+    con.execute("UPDATE pending SET open=0 WHERE open=1")
+    con.commit(); con.close()
+
 # ========= Rotas =========
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "guardiao-auto-bot (webhook único)"}
+    return {"ok": True, "service": "guardiao-auto-bot (webhook único G0/G1/G2 + GREEN/LOSS)"}
 
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
@@ -251,65 +276,87 @@ async def webhook(token: str, request: Request):
     msg = data.get("channel_post") or data.get("message") \
           or data.get("edited_channel_post") or data.get("edited_message") or {}
     text = (msg.get("text") or msg.get("caption") or "").strip()
+    source_msg_id = msg.get("message_id")
+
     if not text:
         return {"ok": True, "skipped": "sem texto"}
 
-    # (opcional) processe apenas o canal-fonte se SOURCE_CHANNEL estiver setado
-    chat = msg.get("chat") or {}
-    chat_id = str(chat.get("id") or "")
-    if SOURCE_CHANNEL and chat_id != SOURCE_CHANNEL:
-        return {"ok": True, "skipped": "outro_canal"}
+    tnorm = re.sub(r"\s+", " ", text)
 
-    # 1) Resultado: GREEN/LOSS -> compara com a última sugestão
-    gnum = extract_green_number(text)
-    lnum = extract_loss_number(text)
-    if gnum is not None or lnum is not None:
-        real = int(gnum if gnum is not None else lnum)
-        # alimenta histórico com o número que saiu
-        append_seq([real])
-        # compara com último pick recente
-        last = get_last_pick()
-        if last is not None:
-            hit = (int(last) == real)
-            if hit:
-                out = f"✅ <b>GREEN</b> — Número: <b>{real}</b>"
+    # 1) GREEN / RED (encerramento) — fecha pendência e publica resultado
+    gnum = extract_green(tnorm)
+    rnum = extract_red(tnorm)
+    if gnum is not None or rnum is not None:
+        pend = pend_get_open()
+        if pend:
+            sug = int(pend["suggested"])
+            stage = int(pend["stage"])
+            if gnum is not None:
+                hit = (int(gnum) == sug)
+                if hit:
+                    await tg_send_text(
+                        TARGET_CHANNEL,
+                        f"✅ <b>GREEN</b> em <b>{'G0' if stage==0 else ('G1' if stage==1 else 'G2')}</b> — Número: <b>{sug}</b>"
+                    )
+                    pend_close()
+                else:
+                    # GREEN em outro número -> trata como LOSS desta janela (canal fonte foi green, mas não no nosso seco)
+                    await tg_send_text(
+                        TARGET_CHANNEL,
+                        f"❌ <b>LOSS</b> — Nosso número: <b>{sug}</b> | Green do canal: <b>{gnum}</b>"
+                    )
+                    pend_close()
             else:
-                out = f"❌ <b>LOSS</b> — Número: <b>{real}</b> (sugerido foi <b>{last}</b>)"
-            if TG_BOT_TOKEN and TARGET_CHANNEL:
-                await tg_send_text(TARGET_CHANNEL, out, "HTML")
-        return {"ok": True, "observed": real, "green": gnum is not None}
+                # RED detectado: se já estávamos no G2, é loss; senão aguardará gale seguinte
+                if stage >= 2:
+                    await tg_send_text(TARGET_CHANNEL, f"❌ <b>LOSS</b> — Número: <b>{sug}</b> (em G2)")
+                    pend_close()
+        return {"ok": True, "observed": ("GREEN" if gnum is not None else "RED")}
 
-    # 2) ENTRADA CONFIRMADA — processa nova sugestão
+    # 2) Mensagens de GALE — avança estágio e republica status
+    if is_gale1(tnorm):
+        pend = pend_get_open()
+        if pend:
+            pend_stage(1)
+            sug = int(pend["suggested"])
+            await tg_send_text(TARGET_CHANNEL, f"🔁 Indo para <b>G1</b> — mantendo número seco: <b>{sug}</b>")
+        return {"ok": True, "gale": 1}
+
+    if is_gale2(tnorm):
+        pend = pend_get_open()
+        if pend:
+            pend_stage(2)
+            sug = int(pend["suggested"])
+            await tg_send_text(TARGET_CHANNEL, f"🔁 Indo para <b>G2</b> — mantendo número seco: <b>{sug}</b>")
+        return {"ok": True, "gale": 2}
+
+    # 3) ENTRADA CONFIRMADA — decide tiro seco (sempre) e publica (G0)
     parsed = parse_entry_text(text)
     if not parsed:
-        return {"ok": True, "skipped": "nao_eh_entrada_confirmada"}
+        return {"ok": True, "skipped": "nao_eh_evento_relevante"}
 
+    # Alimenta histórico com a sequência passada, antes de decidir
     seq = parsed["seq"] or []
     after = parsed["after"]
     target = parsed["target"] or "GEN"
-
-    # Alimenta histórico com a sequência (do passado) antes de decidir
-    # A sequência costuma vir em ordem “left→right”; guardamos na ordem informada
     append_seq(seq)
 
     cands = target_to_candidates(target)
     best, conf, samples = choose_single_number(cands, after)
 
-    # Monta texto final
+    # Abre pendência
+    pend_close()  # garante fila única
+    pend_open(source_msg_id, best)
+
+    # Monta e publica G0
     aft_txt = f" após {after}" if after else ""
-    txt = (
+    out = (
         f"🎯 <b>Número seco (G0):</b> <b>{best}</b>\n"
         f"🧩 <b>Padrão:</b> {target}{aft_txt}\n"
         f"📊 Conf: <b>{conf*100:.2f}%</b> | Amostra≈<b>{samples}</b>"
     )
-
-    # Publica no canal-alvo
     if TG_BOT_TOKEN and TARGET_CHANNEL:
-        await tg_send_text(TARGET_CHANNEL, txt, "HTML")
+        await tg_send_text(TARGET_CHANNEL, out)
 
-    # Salva a sugestão como "pendente" para comparar com o resultado
-    save_last_pick(int(best))
-
-    # Também responde OK
     return {"ok": True, "posted": True, "best": best, "conf": conf, "samples": samples,
-            "cands": cands, "target": target, "after": after}
+            "cands": cands, "target": target, "after": after, "source_msg_id": source_msg_id}
