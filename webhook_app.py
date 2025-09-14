@@ -25,9 +25,8 @@ Principais pontos:
   * Só abre novo sinal quando não há pendência aberta.
   * "ENTRADA CONFIRMADA" do fonte -> escolhe 1 número via n-gram (GEN) e publica.
   * "Estamos no 1° gale" -> marca G1; "Estamos no 2° gale" -> marca G2.
-  * Fechamento:
-      - Lê a mensagem final do fonte (GREEN/RED + "(...|...|...)"), extrai a sequência real
-        e confere se o NOSSO número sugerido apareceu em G0/G1/G2. Fecha com GREEN/LOSS e estágio correto.
+  * Fechamento **somente** quando vier o relatório com 3 números (ex.: "(1 | 4 | 4)"):
+      - 1º = GREEN em G0; 2º = GREEN em G1; 3º = GREEN em G2; senão = LOSS.
 """
 
 import os, re, json, time, sqlite3, asyncio
@@ -245,7 +244,7 @@ def choose_single_number(after: Optional[int]) -> Tuple[int, float, int]:
     if all(v == 0.0 for v in scores.values()):
         last = tail[-50:] if len(tail) >= 50 else tail
         freq = {c: last.count(c) for c in cands}
-        # escolhe o MENOS frequente recente
+        # menor frequência recente vira "melhor" palpite quando sem n-gram
         best = sorted(cands, key=lambda x: (freq.get(x,0), x))[0]
         conf = 0.50
         return best, conf, len(tail)
@@ -259,13 +258,11 @@ def choose_single_number(after: Optional[int]) -> Tuple[int, float, int]:
 ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
 SEQ_RX = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
 AFTER_RX = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
-
-# Marcadores de gales (mantidos, mas fechamento real é por sequência final)
 GALE1_RX = re.compile(r"Estamos\s+no\s*1[ºo]\s*gale", re.I)
 GALE2_RX = re.compile(r"Estamos\s+no\s*2[ºo]\s*gale", re.I)
 
-# Resultado final: GREEN/RED/LOSS + sequência (x | y | z)
-OUTCOME_SEQ_RX = re.compile(r"(GREEN|WIN|✅|RED|LOSS|❌).*?\(([^)]*)\)", re.I | re.S)
+# Fechamento por TRINCA de números: captura "(1 | 4 | 4)" em qualquer lugar do texto
+TRIPLE_RX = re.compile(r"\(\s*([1-4])\s*\|\s*([1-4])\s*\|\s*([1-4])\s*\)")
 
 def parse_entry_text(text: str) -> Optional[Dict]:
     t = re.sub(r"\s+", " ", text).strip()
@@ -280,23 +277,13 @@ def parse_entry_text(text: str) -> Optional[Dict]:
     after_num = int(mafter.group(1)) if mafter else None
     return {"seq": seq, "after": after_num, "raw": t}
 
-def parse_outcome_and_sequence(text: str) -> Optional[Tuple[str, List[int]]]:
-    """
-    Retorna ('GREEN' ou 'LOSS'), [n1, n2, n3] quando a mensagem final trouxer
-    o fechamento com a sequência dentro de parênteses. Ex.: "RED ❌ (1 | 4 | 4)".
-    """
+def parse_triple(text: str) -> Optional[Tuple[int, int, int]]:
     t = re.sub(r"\s+", " ", text).strip()
-    m = OUTCOME_SEQ_RX.search(t)
+    m = TRIPLE_RX.search(t)
     if not m:
         return None
-    outcome_raw = m.group(1).upper()
-    if "GREEN" in outcome_raw or "WIN" in outcome_raw or "✅" in outcome_raw:
-        outcome = "GREEN"
-    else:
-        outcome = "LOSS"
-    nums = re.findall(r"[1-4]", m.group(2))
-    seq = [int(x) for x in nums]
-    return outcome, seq
+    a, b, c = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    return (a, b, c)
 
 # ========= Pending helpers =========
 def get_open_pending() -> Optional[sqlite3.Row]:
@@ -359,48 +346,7 @@ async def webhook(token: str, request: Request):
     if not text:
         return {"ok": True, "skipped": "sem_texto"}
 
-    # 0) Se vier uma mensagem de fechamento com sequência (GREEN/RED + "(...)"),
-    #    usamos essa conferência por NÚMERO para fechar corretamente.
-    parsed_out = parse_outcome_and_sequence(text)
-    if parsed_out:
-        outcome_msg, seq_final = parsed_out  # outcome_msg: 'GREEN' ou 'LOSS'
-        pend = get_open_pending()
-        if pend:
-            sug = int(pend["suggested"])
-            # procura em qual posição (0,1,2) nosso número bateu
-            hit_idx = None
-            for i, n in enumerate(seq_final):
-                if n == sug:
-                    hit_idx = i
-                    break
-            if hit_idx is not None:
-                # GREEN no estágio correto
-                stage_lbl = ["G0", "G1", "G2"][min(hit_idx, 2)]
-                close_pending("GREEN")
-                bump_score("GREEN")
-                await tg_send_text(
-                    TARGET_CHANNEL,
-                    f"🟢 <b>GREEN</b> — finalizado (<b>{stage_lbl}</b>, número <b>{sug}</b>).\n"
-                    f"📊 Geral: {score_text()}"
-                )
-                return {"ok": True, "closed": "green_by_seq", "stage": stage_lbl, "seq": seq_final}
-            else:
-                # Não bateu em nenhuma das 3 posições: LOSS (considera G2)
-                stage_lbl = "G2"
-                close_pending("LOSS")
-                bump_score("LOSS")
-                # número “que fechou” = último da sequência se existir
-                last_num = seq_final[-1] if seq_final else "—"
-                await tg_send_text(
-                    TARGET_CHANNEL,
-                    f"🔴 <b>LOSS</b> — finalizado (<b>{stage_lbl}</b>, número <b>{last_num}</b>).\n"
-                    f"📊 Geral: {score_text()}"
-                )
-                return {"ok": True, "closed": "loss_by_seq", "seq": seq_final}
-        # Se não há pendência, apenas ignora
-        return {"ok": True, "noted_outcome_seq": True}
-
-    # 1) Gales informativos (mantidos, mas o fechamento real ocorre por sequência)
+    # 1) Atualizações de gales (apenas marcam estágio; não fecham)
     if GALE1_RX.search(text):
         if get_open_pending():
             set_stage(1)
@@ -413,27 +359,56 @@ async def webhook(token: str, request: Request):
             await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>2° gale (G2)</b>")
         return {"ok": True, "noted": "g2"}
 
-    # 2) Nova entrada
+    # 2) Fechamento por TRINCA (sempre esperar (a | b | c))
+    triple = parse_triple(text)
+    if triple:
+        pend = get_open_pending()
+        if not pend:
+            return {"ok": True, "closed_ignored": "sem_pendente"}
+        a, b, c = triple
+        suggested = int(pend["suggested"])
+        # decide resultado pelo índice de acerto
+        result_stage = None
+        hit_number = None
+        if suggested == a:
+            result_stage = "G0"; hit_number = a
+            outcome = "GREEN"
+        elif suggested == b:
+            result_stage = "G1"; hit_number = b
+            outcome = "GREEN"
+        elif suggested == c:
+            result_stage = "G2"; hit_number = c
+            outcome = "GREEN"
+        else:
+            result_stage = "G2"; hit_number = c
+            outcome = "LOSS"
+
+        close_pending(outcome)
+        bump_score(outcome)
+
+        if outcome == "GREEN":
+            await tg_send_text(
+                TARGET_CHANNEL,
+                f"🟢 <b>GREEN</b> — finalizado (<b>{result_stage}</b>, número <b>{hit_number}</b>).\n"
+                f"📊 Geral: {score_text()}"
+            )
+        else:
+            await tg_send_text(
+                TARGET_CHANNEL,
+                f"🔴 <b>LOSS</b> — finalizado (<b>{result_stage}</b>, número <b>{hit_number}</b>).\n"
+                f"📊 Geral: {score_text()}"
+            )
+        return {"ok": True, "closed_by_triple": True, "outcome": outcome, "stage": result_stage, "hit": hit_number}
+
+    # 3) Nova entrada (só abre se não houver pendência; não fecha por heurística)
     parsed = parse_entry_text(text)
     if not parsed:
         return {"ok": True, "skipped": "nao_eh_entrada_confirmada"}
 
-    # Se já existe pendência aberta:
     pend = get_open_pending()
     if pend:
-        # heurística antiga: se já estávamos em G2 e chegou outra entrada, considera LOSS da anterior
-        if int(pend["stage"] or 0) >= 2:
-            stage_lbl = _stage_label(pend["stage"])
-            close_pending("LOSS")
-            bump_score("LOSS")
-            await tg_send_text(
-                TARGET_CHANNEL,
-                f"🔴 <b>LOSS (G2)</b> — anterior encerrada (<b>{stage_lbl}</b>).\n"
-                f"📊 Geral: {score_text()}"
-            )
-        else:
-            # ignora abertura até encerrar
-            return {"ok": True, "ignored": "ja_existe_pendente"}
+        # Não fecha por “nova entrada em G2”. Aguarda trinca oficial.
+        return {"ok": True, "ignored": "ja_existe_pendente_aguardando_trinca"}
 
     # Alimenta memória de sequência (se vier algo), antes de decidir
     seq = parsed["seq"] or []
