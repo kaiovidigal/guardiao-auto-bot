@@ -16,9 +16,6 @@ Fechamento robusto (mantido):
 Mensagens finais:
   🟢 GREEN — finalizado (G1, nosso=3, observados=1-3-4).
   🔴 LOSS  — finalizado (G2, nosso=X, observados=1-4-X).
-  + Snapshot n-gram no fechamento:
-    📈 Amostra: N • Conf: XX.X%
-    🔎 N-gram context (última análise): 1 → a% | 2 → b% | 3 → c% | 4 → d%
 Sempre adiciona "📊 Geral: <greens> GREEN × <loss> LOSS — <acc>%".
 
 Qualidade (aproveita todos os sinais; filtros leves apenas no empate técnico):
@@ -34,7 +31,7 @@ Webhook: POST /webhook/{WEBHOOK_TOKEN}
 """
 
 import os, re, time, sqlite3
-from typing import List, Optional, Tuple, Dict, Union
+from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timezone
 
 import httpx
@@ -55,7 +52,7 @@ if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
 # ========= App =========
-app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="2.3.4")
+app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="2.3.3")
 
 # ========= Parâmetros =========
 DECAY = 0.980
@@ -174,12 +171,6 @@ def score_text() -> str:
     return f"{g} GREEN × {l} LOSS — {acc:.1f}%"
 
 # ========= N-gram =========
-def timeline_size() -> int:
-    con = _connect()
-    row = con.execute("SELECT COUNT(*) AS c FROM timeline").fetchone()
-    con.close()
-    return int(row["c"] or 0)
-
 def get_tail(limit:int=400) -> List[int]:
     con = _connect()
     rows = con.execute("SELECT number FROM timeline ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
@@ -267,10 +258,10 @@ def choose_single_number(after: Optional[int]) -> Tuple[int, float, int, Dict[in
             freq = {c: last.count(c) for c in [1,2,3,4]}
             best = sorted([1,2,3,4], key=lambda x: (freq.get(x,0), x))[0]
             conf = 0.50
-            return best, conf, timeline_size(), post
+            return best, conf, len(tail), post
     best = max(post.items(), key=lambda kv: kv[1])[0]
     conf = float(post[best])
-    return best, conf, timeline_size(), post
+    return best, conf, len(tail), post
 
 # ========= Parse =========
 ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
@@ -356,26 +347,6 @@ def _stage_from_observed(suggested: int, obs: List[int]) -> Tuple[str, str]:
     if len(obs) >= 3 and obs[2] == suggested: return ("GREEN", "G2")
     return ("LOSS", "G2")
 
-def _ngram_snapshot_text(suggested: int) -> str:
-    """Monta as duas linhas de snapshot do n-gram para imprimir no fechamento."""
-    tail = get_tail(400)
-    post = _post_from_tail(tail, after=None)
-    # prob em % com 1 casa
-    def pct(x: float) -> str:
-        try:
-            return f"{x*100:.1f}%"
-        except Exception:
-            return "0.0%"
-    p1 = pct(post.get(1, 0.0))
-    p2 = pct(post.get(2, 0.0))
-    p3 = pct(post.get(3, 0.0))
-    p4 = pct(post.get(4, 0.0))
-    conf = pct(post.get(int(suggested), 0.0))
-    amostra = timeline_size()
-    line1 = f"📈 Amostra: {amostra} • Conf: {conf}"
-    line2 = f"🔎 N-gram context (última análise): 1 → {p1} | 2 → {p2} | 3 → {p3} | 4 → {p4}"
-    return line1 + "\n\n" + line2
-
 def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_lbl: str, suggested: int):
     # LOSS deve mostrar "número X" para não confundir
     our_num_display = suggested if outcome.upper()=="GREEN" else "X"
@@ -385,16 +356,11 @@ def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_l
     con.commit(); con.close()
 
     bump_score(outcome.upper())
-
-    # Snapshot n-gram (não altera o fluxo; apenas imprime)
-    snapshot = _ngram_snapshot_text(int(suggested))
-
     msg = (
         f"{'🟢' if outcome.upper()=='GREEN' else '🔴'} "
         f"<b>{outcome.upper()}</b> — finalizado "
         f"(<b>{stage_lbl}</b>, nosso={our_num_display}, observados={final_seen}).\n"
-        f"📊 Geral: {score_text()}\n\n"
-        f"{snapshot}"
+        f"📊 Geral: {score_text()}"
     )
     return msg
 
@@ -434,19 +400,6 @@ def close_pending_force_fill_third_with_X_if_two():
         outcome, stage_lbl = _stage_from_observed(suggested, obs_nums)
         return _close_with_outcome(row, outcome, final_seen, stage_lbl, suggested)
     return None
-
-def close_pending(outcome:str):
-    """Compat: força fechar preenchendo X até 3 observados (não usada no fluxo normal)."""
-    row = get_open_pending()
-    if not row: return
-    seen_list = _seen_list(row)
-    while len(seen_list) < 3:
-        seen_list.append("X")
-    final_seen = "-".join(seen_list[:3])
-    suggested = int(row["suggested"] or 0)
-    obs_nums = [int(x) for x in seen_list if x.isdigit()]
-    outcome2, stage_lbl = _stage_from_observed(suggested, obs_nums)
-    return _close_with_outcome(row, outcome2, final_seen, stage_lbl, suggested)
 
 # ========= Telegram =========
 async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
@@ -569,4 +522,4 @@ async def health():
     pend = get_open_pending()
     pend_open = bool(pend)
     seen = (pend["seen"] if pend else "")
-    return {"ok": True, "db": DB_PATH, "pending_open": pend_open, "pending_seen": seen, "time": ts_str()}
+    return {"ok": True, "db": DB_PATH, "pending_open": pend_open, "pending_seen": seen, "time": ts_str()} 
