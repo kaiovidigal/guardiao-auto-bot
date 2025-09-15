@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-webhook_app.py — transparente (G0/G1/G2 à mostra) + n-gram/backoff + antispam leve
+webhook_app.py — Caso 3 (filtros máximos)
+----------------------------------------
+FastAPI + Telegram webhook para refletir sinais do canal-fonte e publicar
+um "número seco" (modo GEN) no canal-alvo. Acompanha G1/G2 e fecha robusto.
 
-O que entra de novo (sem travar fluxo):
-- Parsers tolerantes (GREEN/RED/greem/los/✅/❌ etc.)
-- Antispam leve (MIN_SECONDS_BETWEEN_POST + MAX_POSTS_PER_HOUR)
-- /debug/state (amostra de ngram/timeline, pendência e limites antispam)
+Mudanças para filtros máximos:
+- Publica G0 **apenas** se:
+  • conf ≥ MIN_CONF_G0 (default: 0.65)
+  • gap(top1-top2) ≥ MIN_GAP_G0 (default: 0.08)
+  • amostras (ngrams) ≥ MIN_SAMPLES (default: 1000)
+- Todos os 3 limites são configuráveis por ENV.
 
-Sem “recuperação oculta”, sem fases A/B/C, sem cool-down pesado.
+ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
+ENV opcionais: TARGET_CHANNEL, SOURCE_CHANNEL, DB_PATH
+               MIN_CONF_G0, MIN_GAP_G0, MIN_SAMPLES
+Webhook: POST /webhook/{WEBHOOK_TOKEN}
 """
 
 import os, re, time, sqlite3, json
@@ -21,11 +29,15 @@ from fastapi import FastAPI, Request, HTTPException
 # ========= ENV =========
 TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
 WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
-# aceita TARGET_CHANNEL ou PUBLIC_CHANNEL (preferência TARGET_CHANNEL)
-TARGET_CHANNEL = (os.getenv("TARGET_CHANNEL") or os.getenv("PUBLIC_CHANNEL", "-1002796105884")).strip()
+TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1002796105884").strip()
 SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "").strip()  # se vazio, não filtra
-
 DB_PATH        = os.getenv("DB_PATH", "/var/data/data.db").strip() or "/var/data/data.db"
+
+# Filtros máximos (configuráveis por ENV)
+MIN_CONF_G0 = float(os.getenv("MIN_CONF_G0", "0.65"))  # confiança mínima
+MIN_GAP_G0  = float(os.getenv("MIN_GAP_G0",  "0.08"))  # gap top1-top2 mínimo
+MIN_SAMPLES = int(  os.getenv("MIN_SAMPLES", "1000"))  # amostras mínimas (ngrams)
+
 TELEGRAM_API   = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 if not TG_BOT_TOKEN:
@@ -34,40 +46,13 @@ if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
 # ========= App =========
-app = FastAPI(title="guardiao-auto-bot (GEN webhook) — fluxo livre", version="2.5.0")
+app = FastAPI(title="guardiao-auto-bot (GEN webhook • filtros máximos)", version="2.5.0-max")
 
-# ========= Parâmetros de qualidade (iguais ao seu base) =========
+# ========= Parâmetros de modelo =========
 DECAY = 0.982
 W4, W3, W2, W1 = 0.46, 0.30, 0.16, 0.08
-GAP_SOFT       = 0.015         # anti-empate técnico (fallback leve por frequência)
+GAP_SOFT       = 0.015         # só interno (empate técnico); filtros reais usam MIN_GAP_G0
 OBS_TIMEOUT_SEC= 180           # completa com X (apenas se já houver 2 observados)
-
-# >>> Antispam leve (não bloqueante para o sistema, só espaça mensagens)
-MIN_SECONDS_BETWEEN_POST = 6
-MAX_POSTS_PER_HOUR       = 40
-_last_post_ts = 0.0
-_posts_this_hour = 0
-_hour_bucket = None
-
-def _hour_key() -> int:
-    return int(datetime.now(timezone.utc).strftime("%Y%m%d%H"))
-
-def _can_post_now() -> bool:
-    global _posts_this_hour, _hour_bucket, _last_post_ts
-    hb = _hour_key()
-    if _hour_bucket != hb:
-        _hour_bucket = hb
-        _posts_this_hour = 0
-    if (time.time() - (_last_post_ts or 0)) < MIN_SECONDS_BETWEEN_POST:
-        return False
-    if _posts_this_hour >= MAX_POSTS_PER_HOUR:
-        return False
-    return True
-
-def _mark_post():
-    global _posts_this_hour, _last_post_ts
-    _posts_this_hour += 1
-    _last_post_ts = time.time()
 
 # ========= Utils =========
 def now_ts() -> int:
@@ -132,7 +117,7 @@ def migrate_db():
             try: cur.execute(ddl)
             except sqlite3.OperationalError: pass
 
-    # score (placar simples)
+    # score
     cur.execute("""CREATE TABLE IF NOT EXISTS score (
         id INTEGER PRIMARY KEY CHECK (id=1),
         green INTEGER DEFAULT 0,
@@ -271,7 +256,6 @@ def choose_single_number(after: Optional[int]) -> Tuple[int, float, int, Dict[in
         last = tail[-50:] if len(tail) >= 50 else tail
         if last:
             freq = {c: last.count(c) for c in [1,2,3,4]}
-            # escolhe o MENOS frequente para evitar overfit do momento
             best = sorted([1,2,3,4], key=lambda x: (freq.get(x,0), x))[0]
             conf = 0.50
             return best, conf, len(tail), post
@@ -279,18 +263,16 @@ def choose_single_number(after: Optional[int]) -> Tuple[int, float, int, Dict[in
     conf = float(post[best])
     return best, conf, len(tail), post
 
-# ========= Parse (mais tolerante) =========
+# ========= Parse =========
 ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
 SEQ_RX   = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
-AFTER_RX = re.compile(r"(?:ap[oó]s|após)\s+o\s+([1-4])", re.I)
+AFTER_RX = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
 GALE1_RX = re.compile(r"Estamos\s+no\s*1[ºo]\s*gale", re.I)
 GALE2_RX = re.compile(r"Estamos\s+no\s*2[ºo]\s*gale", re.I)
 
-# GREEN/RED super tolerante (green/greem/gren/win/✅) / (loss/los/red/❌/perdemos)
 GREEN_RX = re.compile(r"(?:\bgr+e+e?n\b|\bwin\b|✅)", re.I)
 LOSS_RX  = re.compile(r"(?:\blo+s+s?\b|\bred\b|❌|\bperdemos\b)", re.I)
 
-# fechar por números entre parênteses; se não houver, pega 1..4 soltos
 PAREN_GROUP_RX = re.compile(r"\(([^)]*)\)")
 ANY_14_RX      = re.compile(r"[1-4]")
 
@@ -371,6 +353,7 @@ def _fmt_ngram_context(post: Dict[int,float], best:int, samples:int, conf:float)
 
 def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_lbl: str, suggested: int):
     our_num_display = suggested if outcome.upper()=="GREEN" else "X"
+
     try:  conf = float(row["last_conf"] or 0.0)
     except Exception: conf = 0.0
     try:  samples = int(row["last_samples"] or 0)
@@ -436,40 +419,15 @@ async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
 # ========= Rotas =========
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "guardiao-auto-bot (GEN webhook)"}
-
-@app.get("/debug/state")
-async def debug_state():
-    # estado operacional simples (não trava)
-    try:
-        con = _connect()
-        tail_cnt = con.execute("SELECT COUNT(*) FROM timeline").fetchone()[0]
-        ng_cnt   = con.execute("SELECT COUNT(*) FROM ngram").fetchone()[0]
-        con.close()
-    except Exception:
-        tail_cnt = ng_cnt = 0
-    pend = get_open_pending()
-    return {
-        "samples_tail": int(tail_cnt),
-        "ngrams_rows": int(ng_cnt),
-        "pending_open": bool(pend),
-        "pending_seen": (pend["seen"] if pend else ""),
-        "antispam": {
-            "min_gap_sec": MIN_SECONDS_BETWEEN_POST,
-            "max_per_hour": MAX_POSTS_PER_HOUR,
-            "posts_this_hour": _posts_this_hour
-        }
-    }
+    return {"ok": True, "service": "guardiao-auto-bot (GEN webhook • filtros máximos)"}
 
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
     if token != WEBHOOK_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    # timeout: se já houver 2 observados, completa com X e fecha
     timeout_msg = _maybe_close_by_timeout()
     if timeout_msg:
-        # timeout não é “sinal novo”, então antispam não se aplica
         await tg_send_text(TARGET_CHANNEL, timeout_msg)
 
     data = await request.json()
@@ -488,24 +446,19 @@ async def webhook(token: str, request: Request):
     if GALE1_RX.search(text):
         if get_open_pending():
             set_stage(1)
-            if _can_post_now():
-                await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>1° gale (G1)</b>")
-                _mark_post()
+            await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>1° gale (G1)</b>")
         return {"ok": True, "noted": "g1"}
-
     if GALE2_RX.search(text):
         if get_open_pending():
             set_stage(2)
-            if _can_post_now():
-                await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>2° gale (G2)</b>")
-                _mark_post()
+            await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>2° gale (G2)</b>")
         return {"ok": True, "noted": "g2"}
 
-    # 2) Fechamentos do fonte (GREEN/LOSS, com 1, 2 ou 3 números; variações greem/los/red)
+    # 2) Fechamentos do fonte
     if GREEN_RX.search(text) or LOSS_RX.search(text):
         pend = get_open_pending()
         if pend:
-            nums = parse_close_numbers(text)  # pode ter 1, 2 ou 3
+            nums = parse_close_numbers(text)  # 1..3
             if nums:
                 _seen_append(pend, [str(n) for n in nums])
                 pend = get_open_pending()
@@ -517,19 +470,17 @@ async def webhook(token: str, request: Request):
                 outcome, stage_lbl = _stage_from_observed(suggested, obs_nums)
                 final_seen = "-".join(seen_list[:3])
                 out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
-                # fechamento sempre publica (evento raro) — antispam não bloqueia
                 await tg_send_text(TARGET_CHANNEL, out_msg)
                 return {"ok": True, "closed": outcome.lower(), "seen": final_seen}
         return {"ok": True, "noted_close": True}
 
-    # 3) Nova ENTRADA: fecha anterior com X se já havia 2 observados; senão segue
+    # 3) Nova ENTRADA (com filtros máximos)
     parsed = parse_entry_text(text)
     if not parsed:
         return {"ok": True, "skipped": "nao_eh_entrada_confirmada"}
 
     pend = get_open_pending()
     if pend:
-        # se já houver 3, fecha antes de qualquer coisa
         seen_list = _seen_list(pend)
         if len(seen_list) >= 3:
             suggested = int(pend["suggested"] or 0)
@@ -540,39 +491,49 @@ async def webhook(token: str, request: Request):
             await tg_send_text(TARGET_CHANNEL, out_msg)
             pend = get_open_pending()
 
-        # se ficou com 2 observados, fecha com X no 3º AGORA
         if pend:
             msgx = close_pending_force_fill_third_with_X_if_two()
             if msgx:
                 await tg_send_text(TARGET_CHANNEL, msgx)
                 pend = get_open_pending()
 
-        # se ainda existir pendente (ex.: só 1 observado), NÃO abre novo
         if pend:
             return {"ok": True, "kept_open_waiting_more_observed": True}
 
-    # Alimenta memória e decide novo tiro (sem travas por min/conf/gap)
+    # Alimenta memória e decide novo tiro
     seq = parsed["seq"] or []
     if seq: append_seq(seq)
-
     after = parsed["after"]
+
     best, conf, samples, post = choose_single_number(after)
 
-    # Publica novo tiro (salva snapshot p/ imprimir no fechamento)
+    # >>> Filtros máximos: checagem de qualidade (conf, gap, samples)
+    top2 = sorted(post.items(), key=lambda kv: kv[1], reverse=True)[:2]
+    gap = (top2[0][1] - (top2[1][1] if len(top2) > 1 else 0.0)) if top2 else 0.0
+
+    # Bloqueio se não atingir os 3 critérios
+    if (samples < MIN_SAMPLES) or (conf < MIN_CONF_G0) or (gap < MIN_GAP_G0):
+        # Não publica; apenas registra que foi reprovado
+        return {
+            "ok": True,
+            "skipped_low_quality": True,
+            "why": {
+                "samples": f"{samples} (min {MIN_SAMPLES})",
+                "conf": f"{conf:.3f} (min {MIN_CONF_G0:.3f})",
+                "gap": f"{gap:.3f} (min {MIN_GAP_G0:.3f})"
+            }
+        }
+
+    # Publica novo tiro (snapshot para fechamento)
     open_pending(best, conf=conf, samples=samples, post=post)
     aft_txt = f" após {after}" if after else ""
     txt = (
         f"🎯 <b>Número seco (G0):</b> <b>{best}</b>\n"
         f"🧩 <b>Padrão:</b> GEN{aft_txt}\n"
-        f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples}"
+        f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples} | <b>Gap:</b> {gap*100:.2f}%"
     )
-    if _can_post_now():
-        await tg_send_text(TARGET_CHANNEL, txt)
-        _mark_post()
-        return {"ok": True, "posted": True, "best": best, "conf": conf, "samples": samples}
-    else:
-        # se antispam segurou, ainda assim mantemos a pendência aberta (fluxo não “trava”)
-        return {"ok": True, "queued_but_notified_later": True, "best": best, "conf": conf, "samples": samples}
+    await tg_send_text(TARGET_CHANNEL, txt)
+    return {"ok": True, "posted": True, "best": best, "conf": conf, "samples": samples, "gap": gap}
 
 # ===== Debug/help endpoint =====
 @app.get("/health")
@@ -586,9 +547,9 @@ async def health():
         "pending_open": pend_open,
         "pending_seen": seen,
         "time": ts_str(),
-        "antispam": {
-            "min_gap_sec": MIN_SECONDS_BETWEEN_POST,
-            "max_per_hour": MAX_POSTS_PER_HOUR,
-            "posts_this_hour": _posts_this_hour
+        "filters": {
+            "MIN_CONF_G0": MIN_CONF_G0,
+            "MIN_GAP_G0": MIN_GAP_G0,
+            "MIN_SAMPLES": MIN_SAMPLES
         }
     }
