@@ -12,15 +12,15 @@ Fechamento robusto (mantido):
   • GREEN se nosso número aparecer em 1º, 2º ou 3º -> G0/G1/G2.
   • LOSS se, após 3 observados, nosso número não aparece.
   • Se vierem apenas 2 observados, o 3º vira "X" (no próximo ENTRADA CONFIRMADA
-    ou por timeout), e fecha. Se só houver 1 observado, mantém aberto.
-Mensagens finais:
-  🟢 GREEN — finalizado (G1, nosso=3, observados=1-3-4).
-  🔴 LOSS  — finalizado (G2, nosso=X, observados=1-4-X).
-Sempre adiciona "📊 Geral: <greens> GREEN × <loss> LOSS — <acc>%".
+    OU por timeout), e fecha. Se só houver 1 observado, mantém aberto.
+Mensagens finais (agora com N-gram):
+  🟢/🔴 + Geral + "📈 Amostra: N • Conf: X%"
+  🔎 N-gram context (última análise):
+     1 → a% | 2 → b% | 3 → c% | 4 → d%  (com o escolhido em negrito)
 
 Qualidade (aproveita todos os sinais; filtros leves apenas no empate técnico):
-- decay = 0.980
-- W4=0.42, W3=0.30, W2=0.18, W1=0.10
+- decay = 0.982   (mais estável, prioriza um pouco mais sequência longa)
+- W4=0.46, W3=0.30, W2=0.16, W1=0.08
 - GAP_SOFT (empate técnico) = 0.015 → fallback leve por frequência
 - SEM bloqueio por MIN_SAMPLES/CONF_MIN/GAP_MIN
 - Timeout para completar com X (apenas se já houver 2 observados): 180s
@@ -30,7 +30,7 @@ ENV opcionais: TARGET_CHANNEL, SOURCE_CHANNEL, DB_PATH
 Webhook: POST /webhook/{WEBHOOK_TOKEN}
 """
 
-import os, re, time, sqlite3
+import os, re, time, sqlite3, json
 from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timezone
 
@@ -52,11 +52,12 @@ if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
 # ========= App =========
-app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="2.3.3")
+app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="2.4.0")
 
 # ========= Parâmetros =========
-DECAY = 0.980
-W4, W3, W2, W1 = 0.42, 0.30, 0.18, 0.10
+# (ajuste cirúrgico na qualidade)
+DECAY = 0.982
+W4, W3, W2, W1 = 0.46, 0.30, 0.16, 0.08
 GAP_SOFT       = 0.015         # anti-empate técnico (fallback leve)
 OBS_TIMEOUT_SEC= 180           # completa com X (apenas se já houver 2 observados)
 
@@ -103,7 +104,10 @@ def migrate_db():
         stage INTEGER DEFAULT 0,
         open INTEGER DEFAULT 1,
         seen TEXT,
-        opened_at INTEGER
+        opened_at INTEGER,
+        last_conf REAL,
+        last_samples INTEGER,
+        last_post TEXT
     )""")
     for col, ddl in [
         ("created_at", "ALTER TABLE pending ADD COLUMN created_at INTEGER"),
@@ -112,6 +116,9 @@ def migrate_db():
         ("open",       "ALTER TABLE pending ADD COLUMN open INTEGER DEFAULT 1"),
         ("seen",       "ALTER TABLE pending ADD COLUMN seen TEXT"),
         ("opened_at",  "ALTER TABLE pending ADD COLUMN opened_at INTEGER"),
+        ("last_conf",  "ALTER TABLE pending ADD COLUMN last_conf REAL"),
+        ("last_samples","ALTER TABLE pending ADD COLUMN last_samples INTEGER"),
+        ("last_post",  "ALTER TABLE pending ADD COLUMN last_post TEXT"),
     ]:
         if not _column_exists(con, "pending", col):
             try: cur.execute(ddl)
@@ -270,7 +277,7 @@ AFTER_RX = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
 GALE1_RX = re.compile(r"Estamos\s+no\s*1[ºo]\s*gale", re.I)
 GALE2_RX = re.compile(r"Estamos\s+no\s*2[ºo]\s*gale", re.I)
 
-# >>> Regex TOLERANTE para fechamento:
+# Fechamento tolerante
 GREEN_RX = re.compile(r"(?:\bgr+e+e?n\b|\bwin\b|✅)", re.I)   # GREEN/GREEM/GREN, WIN, ✅
 LOSS_RX  = re.compile(r"(?:\blo+s+s?\b|\bred\b|❌|\bperdemos\b)", re.I)  # LOSS/LOS, RED, ❌, PERDEMOS
 
@@ -293,9 +300,8 @@ def parse_entry_text(text: str) -> Optional[Dict]:
 
 def parse_close_numbers(text: str) -> List[int]:
     """
-    1) Tenta extrair o último grupo entre parênteses: (1 | 4 | 4) -> [1,4,4]
-    2) Se não houver parênteses, captura até 3 dígitos válidos 1..4 no texto inteiro, na ordem em que aparecem.
-       Ex.: 'GREEM 2 4 1' -> [2,4,1]
+    1) Extrai o último grupo entre parênteses: (1 | 4 | 4) -> [1,4,4]
+    2) Se não houver parênteses, captura até 3 dígitos válidos 1..4 no texto inteiro.
     """
     t = re.sub(r"\s+", " ", text)
     groups = PAREN_GROUP_RX.findall(t)
@@ -303,7 +309,6 @@ def parse_close_numbers(text: str) -> List[int]:
         last = groups[-1]
         nums = re.findall(r"[1-4]", last)
         return [int(x) for x in nums][:3]
-    # fallback sem parênteses
     nums = ANY_14_RX.findall(t)
     return [int(x) for x in nums][:3]
 
@@ -314,13 +319,14 @@ def get_open_pending() -> Optional[sqlite3.Row]:
     con.close()
     return row
 
-def open_pending(suggested: int):
-    _exec_write("""INSERT INTO pending (created_at, suggested, stage, open, seen, opened_at)
-                   VALUES (?,?,?,?,?,?)""",
-                (now_ts(), int(suggested), 0, 1, "", now_ts()))
+def open_pending(suggested: int, conf: float=0.0, samples: int=0, post: Optional[Dict[int,float]]=None):
+    post_txt = json.dumps(post or {}, ensure_ascii=False)
+    _exec_write("""INSERT INTO pending
+                   (created_at, suggested, stage, open, seen, opened_at, last_conf, last_samples, last_post)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (now_ts(), int(suggested), 0, 1, "", now_ts(), float(conf), int(samples), post_txt))
 
 def set_stage(stage:int):
-    # apenas informativo
     con = _connect(); cur = con.cursor()
     cur.execute("UPDATE pending SET stage=? WHERE open=1", (int(stage),))
     con.commit(); con.close()
@@ -347,21 +353,54 @@ def _stage_from_observed(suggested: int, obs: List[int]) -> Tuple[str, str]:
     if len(obs) >= 3 and obs[2] == suggested: return ("GREEN", "G2")
     return ("LOSS", "G2")
 
+def _fmt_ngram_context(post: Dict[int,float], best:int, samples:int, conf:float) -> str:
+    # formata: "📈 Amostra: N • Conf: X%\n\n🔎 N-gram context (última análise):\n1 → a% | 2 → b% | 3 → c% | 4 → d%"
+    lines = []
+    lines.append(f"📈 Amostra: {int(samples)} • Conf: {conf*100:.1f}%")
+    # ordena por chave 1..4 mantendo ordem visual 1-2-3-4
+    parts = []
+    for n in [1,2,3,4]:
+        p = post.get(n, 0.0) * 100.0
+        label = f"<b>{n}</b> → {p:.1f}%"
+        parts.append(label)
+    body = " | ".join(parts)
+    return f"{lines[0]}\n\n🔎 N-gram context (última análise):\n{body}"
+
 def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_lbl: str, suggested: int):
-    # LOSS deve mostrar "número X" para não confundir
     our_num_display = suggested if outcome.upper()=="GREEN" else "X"
+
+    # snapshot da análise para imprimir no fechamento
+    try:
+        conf = float(row["last_conf"] or 0.0)
+    except Exception:
+        conf = 0.0
+    try:
+        samples = int(row["last_samples"] or 0)
+    except Exception:
+        samples = 0
+    try:
+        post = json.loads(row["last_post"] or "{}")
+        # chaves do sqlite vêm como strings; normaliza para int
+        post = {int(k): float(v) for k,v in post.items()}
+    except Exception:
+        post = {}
 
     con = _connect(); cur = con.cursor()
     cur.execute("UPDATE pending SET open=0, seen=? WHERE id=?", (final_seen, int(row["id"])))
     con.commit(); con.close()
 
     bump_score(outcome.upper())
-    msg = (
+
+    base_msg = (
         f"{'🟢' if outcome.upper()=='GREEN' else '🔴'} "
         f"<b>{outcome.upper()}</b> — finalizado "
         f"(<b>{stage_lbl}</b>, nosso={our_num_display}, observados={final_seen}).\n"
         f"📊 Geral: {score_text()}"
     )
+
+    # anexa bloco N-gram (amostra dinâmica + distribuição)
+    ngram_block = _fmt_ngram_context(post, suggested, samples, conf)
+    msg = f"{base_msg}\n\n{ngram_block}"
     return msg
 
 def _maybe_close_by_timeout():
@@ -505,8 +544,8 @@ async def webhook(token: str, request: Request):
     after = parsed["after"]
     best, conf, samples, post = choose_single_number(after)
 
-    # Publica novo tiro
-    open_pending(best)
+    # Publica novo tiro (agora salvando snapshot p/ imprimir no fechamento)
+    open_pending(best, conf=conf, samples=samples, post=post)
     aft_txt = f" após {after}" if after else ""
     txt = (
         f"🎯 <b>Número seco (G0):</b> <b>{best}</b>\n"
@@ -522,4 +561,4 @@ async def health():
     pend = get_open_pending()
     pend_open = bool(pend)
     seen = (pend["seen"] if pend else "")
-    return {"ok": True, "db": DB_PATH, "pending_open": pend_open, "pending_seen": seen, "time": ts_str()} 
+    return {"ok": True, "db": DB_PATH, "pending_open": pend_open, "pending_seen": seen, "time": ts_str()}
