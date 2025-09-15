@@ -3,3 +3,4 @@ httpx
 uvicorn
 pydantic
 sqlite3
+httpx
