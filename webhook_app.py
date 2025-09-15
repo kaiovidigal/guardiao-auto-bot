@@ -24,9 +24,9 @@ app = FastAPI(title="guardiao-auto-bot (GEN Hibrido)", version="2.7.1")
 
 # ========= HÍBRIDO (curta/longa) – mantém sua lógica anterior =========
 SHORT_WINDOW = 500
-LONG_WINDOW  = 5000
-CONF_SHORT_MIN = 0.55
-CONF_LONG_MIN  = 0.58
+LONG_WINDOW  = 3000
+CONF_SHORT_MIN = 0.49
+CONF_LONG_MIN  = 0.55
 GAP_MIN        = 0.040
 
 # ======== TIMEOUT ÚNICO (pedido): inicia quando houver 2 observados ========
