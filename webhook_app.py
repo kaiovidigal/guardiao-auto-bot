@@ -1,22 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-webhook_app.py
---------------
-FastAPI + Telegram webhook para refletir sinais do canal-fonte e publicar
-um "número seco" (GEN) no canal-alvo. Acompanha G1/G2 e fecha de forma robusta.
+webhook_app.py — transparente (G0/G1/G2 à mostra) + n-gram/backoff + antispam leve
 
-Destaques:
-- Compatível com TARGET_CHANNEL **ou** PUBLIC_CHANNEL (usa o que tiver).
-- Duas rotas de webhook: dinâmica (/webhook/{token}) e fixa (/webhook/<WEBHOOK_TOKEN>).
-- Fechamento SEMPRE pelos números observados do fonte (1º/2º/3º => G0/G1/G2; senão LOSS).
-- Se só vierem 2 observados, completa com "X" no 3º por timeout (180s) ou ao chegar nova entrada.
-- N-gram com memória (timeline/ngram) sem travas de amostra/conf mínima.
-- Mensagens de fechamento incluem placar geral + amostra e distribuição de probabilidades.
+O que entra de novo (sem travar fluxo):
+- Parsers tolerantes (GREEN/RED/greem/los/✅/❌ etc.)
+- Antispam leve (MIN_SECONDS_BETWEEN_POST + MAX_POSTS_PER_HOUR)
+- /debug/state (amostra de ngram/timeline, pendência e limites antispam)
 
-ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
-ENV opcionais: TARGET_CHANNEL **ou** PUBLIC_CHANNEL, SOURCE_CHANNEL, DB_PATH
-Webhook: POST /webhook/{WEBHOOK_TOKEN}  (e rota fixa equivalente)
+Sem “recuperação oculta”, sem fases A/B/C, sem cool-down pesado.
 """
 
 import os, re, time, sqlite3, json
@@ -27,17 +19,13 @@ import httpx
 from fastapi import FastAPI, Request, HTTPException
 
 # ========= ENV =========
-TG_BOT_TOKEN   = (os.getenv("TG_BOT_TOKEN") or "").strip()
-WEBHOOK_TOKEN  = (os.getenv("WEBHOOK_TOKEN") or "").strip()
+TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
+WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
+# aceita TARGET_CHANNEL ou PUBLIC_CHANNEL (preferência TARGET_CHANNEL)
+TARGET_CHANNEL = (os.getenv("TARGET_CHANNEL") or os.getenv("PUBLIC_CHANNEL", "-1002796105884")).strip()
+SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "").strip()  # se vazio, não filtra
 
-# aceita TARGET_CHANNEL ou PUBLIC_CHANNEL
-_target_env     = (os.getenv("TARGET_CHANNEL") or os.getenv("PUBLIC_CHANNEL") or "").strip()
-TARGET_CHANNEL  = _target_env if _target_env else "-1002796105884"
-
-SOURCE_CHANNEL  = (os.getenv("SOURCE_CHANNEL") or "").strip()   # se vazio, não filtra
-
-# caminho do BD (gravável). /var/data é estável no Render/Railway
-DB_PATH        = (os.getenv("DB_PATH") or "/var/data/data.db").strip() or "/var/data/data.db"
+DB_PATH        = os.getenv("DB_PATH", "/var/data/data.db").strip() or "/var/data/data.db"
 TELEGRAM_API   = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 if not TG_BOT_TOKEN:
@@ -46,13 +34,40 @@ if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
 # ========= App =========
-app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="2.5.0")
+app = FastAPI(title="guardiao-auto-bot (GEN webhook) — fluxo livre", version="2.5.0")
 
-# ========= Parâmetros =========
+# ========= Parâmetros de qualidade (iguais ao seu base) =========
 DECAY = 0.982
 W4, W3, W2, W1 = 0.46, 0.30, 0.16, 0.08
-GAP_SOFT        = 0.015         # empate técnico → fallback leve por frequência
-OBS_TIMEOUT_SEC = 180           # completa com X se já houver 2 observados
+GAP_SOFT       = 0.015         # anti-empate técnico (fallback leve por frequência)
+OBS_TIMEOUT_SEC= 180           # completa com X (apenas se já houver 2 observados)
+
+# >>> Antispam leve (não bloqueante para o sistema, só espaça mensagens)
+MIN_SECONDS_BETWEEN_POST = 6
+MAX_POSTS_PER_HOUR       = 40
+_last_post_ts = 0.0
+_posts_this_hour = 0
+_hour_bucket = None
+
+def _hour_key() -> int:
+    return int(datetime.now(timezone.utc).strftime("%Y%m%d%H"))
+
+def _can_post_now() -> bool:
+    global _posts_this_hour, _hour_bucket, _last_post_ts
+    hb = _hour_key()
+    if _hour_bucket != hb:
+        _hour_bucket = hb
+        _posts_this_hour = 0
+    if (time.time() - (_last_post_ts or 0)) < MIN_SECONDS_BETWEEN_POST:
+        return False
+    if _posts_this_hour >= MAX_POSTS_PER_HOUR:
+        return False
+    return True
+
+def _mark_post():
+    global _posts_this_hour, _last_post_ts
+    _posts_this_hour += 1
+    _last_post_ts = time.time()
 
 # ========= Utils =========
 def now_ts() -> int:
@@ -117,7 +132,7 @@ def migrate_db():
             try: cur.execute(ddl)
             except sqlite3.OperationalError: pass
 
-    # score
+    # score (placar simples)
     cur.execute("""CREATE TABLE IF NOT EXISTS score (
         id INTEGER PRIMARY KEY CHECK (id=1),
         green INTEGER DEFAULT 0,
@@ -250,12 +265,13 @@ def _post_from_tail(tail: List[int], after: Optional[int]) -> Dict[int, float]:
 def choose_single_number(after: Optional[int]) -> Tuple[int, float, int, Dict[int,float]]:
     tail = get_tail(400)
     post = _post_from_tail(tail, after)
-    # empate técnico → fallback por frequência nos últimos 50
+    # empate técnico → fallback leve por frequência nos últimos 50
     top2 = sorted(post.items(), key=lambda kv: kv[1], reverse=True)[:2]
     if len(top2) == 2 and (top2[0][1] - top2[1][1]) < GAP_SOFT:
         last = tail[-50:] if len(tail) >= 50 else tail
         if last:
             freq = {c: last.count(c) for c in [1,2,3,4]}
+            # escolhe o MENOS frequente para evitar overfit do momento
             best = sorted([1,2,3,4], key=lambda x: (freq.get(x,0), x))[0]
             conf = 0.50
             return best, conf, len(tail), post
@@ -263,18 +279,18 @@ def choose_single_number(after: Optional[int]) -> Tuple[int, float, int, Dict[in
     conf = float(post[best])
     return best, conf, len(tail), post
 
-# ========= Parse =========
+# ========= Parse (mais tolerante) =========
 ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
 SEQ_RX   = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
-AFTER_RX = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
+AFTER_RX = re.compile(r"(?:ap[oó]s|após)\s+o\s+([1-4])", re.I)
 GALE1_RX = re.compile(r"Estamos\s+no\s*1[ºo]\s*gale", re.I)
 GALE2_RX = re.compile(r"Estamos\s+no\s*2[ºo]\s*gale", re.I)
 
-# Fechamento tolerante
-GREEN_RX = re.compile(r"(?:\bgr+e+e?n\b|\bwin\b|✅)", re.I)   # GREEN/GREEM/GREN, WIN, ✅
+# GREEN/RED super tolerante (green/greem/gren/win/✅) / (loss/los/red/❌/perdemos)
+GREEN_RX = re.compile(r"(?:\bgr+e+e?n\b|\bwin\b|✅)", re.I)
 LOSS_RX  = re.compile(r"(?:\blo+s+s?\b|\bred\b|❌|\bperdemos\b)", re.I)
 
-# Números de fechamento
+# fechar por números entre parênteses; se não houver, pega 1..4 soltos
 PAREN_GROUP_RX = re.compile(r"\(([^)]*)\)")
 ANY_14_RX      = re.compile(r"[1-4]")
 
@@ -343,23 +359,26 @@ def _stage_from_observed(suggested: int, obs: List[int]) -> Tuple[str, str]:
     return ("LOSS", "G2")
 
 def _fmt_ngram_context(post: Dict[int,float], best:int, samples:int, conf:float) -> str:
+    lines = []
+    lines.append(f"📈 Amostra: {int(samples)} • Conf: {conf*100:.1f}%")
     parts = []
     for n in [1,2,3,4]:
         p = post.get(n, 0.0) * 100.0
-        parts.append(f"<b>{n}</b> → {p:.1f}%")
-    return f"📈 Amostra: {int(samples)} • Conf: {conf*100:.1f}%\n\n🔎 N-gram context (última análise):\n" + " | ".join(parts)
+        label = f"<b>{n}</b> → {p:.1f}%"
+        parts.append(label)
+    body = " | ".join(parts)
+    return f"{lines[0]}\n\n🔎 N-gram context (última análise):\n{body}"
 
 def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_lbl: str, suggested: int):
     our_num_display = suggested if outcome.upper()=="GREEN" else "X"
-
-    try:    conf = float(row["last_conf"] or 0.0)
-    except: conf = 0.0
-    try:    samples = int(row["last_samples"] or 0)
-    except: samples = 0
+    try:  conf = float(row["last_conf"] or 0.0)
+    except Exception: conf = 0.0
+    try:  samples = int(row["last_samples"] or 0)
+    except Exception: samples = 0
     try:
         post = json.loads(row["last_post"] or "{}")
         post = {int(k): float(v) for k,v in post.items()}
-    except:
+    except Exception:
         post = {}
 
     con = _connect(); cur = con.cursor()
@@ -374,7 +393,8 @@ def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_l
         f"(<b>{stage_lbl}</b>, nosso={our_num_display}, observados={final_seen}).\n"
         f"📊 Geral: {score_text()}"
     )
-    return base_msg + "\n\n" + _fmt_ngram_context(post, suggested, samples, conf)
+    ngram_block = _fmt_ngram_context(post, suggested, samples, conf)
+    return f"{base_msg}\n\n{ngram_block}"
 
 def _maybe_close_by_timeout():
     row = get_open_pending()
@@ -416,64 +436,80 @@ async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
 # ========= Rotas =========
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "guardiao-auto-bot (GEN webhook)",
-            "use": f"POST /webhook/{WEBHOOK_TOKEN}"}
+    return {"ok": True, "service": "guardiao-auto-bot (GEN webhook)"}
 
-# rota dinâmica + checagem do token
+@app.get("/debug/state")
+async def debug_state():
+    # estado operacional simples (não trava)
+    try:
+        con = _connect()
+        tail_cnt = con.execute("SELECT COUNT(*) FROM timeline").fetchone()[0]
+        ng_cnt   = con.execute("SELECT COUNT(*) FROM ngram").fetchone()[0]
+        con.close()
+    except Exception:
+        tail_cnt = ng_cnt = 0
+    pend = get_open_pending()
+    return {
+        "samples_tail": int(tail_cnt),
+        "ngrams_rows": int(ng_cnt),
+        "pending_open": bool(pend),
+        "pending_seen": (pend["seen"] if pend else ""),
+        "antispam": {
+            "min_gap_sec": MIN_SECONDS_BETWEEN_POST,
+            "max_per_hour": MAX_POSTS_PER_HOUR,
+            "posts_this_hour": _posts_this_hour
+        }
+    }
+
 @app.post("/webhook/{token}")
-async def webhook_dyn(token: str, request: Request):
+async def webhook(token: str, request: Request):
     if token != WEBHOOK_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
-    return await _handle_update(request)
 
-# rota FIXA (evita 404 no setWebhook direto)
-@app.post(f"/webhook/{WEBHOOK_TOKEN}")
-async def webhook_fixed(request: Request):
-    return await _handle_update(request)
-
-async def _handle_update(request: Request):
-    # timeout pode fechar pendência (se já houver 2 observados)
+    # timeout: se já houver 2 observados, completa com X e fecha
     timeout_msg = _maybe_close_by_timeout()
     if timeout_msg:
+        # timeout não é “sinal novo”, então antispam não se aplica
         await tg_send_text(TARGET_CHANNEL, timeout_msg)
 
-    try:
-        data = await request.json()
-    except Exception:
-        data = {}
-
+    data = await request.json()
     msg = data.get("channel_post") or data.get("message") \
         or data.get("edited_channel_post") or data.get("edited_message") or {}
 
     text = (msg.get("text") or msg.get("caption") or "").strip()
     chat = msg.get("chat") or {}
     chat_id = str(chat.get("id") or "")
-
     if SOURCE_CHANNEL and chat_id != str(SOURCE_CHANNEL):
         return {"ok": True, "skipped": "outro_chat"}
     if not text:
         return {"ok": True, "skipped": "sem_texto"}
 
-    # --- gales (informativo) ---
+    # 1) Gales (informativo)
     if GALE1_RX.search(text):
         if get_open_pending():
             set_stage(1)
-            await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>1° gale (G1)</b>")
+            if _can_post_now():
+                await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>1° gale (G1)</b>")
+                _mark_post()
         return {"ok": True, "noted": "g1"}
+
     if GALE2_RX.search(text):
         if get_open_pending():
             set_stage(2)
-            await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>2° gale (G2)</b>")
+            if _can_post_now():
+                await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>2° gale (G2)</b>")
+                _mark_post()
         return {"ok": True, "noted": "g2"}
 
-    # --- fechamentos (GREEN/LOSS, 1..3 números; tolerante) ---
+    # 2) Fechamentos do fonte (GREEN/LOSS, com 1, 2 ou 3 números; variações greem/los/red)
     if GREEN_RX.search(text) or LOSS_RX.search(text):
         pend = get_open_pending()
         if pend:
-            nums = parse_close_numbers(text)
+            nums = parse_close_numbers(text)  # pode ter 1, 2 ou 3
             if nums:
                 _seen_append(pend, [str(n) for n in nums])
                 pend = get_open_pending()
+
             seen_list = _seen_list(pend) if pend else []
             if pend and len(seen_list) >= 3:
                 suggested = int(pend["suggested"] or 0)
@@ -481,17 +517,19 @@ async def _handle_update(request: Request):
                 outcome, stage_lbl = _stage_from_observed(suggested, obs_nums)
                 final_seen = "-".join(seen_list[:3])
                 out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
+                # fechamento sempre publica (evento raro) — antispam não bloqueia
                 await tg_send_text(TARGET_CHANNEL, out_msg)
                 return {"ok": True, "closed": outcome.lower(), "seen": final_seen}
         return {"ok": True, "noted_close": True}
 
-    # --- nova ENTRADA CONFIRMADA ---
+    # 3) Nova ENTRADA: fecha anterior com X se já havia 2 observados; senão segue
     parsed = parse_entry_text(text)
     if not parsed:
         return {"ok": True, "skipped": "nao_eh_entrada_confirmada"}
 
     pend = get_open_pending()
     if pend:
+        # se já houver 3, fecha antes de qualquer coisa
         seen_list = _seen_list(pend)
         if len(seen_list) >= 3:
             suggested = int(pend["suggested"] or 0)
@@ -501,21 +539,26 @@ async def _handle_update(request: Request):
             out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
             await tg_send_text(TARGET_CHANNEL, out_msg)
             pend = get_open_pending()
+
+        # se ficou com 2 observados, fecha com X no 3º AGORA
         if pend:
             msgx = close_pending_force_fill_third_with_X_if_two()
             if msgx:
                 await tg_send_text(TARGET_CHANNEL, msgx)
                 pend = get_open_pending()
-        if pend:   # ainda pendente (ex.: só 1 observado) → não abre novo
+
+        # se ainda existir pendente (ex.: só 1 observado), NÃO abre novo
+        if pend:
             return {"ok": True, "kept_open_waiting_more_observed": True}
 
-    # Alimenta memória com a sequência, decide o tiro, e publica G0
+    # Alimenta memória e decide novo tiro (sem travas por min/conf/gap)
     seq = parsed["seq"] or []
     if seq: append_seq(seq)
 
     after = parsed["after"]
     best, conf, samples, post = choose_single_number(after)
 
+    # Publica novo tiro (salva snapshot p/ imprimir no fechamento)
     open_pending(best, conf=conf, samples=samples, post=post)
     aft_txt = f" após {after}" if after else ""
     txt = (
@@ -523,8 +566,13 @@ async def _handle_update(request: Request):
         f"🧩 <b>Padrão:</b> GEN{aft_txt}\n"
         f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples}"
     )
-    await tg_send_text(TARGET_CHANNEL, txt)
-    return {"ok": True, "posted": True, "best": best, "conf": conf, "samples": samples}
+    if _can_post_now():
+        await tg_send_text(TARGET_CHANNEL, txt)
+        _mark_post()
+        return {"ok": True, "posted": True, "best": best, "conf": conf, "samples": samples}
+    else:
+        # se antispam segurou, ainda assim mantemos a pendência aberta (fluxo não “trava”)
+        return {"ok": True, "queued_but_notified_later": True, "best": best, "conf": conf, "samples": samples}
 
 # ===== Debug/help endpoint =====
 @app.get("/health")
@@ -532,4 +580,15 @@ async def health():
     pend = get_open_pending()
     pend_open = bool(pend)
     seen = (pend["seen"] if pend else "")
-    return {"ok": True, "db": DB_PATH, "pending_open": pend_open, "pending_seen": seen, "time": ts_str()}
+    return {
+        "ok": True,
+        "db": DB_PATH,
+        "pending_open": pend_open,
+        "pending_seen": seen,
+        "time": ts_str(),
+        "antispam": {
+            "min_gap_sec": MIN_SECONDS_BETWEEN_POST,
+            "max_per_hour": MAX_POSTS_PER_HOUR,
+            "posts_this_hour": _posts_this_hour
+        }
+    }
