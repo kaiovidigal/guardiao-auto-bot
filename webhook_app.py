@@ -3,13 +3,6 @@
 
 """
 Webhook (GEN híbrido + estratégia + timeout 45s + relatório 5min + reset diário)
-
-- Respeita a estratégia do canal-fonte (KWOK/SSH/ODD/EVEN/Sequência) restringindo os candidatos.
-- Decide o "número seco" usando n-gram híbrido: cauda curta (1000) + longa (5000).
-- Publica G0 imediatamente; fecha assim que nosso número aparecer (G0/G1/G2).
-- Timeout único: ao ter 2 observados, inicia contagem de 45s; se 3º não vier, fecha com X.
-- Relatório automático a cada 5 minutos (G0/G1/G2, LOSS, % e status do dia).
-- Reset diário 00:00 UTC do placar (GREEN × LOSS).
 """
 
 import os, re, time, json, sqlite3, asyncio
@@ -31,25 +24,23 @@ if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
-app = FastAPI(title="guardiao-auto-bot (GEN híbrido + estratégia)", version="3.1.0")
+app = FastAPI(title="guardiao-auto-bot (GEN híbrido + estratégia)", version="3.1.1")
 
 # ========= HÍBRIDO (curta/longa) =========
-SHORT_WINDOW    = 40     # cauda curta (mais responsiva)
-LONG_WINDOW     = 1500     # cauda longa (mais estável)
-CONF_SHORT_MIN  = 0.40     # confiança mínima na curta
-CONF_LONG_MIN   = 0.55     # confiança mínima na longa
-GAP_MIN         = 0.020    # gap mínimo (top1 - top2) nas duas
-FINAL_TIMEOUT   = 45       # segundos; começa quando houver 2 observados
+SHORT_WINDOW    = 30
+LONG_WINDOW     = 2000
+CONF_SHORT_MIN  = 0.40
+CONF_LONG_MIN   = 0.55
+GAP_MIN         = 0.020
+FINAL_TIMEOUT   = 45       # começa quando houver 2 observados
 
 # ========= Relatório / Sinais do dia =========
-REPORT_EVERY_SEC   = 5 * 60   # 5 minutos
-GOOD_DAY_THRESHOLD = 0.70     # >= 70% → Dia bom
-BAD_DAY_THRESHOLD  = 0.40     # <= 40% → Dia ruim
+REPORT_EVERY_SEC   = 5 * 60
+GOOD_DAY_THRESHOLD = 0.70
+BAD_DAY_THRESHOLD  = 0.40
 
 # ========= Utils =========
-def now_ts() -> int:
-    return int(time.time())
-
+def now_ts() -> int: return int(time.time())
 def ts_str(ts=None) -> str:
     if ts is None: ts = now_ts()
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -83,19 +74,17 @@ def _query_all(sql: str, params: tuple=()) -> List[sqlite3.Row]:
 
 def migrate_db():
     con = _connect(); cur = con.cursor()
-    # histórico simples
     cur.execute("""CREATE TABLE IF NOT EXISTS timeline (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         created_at INTEGER NOT NULL,
         number INTEGER NOT NULL
     )""")
-    # pendência com 1 cronômetro (final) + resultado/fechamento
     cur.execute("""CREATE TABLE IF NOT EXISTS pending (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         created_at INTEGER,
         suggested INTEGER,
         open INTEGER DEFAULT 1,
-        seen TEXT,                -- "1-3" | "1-3-2"
+        seen TEXT,
         opened_at INTEGER,
         last_post_short TEXT,
         last_post_long  TEXT,
@@ -104,11 +93,10 @@ def migrate_db():
         d_final INTEGER,
         base TEXT,
         pattern_key TEXT,
-        closed_at INTEGER,        -- timestamp do fechamento
-        outcome TEXT,             -- 'GREEN' | 'LOSS'
-        stage TEXT                -- 'G0' | 'G1' | 'G2'
+        closed_at INTEGER,
+        outcome TEXT,
+        stage TEXT
     )""")
-    # placar diário simples (totais)
     cur.execute("""CREATE TABLE IF NOT EXISTS score (
         id INTEGER PRIMARY KEY CHECK (id=1),
         green INTEGER DEFAULT 0,
@@ -135,6 +123,13 @@ def migrate_db():
             try: cur.execute(ddl)
             except sqlite3.OperationalError: pass
 
+    # 🔧 corrige linhas antigas com NULL/vazio onde o schema antigo exigia NOT NULL
+    try:
+        cur.execute("UPDATE pending SET stage='OPEN'    WHERE stage IS NULL OR stage=''")
+        cur.execute("UPDATE pending SET outcome='PENDING' WHERE outcome IS NULL OR outcome=''")
+    except sqlite3.OperationalError:
+        pass
+
     con.commit(); con.close()
 
 migrate_db()
@@ -156,8 +151,7 @@ def bump_score(outcome: str):
     cur.execute("INSERT OR REPLACE INTO score (id, green, loss) VALUES (1,?,?)", (g, l))
     con.commit(); con.close()
 
-def reset_score():
-    _exec_write("INSERT OR REPLACE INTO score (id, green, loss) VALUES (1,0,0)")
+def reset_score(): _exec_write("INSERT OR REPLACE INTO score (id, green, loss) VALUES (1,0,0)")
 
 def score_text() -> str:
     con = _connect()
@@ -169,7 +163,7 @@ def score_text() -> str:
     acc = (g/total*100.0) if total>0 else 0.0
     return f"{g} GREEN × {l} LOSS — {acc:.1f}%"
 
-# ========= Timeline / N-gram simplificado =========
+# ========= Timeline / N-gram =========
 def append_timeline(seq: List[int]):
     for n in seq:
         _exec_write("INSERT INTO timeline (created_at, number) VALUES (?,?)", (now_ts(), int(n)))
@@ -194,7 +188,6 @@ def _post_from_tail(tail: List[int], after: Optional[int], candidates: List[int]
     if not tail:
         return {c: 1.0/len(candidates) for c in candidates}
     W = [0.46, 0.30, 0.16, 0.08]
-    # contextos (após X se existir na cauda)
     if after is not None and after in tail:
         idxs = [i for i,v in enumerate(tail) if v == after]
         i = idxs[-1]
@@ -247,10 +240,8 @@ def parse_candidates_and_pattern(t: str) -> Tuple[List[int], str]:
         a,b = int(m.group(1)), int(m.group(2))
         base = sorted(list({a,b}))
         return base, f"KWOK-{a}-{b}"
-    if ODD_RX.search(t):
-        return [1,3], "ODD"
-    if EVEN_RX.search(t):
-        return [2,4], "EVEN"
+    if ODD_RX.search(t):  return [1,3], "ODD"
+    if EVEN_RX.search(t): return [2,4], "EVEN"
     m = SSH_RX.search(t)
     if m:
         nums = [int(g) for g in m.groups() if g]
@@ -264,8 +255,7 @@ def parse_candidates_and_pattern(t: str) -> Tuple[List[int], str]:
             if n not in seen:
                 seen.add(n); base.append(n)
             if len(base) == 3: break
-        if base:
-            return base, "SEQ"
+        if base: return base, "SEQ"
     return [1,2,3,4], "GEN"
 
 def parse_entry_text(text: str) -> Optional[Dict]:
@@ -301,7 +291,7 @@ def choose_single_number_hybrid(after: Optional[int], candidates: List[int]) -> 
         best = b_s
     return best, c_s, c_l, len(tail_s), post_s, post_l
 
-# ========= Pending helpers (timer único 45s) =========
+# ========= Pending helpers =========
 def get_open_pending() -> Optional[sqlite3.Row]:
     con = _connect()
     row = con.execute("SELECT * FROM pending WHERE open=1 ORDER BY id DESC LIMIT 1").fetchone()
@@ -313,14 +303,11 @@ def _seen_list(row: sqlite3.Row) -> List[str]:
     return [s for s in seen.split("-") if s]
 
 def _set_seen(row_id:int, seen_list:List[str]):
-    seen_txt = "-".join(seen_list[:3])
-    _exec_write("UPDATE pending SET seen=? WHERE id=?", (seen_txt, row_id))
+    _exec_write("UPDATE pending SET seen=? WHERE id=?", ("-".join(seen_list[:3]), row_id))
 
 def _ensure_final_deadline_when_two(row: sqlite3.Row):
-    if int(row["d_final"] or 0) > 0:
-        return
-    seen_list = _seen_list(row)
-    if len(seen_list) == 2:
+    if int(row["d_final"] or 0) > 0: return
+    if len(_seen_list(row)) == 2:
         _exec_write("UPDATE pending SET d_final=? WHERE id=?", (now_ts() + FINAL_TIMEOUT, int(row["id"])))
 
 def _close_now(row: sqlite3.Row, suggested:int, final_seen:List[str]):
@@ -348,11 +335,12 @@ def _close_now(row: sqlite3.Row, suggested:int, final_seen:List[str]):
 def open_pending(suggested: int, conf_short:float, conf_long:float,
                  post_short:Dict[int,float], post_long:Dict[int,float],
                  base:List[int], pattern_key:str):
+    # 🔒 grava stage/outcome não nulos para compatibilidade com esquemas antigos
     _exec_write("""INSERT INTO pending
         (created_at, suggested, open, seen, opened_at,
          last_post_short, last_post_long, last_conf_short, last_conf_long,
          d_final, base, pattern_key, closed_at, outcome, stage)
-        VALUES (?,?,?,?,?,?,?,?,?,NULL,?,?,NULL,NULL,NULL)
+        VALUES (?,?,?,?,?,?,?,?,?,NULL,?,?,NULL,'PENDING','OPEN')
     """, (now_ts(), int(suggested), 1, "", now_ts(),
           json.dumps(post_short), json.dumps(post_long),
           float(conf_short), float(conf_long),
@@ -362,13 +350,11 @@ def _maybe_close_by_final_timeout():
     row = get_open_pending()
     if not row: return None
     d_final = int(row["d_final"] or 0)
-    if d_final <= 0 or now_ts() < d_final:
-        return None
+    if d_final <= 0 or now_ts() < d_final: return None
     seen_list = _seen_list(row)
     if len(seen_list) == 2:
         seen_list.append("X")
-        msg = _close_now(row, int(row["suggested"] or 0), seen_list)
-        return msg
+        return _close_now(row, int(row["suggested"] or 0), seen_list)
     return None
 
 # ========= Relatório 5 em 5 minutos =========
@@ -390,24 +376,15 @@ def _report_snapshot(last_secs:int=300) -> Dict[str,int]:
             if st == "G0": l0 += 1
             elif st == "G1": l1 += 1
             else: l2 += 1
-    # Totais do dia (score table)
-    con = _connect()
-    row = con.execute("SELECT green, loss FROM score WHERE id=1").fetchone()
-    con.close()
+    row = _query_all("SELECT green, loss FROM score WHERE id=1")[0] if _query_all("SELECT green, loss FROM score WHERE id=1") else None
     g = int(row["green"] if row else 0); l = int(row["loss"] if row else 0)
     total = g + l
     acc = (g/total) if total>0 else 0.0
-    return {
-        "g0": g0, "g1": g1, "g2": g2,
-        "l0": l0, "l1": l1, "l2": l2,
-        "day_green": g, "day_loss": l, "day_acc": acc
-    }
+    return {"g0":g0,"g1":g1,"g2":g2,"l0":l0,"l1":l1,"l2":l2,"day_green":g,"day_loss":l,"day_acc":acc}
 
 def _day_mood(acc: float) -> str:
-    if acc >= GOOD_DAY_THRESHOLD:
-        return "🔥 <b>Dia bom</b> — continuando bem!"
-    if acc <= BAD_DAY_THRESHOLD:
-        return "⚠️ <b>Dia ruim</b> — atenção!"
+    if acc >= GOOD_DAY_THRESHOLD: return "🔥 <b>Dia bom</b> — continuando bem!"
+    if acc <= BAD_DAY_THRESHOLD:  return "⚠️ <b>Dia ruim</b> — atenção!"
     return "🔎 <b>Dia neutro</b> — operação regular."
 
 async def _reporter_loop():
@@ -438,8 +415,7 @@ async def _daily_reset_loop():
         try:
             now = datetime.now(timezone.utc)
             tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-            wait = max(1.0, (tomorrow - now).total_seconds())
-            await asyncio.sleep(wait)
+            await asyncio.sleep(max(1.0, (tomorrow - now).total_seconds()))
             reset_score()
             await tg_send_text(TARGET_CHANNEL, "🕛 <b>Reset diário executado (00:00 UTC)</b>\n📊 Placar zerado para o novo dia.")
         except Exception as e:
@@ -453,14 +429,10 @@ async def root():
 
 @app.on_event("startup")
 async def _boot_tasks():
-    try:
-        asyncio.create_task(_reporter_loop())
-    except Exception as e:
-        print(f"[START] reporter error: {e}")
-    try:
-        asyncio.create_task(_daily_reset_loop())
-    except Exception as e:
-        print(f"[START] reset error: {e}")
+    try: asyncio.create_task(_reporter_loop())
+    except Exception as e: print(f"[START] reporter error: {e}")
+    try: asyncio.create_task(_daily_reset_loop())
+    except Exception as e: print(f"[START] reset error: {e}")
 
 @app.get("/health")
 async def health():
@@ -479,15 +451,12 @@ async def webhook(token: str, request: Request):
     if token != WEBHOOK_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    # Destravamento por timeout (se houver 2 observados e 45s vencidos)
     msg_timeout = _maybe_close_by_final_timeout()
-    if msg_timeout:
-        await tg_send_text(TARGET_CHANNEL, msg_timeout)
+    if msg_timeout: await tg_send_text(TARGET_CHANNEL, msg_timeout)
 
     data = await request.json()
     msg = data.get("channel_post") or data.get("message") \
         or data.get("edited_channel_post") or data.get("edited_message") or {}
-
     text = (msg.get("text") or msg.get("caption") or "").strip()
     chat = msg.get("chat") or {}
     chat_id = str(chat.get("id") or "")
@@ -496,7 +465,7 @@ async def webhook(token: str, request: Request):
     if not text:
         return {"ok": True, "skipped": "sem_texto"}
 
-    # 1) Fechamentos do fonte (GREEN/LOSS — 1,2,3 números)
+    # Fechamentos
     if GREEN_RX.search(text) or LOSS_RX.search(text):
         pend = get_open_pending()
         nums = parse_close_numbers(text)
@@ -505,7 +474,6 @@ async def webhook(token: str, request: Request):
             for n in nums:
                 if len(seen) >= 3: break
                 seen.append(str(int(n)))
-                # GREEN imediato se bater nosso número
                 suggested = int(pend["suggested"] or 0)
                 obs_nums = [int(x) for x in seen if x.isdigit()]
                 if (len(obs_nums) >= 1 and obs_nums[0] == suggested) or \
@@ -514,31 +482,25 @@ async def webhook(token: str, request: Request):
                     out = _close_now(pend, suggested, seen)
                     await tg_send_text(TARGET_CHANNEL, out)
                     return {"ok": True, "closed": "green_imediato"}
-
             _set_seen(int(pend["id"]), seen)
             pend = get_open_pending()
             if pend and len(_seen_list(pend)) == 2:
                 _ensure_final_deadline_when_two(pend)
-
             pend = get_open_pending()
             if pend and len(_seen_list(pend)) >= 3:
                 out = _close_now(pend, int(pend["suggested"] or 0), _seen_list(pend))
                 await tg_send_text(TARGET_CHANNEL, out)
                 return {"ok": True, "closed": "loss_3_observados"}
-
         return {"ok": True, "noted_close": True}
 
-    # 2) ENTRADA CONFIRMADA — decide novo número (híbrido + estratégia)
+    # Entrada confirmada
     parsed = parse_entry_text(text)
     if not parsed:
         return {"ok": True, "skipped": "nao_eh_entrada_confirmada"}
 
-    # antes de abrir novo, tenta fechar por timeout se pendência ficou com 2 e já venceu
     msg_timeout = _maybe_close_by_final_timeout()
-    if msg_timeout:
-        await tg_send_text(TARGET_CHANNEL, msg_timeout)
+    if msg_timeout: await tg_send_text(TARGET_CHANNEL, msg_timeout)
 
-    # Alimenta histórico com sequência crua, se houver
     seq = parsed["seq"] or []
     if seq: append_timeline(seq)
 
@@ -550,7 +512,6 @@ async def webhook(token: str, request: Request):
     if best is None:
         return {"ok": True, "skipped_low_conf_or_disagree": True}
 
-    # Abre pendência (d_final só nasce quando virem DOIS observados)
     open_pending(best, conf_s, conf_l, post_s, post_l, base, pattern_key)
 
     base_txt = ", ".join(str(x) for x in base) if base else "—"
