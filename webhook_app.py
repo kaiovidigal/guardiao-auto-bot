@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Webhook (GEN híbrido + estratégia)
+- Respeita a estratégia do canal-fonte (KWOK/SSH/ODD/EVEN/Sequência) restringindo os candidatos.
+- Decide o "número seco" usando n-gram híbrido: cauda curta (1000) + longa (5000).
+- Publica G0 imediatamente; fecha assim que nosso número aparecer (G0/G1/G2).
+- Timeout único: ao ter 2 observados, inicia contagem de 45s; se 3º não vier, fecha com X.
+"""
 
 import os, re, time, json, sqlite3
 from typing import List, Optional, Tuple, Dict
@@ -10,13 +17,8 @@ from fastapi import FastAPI, Request, HTTPException
 # ========= ENV =========
 TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
 WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
-
-# destino (onde vamos publicar)
-TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1002796105884").strip()
-
-# fonte (de onde lemos). Deixe vazio "" para NÃO filtrar.
-SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "").strip()
-
+TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1002796105884").strip()  # destino
+SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "-1002810508717").strip()  # fonte
 DB_PATH        = os.getenv("DB_PATH", "/var/data/data.db").strip() or "/var/data/data.db"
 
 if not TG_BOT_TOKEN:
@@ -25,18 +27,15 @@ if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
-app = FastAPI(title="guardiao-auto-bot (GEN híbrido)", version="3.1.0")
+app = FastAPI(title="guardiao-auto-bot (GEN híbrido + estratégia)", version="2.9.0")
 
 # ========= HÍBRIDO (curta/longa) =========
-SHORT_WINDOW   = 30     # cauda curta (sensível ao momento)
-LONG_WINDOW    = 4000     # cauda longa (estável)
-CONF_SHORT_MIN = 0.40     # mínimo de confiança no modelo curto
-CONF_LONG_MIN  = 0.50     # mínimo de confiança no modelo longo
-GAP_MIN        = 0.020    # distância top1-top2 mínima (anti-empate)
-
-# ========= TIMEOUTS =========
-FINAL_TIMEOUT  = 120  # inicia quando houver 2 observados; se não vier o 3º, força X
-FORCE_CLOSE_3  = 45   # se já temos 3 observados “mal-formado/sem número”, força fechar em 45s
+SHORT_WINDOW    = 40     # cauda curta (mais responsiva)
+LONG_WINDOW     = 3000     # cauda longa (mais estável)
+CONF_SHORT_MIN  = 0.40     # confiança mínima na curta
+CONF_LONG_MIN   = 0.55     # confiança mínima na longa
+GAP_MIN         = 0.020    # gap mínimo (top1 - top2) nas duas
+FINAL_TIMEOUT   = 45       # segundos; começa quando houver 2 observados
 
 # ========= Utils =========
 def now_ts() -> int:
@@ -69,31 +68,29 @@ def _exec_write(sql: str, params: tuple=()):
 
 def migrate_db():
     con = _connect(); cur = con.cursor()
-    # timeline de números para alimentar n-gram
+    # histórico simples
     cur.execute("""CREATE TABLE IF NOT EXISTS timeline (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         created_at INTEGER NOT NULL,
         number INTEGER NOT NULL
     )""")
-    # pendência do tiro aberto
+    # pendência com 1 cronômetro (final)
     cur.execute("""CREATE TABLE IF NOT EXISTS pending (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         created_at INTEGER,
         suggested INTEGER,
-        stage INTEGER NOT NULL DEFAULT 0,  -- G0=0, G1=1, G2=2
         open INTEGER DEFAULT 1,
-        seen TEXT,                -- "1-3" (dois observados), "1-3-4" (fechado)
+        seen TEXT,                -- "1-3" (dois) | "1-3-2" (três)
         opened_at INTEGER,
+        last_post_short TEXT,
+        last_post_long  TEXT,
         last_conf_short REAL,
-        last_conf_long REAL,
-        d_final INTEGER           -- deadline para forçar “X” no 3º
+        last_conf_long  REAL,
+        d_final INTEGER,
+        base TEXT,                -- candidatos usados no cálculo
+        pattern_key TEXT          -- rótulo da estratégia (KWOK/SSH/EVEN/ODD/SEQ/GEN)
     )""")
-    # patch em DB antigo que tinha stage sem NOT NULL
-    try:
-        cur.execute("UPDATE pending SET stage=0 WHERE stage IS NULL")
-    except: pass
-
-    # placar simples
+    # placar
     cur.execute("""CREATE TABLE IF NOT EXISTS score (
         id INTEGER PRIMARY KEY CHECK (id=1),
         green INTEGER DEFAULT 0,
@@ -101,6 +98,23 @@ def migrate_db():
     )""")
     if not cur.execute("SELECT 1 FROM score WHERE id=1").fetchone():
         cur.execute("INSERT INTO score (id, green, loss) VALUES (1,0,0)")
+
+    # migrações idempotentes
+    for col, ddl in [
+        ("d_final","ALTER TABLE pending ADD COLUMN d_final INTEGER"),
+        ("last_post_short","ALTER TABLE pending ADD COLUMN last_post_short TEXT"),
+        ("last_post_long","ALTER TABLE pending ADD COLUMN last_post_long TEXT"),
+        ("last_conf_short","ALTER TABLE pending ADD COLUMN last_conf_short REAL"),
+        ("last_conf_long","ALTER TABLE pending ADD COLUMN last_conf_long REAL"),
+        ("base","ALTER TABLE pending ADD COLUMN base TEXT"),
+        ("pattern_key","ALTER TABLE pending ADD COLUMN pattern_key TEXT"),
+    ]:
+        try:
+            cur.execute(f"SELECT {col} FROM pending LIMIT 1")
+        except sqlite3.OperationalError:
+            try: cur.execute(ddl)
+            except sqlite3.OperationalError: pass
+
     con.commit(); con.close()
 
 migrate_db()
@@ -112,7 +126,7 @@ async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
                           json={"chat_id": chat_id, "text": text, "parse_mode": parse,
                                 "disable_web_page_preview": True})
 
-# ========= Score helpers =========
+# ========= Score =========
 def bump_score(outcome: str):
     con = _connect(); cur = con.cursor()
     row = cur.execute("SELECT green, loss FROM score WHERE id=1").fetchone()
@@ -132,7 +146,7 @@ def score_text() -> str:
     acc = (g/total*100.0) if total>0 else 0.0
     return f"{g} GREEN × {l} LOSS — {acc:.1f}%"
 
-# ========= Timeline / n-gram simplificado =========
+# ========= Timeline / N-gram simplificado =========
 def append_timeline(seq: List[int]):
     for n in seq:
         _exec_write("INSERT INTO timeline (created_at, number) VALUES (?,?)", (now_ts(), int(n)))
@@ -153,11 +167,11 @@ def _ctx_counts(tail: List[int], ctx: List[int]) -> Dict[int,int]:
             if nxt in cnt: cnt[nxt] += 1
     return cnt
 
-def _post_from_tail(tail: List[int], after: Optional[int]) -> Dict[int,float]:
+def _post_from_tail(tail: List[int], after: Optional[int], candidates: List[int]) -> Dict[int,float]:
     if not tail:
-        return {1:0.25,2:0.25,3:0.25,4:0.25}
+        return {c: 1.0/len(candidates) for c in candidates}
     W = [0.46, 0.30, 0.16, 0.08]
-    # contexto (padrão “após X” se der)
+    # contextos (após X se existir na cauda)
     if after is not None and after in tail:
         idxs = [i for i,v in enumerate(tail) if v == after]
         i = idxs[-1]
@@ -170,15 +184,16 @@ def _post_from_tail(tail: List[int], after: Optional[int]) -> Dict[int,float]:
         ctx3 = tail[-3:] if len(tail)>=3 else []
         ctx2 = tail[-2:] if len(tail)>=2 else []
         ctx1 = tail[-1:] if len(tail)>=1 else []
-    posts = {1:0.0,2:0.0,3:0.0,4:0.0}
+
+    posts = {c: 0.0 for c in candidates}
     ctxs  = [(4,ctx4),(3,ctx3),(2,ctx2),(1,ctx1)]
     for lvl, ctx in ctxs:
         if not ctx: continue
         counts = _ctx_counts(tail, ctx[:-1])
         tot = sum(counts.values())
         if tot == 0: continue
-        for n in [1,2,3,4]:
-            posts[n] += W[4-lvl] * (counts[n]/tot)
+        for n in candidates:
+            posts[n] += W[4-lvl] * (counts.get(n,0)/tot)
     s = sum(posts.values()) or 1e-9
     return {k: v/s for k,v in posts.items()}
 
@@ -188,27 +203,16 @@ def _best_conf_gap(post: Dict[int,float]) -> Tuple[int,float,float]:
     gap  = top[0][1] - (top[1][1] if len(top)>1 else 0.0)
     return best, conf, gap
 
-def choose_single_number_hybrid(after: Optional[int]):
-    tail_s = get_tail(SHORT_WINDOW)
-    tail_l = get_tail(LONG_WINDOW)
-    post_s = _post_from_tail(tail_s, after)
-    post_l = _post_from_tail(tail_l, after)
-    b_s, c_s, g_s = _best_conf_gap(post_s)
-    b_l, c_l, g_l = _best_conf_gap(post_l)
-
-    # precisa concordar (mesmo número) e passar limiares
-    if b_s == b_l and c_s >= CONF_SHORT_MIN and c_l >= CONF_LONG_MIN and g_s >= GAP_MIN and g_l >= GAP_MIN:
-        best = b_s
-    else:
-        best = None
-    return best, c_s, c_l, len(tail_s), post_s, post_l
-
-# ========= Parsers =========
+# ========= Parsers/estratégia =========
 ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
 SEQ_RX   = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
 AFTER_RX = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
+KWOK_RX  = re.compile(r"\bKWOK\s*([1-4])\s*-\s*([1-4])", re.I)
+SSH_RX   = re.compile(r"\bSS?H\s*([1-4])(?:-([1-4]))?(?:-([1-4]))?(?:-([1-4]))?", re.I)
+ODD_RX   = re.compile(r"\bODD\b", re.I)
+EVEN_RX  = re.compile(r"\bEVEN\b", re.I)
 
-GREEN_RX = re.compile(r"(?:\bgr+e+e?n\b|\bwin\b|✅)", re.I)   # GREEN/GREEM… WIN, ✅
+GREEN_RX = re.compile(r"(?:\bgr+e+e?n\b|\bwin\b|✅)", re.I)
 LOSS_RX  = re.compile(r"(?:\blo+s+s?\b|\bred\b|❌|\bperdemos\b)", re.I)
 
 PAREN_GROUP_RX = re.compile(r"\(([^)]*)\)")
@@ -217,11 +221,43 @@ ANY_14_RX      = re.compile(r"[1-4]")
 def parse_entry_text(text: str) -> Optional[Dict]:
     t = re.sub(r"\s+", " ", text).strip()
     if not ENTRY_RX.search(t): return None
+    # Estratégia → base de candidatos + rótulo
+    base, pattern_key = parse_candidates_and_pattern(t)
+    # Sequência bruta (se aparecer) apenas para alimentar timeline
     mseq = SEQ_RX.search(t)
     seq = [int(x) for x in re.findall(r"[1-4]", mseq.group(1))] if mseq else []
     mafter = AFTER_RX.search(t)
     after_num = int(mafter.group(1)) if mafter else None
-    return {"seq": seq, "after": after_num, "raw": t}
+    return {"seq": seq, "after": after_num, "raw": t, "base": base, "pattern_key": pattern_key}
+
+def parse_candidates_and_pattern(t: str) -> Tuple[List[int], str]:
+    m = KWOK_RX.search(t)
+    if m:
+        a,b = int(m.group(1)), int(m.group(2))
+        base = sorted(list({a,b}))
+        return base, f"KWOK-{a}-{b}"
+    if ODD_RX.search(t):
+        return [1,3], "ODD"
+    if EVEN_RX.search(t):
+        return [2,4], "EVEN"
+    m = SSH_RX.search(t)
+    if m:
+        nums = [int(g) for g in m.groups() if g]
+        base = sorted(list(dict.fromkeys(nums)))[:4]
+        return base, "SSH-" + "-".join(str(x) for x in base)
+    m = SEQ_RX.search(t)
+    if m:
+        parts = [int(x) for x in re.findall(r"[1-4]", m.group(1))]
+        # pega primeiros distintos preservando ordem (máximo 3)
+        seen, base = set(), []
+        for n in parts:
+            if n not in seen:
+                seen.add(n); base.append(n)
+            if len(base) == 3: break
+        if base:
+            return base, "SEQ"
+    # fallback GEN: usa [1..4]
+    return [1,2,3,4], "GEN"
 
 def parse_close_numbers(text: str) -> List[int]:
     t = re.sub(r"\s+", " ", text)
@@ -232,7 +268,26 @@ def parse_close_numbers(text: str) -> List[int]:
     nums = ANY_14_RX.findall(t)
     return [int(x) for x in nums][:3]
 
-# ========= Pending helpers =========
+# ========= Decisor (híbrido + estratégia) =========
+def choose_single_number_hybrid(after: Optional[int], candidates: List[int]) -> Tuple[Optional[int], float, float, int, Dict[int,float], Dict[int,float]]:
+    # garante que são válidos e únicos
+    candidates = sorted(list(dict.fromkeys([c for c in candidates if c in (1,2,3,4)]))) or [1,2,3,4]
+
+    tail_s = get_tail(SHORT_WINDOW)
+    tail_l = get_tail(LONG_WINDOW)
+    post_s = _post_from_tail(tail_s, after, candidates)
+    post_l = _post_from_tail(tail_l, after, candidates)
+
+    b_s, c_s, g_s = _best_conf_gap(post_s)
+    b_l, c_l, g_l = _best_conf_gap(post_l)
+
+    best = None
+    if b_s == b_l and c_s >= CONF_SHORT_MIN and c_l >= CONF_LONG_MIN and g_s >= GAP_MIN and g_l >= GAP_MIN:
+        best = b_s
+
+    return best, c_s, c_l, len(tail_s), post_s, post_l
+
+# ========= Pending helpers (timer único 45s) =========
 def get_open_pending() -> Optional[sqlite3.Row]:
     con = _connect()
     row = con.execute("SELECT * FROM pending WHERE open=1 ORDER BY id DESC LIMIT 1").fetchone()
@@ -248,10 +303,10 @@ def _set_seen(row_id:int, seen_list:List[str]):
     _exec_write("UPDATE pending SET seen=? WHERE id=?", (seen_txt, row_id))
 
 def _ensure_final_deadline_when_two(row: sqlite3.Row):
-    """Assim que houver 2 observados, abre o cronômetro de FINAL_TIMEOUT para forçar X se o 3º não vier."""
-    if int(row["d_final"] or 0) > 0:
+    if int(row["d_final"] or 0) > 0: 
         return
-    if len(_seen_list(row)) == 2:
+    seen_list = _seen_list(row)
+    if len(seen_list) == 2:
         _exec_write("UPDATE pending SET d_final=? WHERE id=?", (now_ts() + FINAL_TIMEOUT, int(row["id"])))
 
 def _close_now(row: sqlite3.Row, suggested:int, final_seen:List[str]):
@@ -274,50 +329,58 @@ def _close_now(row: sqlite3.Row, suggested:int, final_seen:List[str]):
            f"📊 Geral: {score_text()}")
     return msg
 
-def open_pending(suggested: int, conf_short:float, conf_long:float):
+def open_pending(suggested: int, conf_short:float, conf_long:float,
+                 post_short:Dict[int,float], post_long:Dict[int,float],
+                 base:List[int], pattern_key:str):
     _exec_write("""INSERT INTO pending
-        (created_at, suggested, stage, open, seen, opened_at, last_conf_short, last_conf_long, d_final)
-        VALUES (?,?,?,?,?,?,?, ?, NULL)
-    """, (now_ts(), int(suggested), 0, 1, "", now_ts(), float(conf_short), float(conf_long)))
+        (created_at, suggested, open, seen, opened_at,
+         last_post_short, last_post_long, last_conf_short, last_conf_long,
+         d_final, base, pattern_key)
+        VALUES (?,?,?,?,?,?,?,?,?,NULL,?,?)
+    """, (now_ts(), int(suggested), 1, "", now_ts(),
+          json.dumps(post_short), json.dumps(post_long),
+          float(conf_short), float(conf_long),
+          json.dumps(base), pattern_key))
 
-def _maybe_force_close():
-    """
-    Destrava pendência:
-      • Se há 2 observados e d_final expirou → adiciona 'X' e fecha.
-      • Se há 3 observados mas ficou travado (sem número) por > FORCE_CLOSE_3 → fecha.
-    """
+def _maybe_close_by_final_timeout():
     row = get_open_pending()
     if not row: return None
-    seen_list = _seen_list(row)
-
-    # caso 2 observados e cronômetro estourou: força X no 3º
     d_final = int(row["d_final"] or 0)
-    if len(seen_list) == 2 and d_final > 0 and now_ts() >= d_final:
+    if d_final <= 0 or now_ts() < d_final:
+        return None
+    seen_list = _seen_list(row)
+    if len(seen_list) == 2:
         seen_list.append("X")
-        return _close_now(row, int(row["suggested"] or 0), seen_list)
-
-    # caso 3 observados “pendurados” há muito tempo
-    if len(seen_list) >= 3:
-        opened_at = int(row["opened_at"] or now_ts())
-        if now_ts() - opened_at >= FORCE_CLOSE_3:
-            return _close_now(row, int(row["suggested"] or 0), seen_list)
-
+        msg = _close_now(row, int(row["suggested"] or 0), seen_list)
+        return msg
     return None
 
 # ========= Rotas =========
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "guardiao-auto-bot (GEN híbrido c/ timeout único)"}
+    return {"ok": True, "service": "guardiao-auto-bot (GEN híbrido + estratégia + timeout 45s)"}
+
+@app.get("/health")
+async def health():
+    pend = get_open_pending()
+    return {
+        "ok": True,
+        "db": DB_PATH,
+        "pending_open": bool(pend),
+        "pending_seen": (pend["seen"] if pend else ""),
+        "d_final": int(pend["d_final"] or 0) if pend else 0,
+        "time": ts_str()
+    }
 
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
     if token != WEBHOOK_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    # destrava pendências antigas sempre que chegar algo
-    forced = _maybe_force_close()
-    if forced:
-        await tg_send_text(TARGET_CHANNEL, forced)
+    # Destravamento por timeout (se houver 2 observados e 45s vencidos)
+    msg_timeout = _maybe_close_by_final_timeout()
+    if msg_timeout:
+        await tg_send_text(TARGET_CHANNEL, msg_timeout)
 
     data = await request.json()
     msg = data.get("channel_post") or data.get("message") \
@@ -331,7 +394,7 @@ async def webhook(token: str, request: Request):
     if not text:
         return {"ok": True, "skipped": "sem_texto"}
 
-    # 1) Fechamentos do fonte (GREEN/LOSS — números entre parênteses ou soltos)
+    # 1) Fechamentos do fonte (GREEN/LOSS — 1,2,3 números)
     if GREEN_RX.search(text) or LOSS_RX.search(text):
         pend = get_open_pending()
         nums = parse_close_numbers(text)
@@ -340,8 +403,7 @@ async def webhook(token: str, request: Request):
             for n in nums:
                 if len(seen) >= 3: break
                 seen.append(str(int(n)))
-
-                # GREEN imediato: se bater nosso número em qualquer posição, fecha já
+                # GREEN imediato se bater nosso número
                 suggested = int(pend["suggested"] or 0)
                 obs_nums = [int(x) for x in seen if x.isdigit()]
                 if (len(obs_nums) >= 1 and obs_nums[0] == suggested) or \
@@ -351,15 +413,11 @@ async def webhook(token: str, request: Request):
                     await tg_send_text(TARGET_CHANNEL, out)
                     return {"ok": True, "closed": "green_imediato"}
 
-            # salva vistos
             _set_seen(int(pend["id"]), seen)
-
-            # se ficou com 2 observados, arma/renova o deadline final
             pend = get_open_pending()
             if pend and len(_seen_list(pend)) == 2:
                 _ensure_final_deadline_when_two(pend)
 
-            # se já tem 3 observados e não bateu, fecha LOSS
             pend = get_open_pending()
             if pend and len(_seen_list(pend)) >= 3:
                 out = _close_now(pend, int(pend["suggested"] or 0), _seen_list(pend))
@@ -368,46 +426,39 @@ async def webhook(token: str, request: Request):
 
         return {"ok": True, "noted_close": True}
 
-    # 2) ENTRADA CONFIRMADA — decide novo número (híbrido)
+    # 2) ENTRADA CONFIRMADA — decide novo número (híbrido + estratégia)
     parsed = parse_entry_text(text)
     if not parsed:
         return {"ok": True, "skipped": "nao_eh_entrada_confirmada"}
 
-    # antes de abrir novo, tenta destravar novamente
-    forced2 = _maybe_force_close()
-    if forced2:
-        await tg_send_text(TARGET_CHANNEL, forced2)
+    # antes de abrir novo, tenta fechar por timeout se pendência ficou com 2 e já venceu
+    msg_timeout = _maybe_close_by_final_timeout()
+    if msg_timeout:
+        await tg_send_text(TARGET_CHANNEL, msg_timeout)
 
-    # Alimenta memória com a sequência bruta, se houver
+    # Alimenta histórico com sequência crua, se houver
     seq = parsed["seq"] or []
-    if seq:
-        append_timeline(seq)
+    if seq: append_timeline(seq)
 
-    after = parsed["after"]
-    best, conf_s, conf_l, samples_s, _post_s, _post_l = choose_single_number_hybrid(after)
+    after       = parsed["after"]
+    base        = parsed["base"] or [1,2,3,4]
+    pattern_key = parsed["pattern_key"] or "GEN"
+
+    best, conf_s, conf_l, samples_s, post_s, post_l = choose_single_number_hybrid(after, base)
     if best is None:
         return {"ok": True, "skipped_low_conf_or_disagree": True}
 
-    # abre pendência nova
-    open_pending(best, conf_s, conf_l)
+    # Abre pendência (d_final só nasce quando virem DOIS observados)
+    open_pending(best, conf_s, conf_l, post_s, post_l, base, pattern_key)
 
+    base_txt = ", ".join(str(x) for x in base) if base else "—"
+    aft_txt  = f" após {after}" if after else ""
     txt = (
         f"🎯 <b>Número seco (G0):</b> <b>{best}</b>\n"
-        f"🧩 <b>Padrão:</b> GEN{' após ' + str(after) if after else ''}\n"
+        f"🧩 <b>Padrão:</b> {pattern_key}{aft_txt}\n"
+        f"🧮 <b>Base:</b> [{base_txt}]\n"
         f"📊 <b>Conf (curta/longa):</b> {conf_s*100:.2f}% / {conf_l*100:.2f}% "
         f"| <b>Amostra≈</b>{samples_s}"
     )
     await tg_send_text(TARGET_CHANNEL, txt)
     return {"ok": True, "posted": True, "best": best}
-
-# ===== Health =====
-@app.get("/health")
-async def health():
-    pend = get_open_pending()
-    return {
-        "ok": True, "db": DB_PATH,
-        "pending_open": bool(pend),
-        "pending_seen": (pend["seen"] if pend else ""),
-        "d_final": int(pend["d_final"] or 0) if pend else 0,
-        "time": ts_str()
-    }
