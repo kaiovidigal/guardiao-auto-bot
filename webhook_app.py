@@ -35,10 +35,10 @@ app = FastAPI(title="guardiao-auto-bot (GEN híbrido + estratégia)", version="3
 
 # ========= HÍBRIDO (curta/longa) =========
 SHORT_WINDOW    = 40     # cauda curta (mais responsiva)
-LONG_WINDOW     = 3000     # cauda longa (mais estável)
+LONG_WINDOW     = 1500     # cauda longa (mais estável)
 CONF_SHORT_MIN  = 0.40     # confiança mínima na curta
 CONF_LONG_MIN   = 0.55     # confiança mínima na longa
-GAP_MIN         = 0.030    # gap mínimo (top1 - top2) nas duas
+GAP_MIN         = 0.020    # gap mínimo (top1 - top2) nas duas
 FINAL_TIMEOUT   = 45       # segundos; começa quando houver 2 observados
 
 # ========= Relatório / Sinais do dia =========
