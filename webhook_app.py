@@ -23,20 +23,21 @@ WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1002796105884").strip()  # destino
 SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "-1002810508717").strip()  # fonte
 DB_PATH        = os.getenv("DB_PATH", "/var/data/data.db").strip() or "/var/data/data.db"
+DEBUG_SKIPS    = bool(int(os.getenv("DEBUG_SKIPS", "0")))  # 1 = avisa motivos de "skip"
 
 if not TG_BOT_TOKEN:   raise RuntimeError("Defina TG_BOT_TOKEN no ambiente.")
 if not WEBHOOK_TOKEN:  raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
-app = FastAPI(title="guardiao-auto-bot (GEN híbrido + estratégia + relatório)", version="3.2.0")
+app = FastAPI(title="guardiao-auto-bot (GEN híbrido + estratégia + relatório)", version="3.2.1")
 
 # ========= HÍBRIDO (curta/longa) =========
-SHORT_WINDOW    = 40     # cauda curta (mais responsiva)
-LONG_WINDOW     = 1000    # cauda longa  (mais estável)
-CONF_SHORT_MIN  = 0.35     # confiança mínima na curta
-CONF_LONG_MIN   = 0.45     # confiança mínima na longa
-GAP_MIN         = 0.020    # gap mínimo (top1 - top2) nas duas
-FINAL_TIMEOUT   = 45       # segundos; começa quando houver 2 observados
+SHORT_WINDOW    = 40      # cauda curta (mais responsiva)
+LONG_WINDOW     = 200     # cauda longa  (mais estável)
+CONF_SHORT_MIN  = 0.35    # confiança mínima na curta
+CONF_LONG_MIN   = 0.45    # confiança mínima na longa
+GAP_MIN         = 0.020   # gap mínimo (top1 - top2) nas duas
+FINAL_TIMEOUT   = 45      # segundos; começa quando houver 2 observados
 
 # Relatório 5/5min: faixas de status do dia
 GOOD_THRESH = 0.70
@@ -51,8 +52,7 @@ def ts_str(ts=None) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def today_key() -> str:
-    # reset natural "à meia-noite" via chave de dia YYYYMMDD (UTC)
-    return datetime.utcnow().strftime("%Y%m%d")
+    return datetime.utcnow().strftime("%Y%m%d")  # meia-noite UTC
 
 # ========= DB =========
 def _connect() -> sqlite3.Connection:
@@ -114,7 +114,7 @@ def migrate_db():
         day_key TEXT PRIMARY KEY,
         next_no INTEGER NOT NULL
     )""")
-    # Backfills idempotentes:
+    # Backfills idempotentes
     for col, ddl in [
         ("d_final","ALTER TABLE pending ADD COLUMN d_final INTEGER"),
         ("last_post_short","ALTER TABLE pending ADD COLUMN last_post_short TEXT"),
@@ -343,7 +343,6 @@ def _ensure_final_deadline_when_two(row: sqlite3.Row):
         _exec_write("UPDATE pending SET d_final=? WHERE id=?", (now_ts() + FINAL_TIMEOUT, int(row["id"])))
 
 def _close_now(row: sqlite3.Row, suggested:int, final_seen:List[str]):
-    # determina estágio e outcome
     obs_nums = [int(x) for x in final_seen if x.isdigit()]
     if len(obs_nums) >= 1 and obs_nums[0] == suggested:
         outcome, stage_lbl = "GREEN", "G0"
@@ -363,7 +362,6 @@ def _close_now(row: sqlite3.Row, suggested:int, final_seen:List[str]):
     our_num_display = suggested if outcome=="GREEN" else "X"
     msg = (f"{'🟢' if outcome=='GREEN' else '🔴'} <b>{outcome}</b> — Jogada <b>{play_tag}</b> "
            f"(<b>{stage_lbl}</b>, nosso={our_num_display}, observados={'-'.join(final_seen[:3])}).")
-    # anexa placar compacto do dia
     g0,g1,g2,ls,acc = read_daily()
     msg += f"\n📊 Dia: G0={g0} • G1={g1} • G2={g2} • Loss={ls} • Acerto={acc*100:.1f}%"
     return msg
@@ -472,6 +470,11 @@ async def webhook(token: str, request: Request):
     if GREEN_RX.search(text) or LOSS_RX.search(text):
         pend = get_open_pending()
         nums = parse_close_numbers(text)
+
+        # ✅ NOVO: alimentar timeline com os observados do fechamento
+        if nums:
+            append_timeline(nums)
+
         if pend and nums:
             seen = _seen_list(pend)
             for n in nums:
@@ -520,6 +523,19 @@ async def webhook(token: str, request: Request):
 
     best, conf_s, conf_l, samples_s, post_s, post_l = choose_single_number_hybrid(after, base)
     if best is None:
+        if DEBUG_SKIPS:
+            # Mensagem curta de diagnóstico
+            top_s = sorted(post_s.items(), key=lambda kv: kv[1], reverse=True)[:2] if post_s else []
+            top_l = sorted(post_l.items(), key=lambda kv: kv[1], reverse=True)[:2] if post_l else []
+            def fmt(t):
+                return ", ".join([f"{n}:{p*100:.1f}%" for n,p in t])
+            msg_dbg = (
+                "ℹ️ <b>Skip (qualidade)</b>\n"
+                f"Base: {base} • Após: {after}\n"
+                f"Curta top2: {fmt(top_s)} | Longa top2: {fmt(top_l)}\n"
+                f"Min conf: {CONF_SHORT_MIN}/{CONF_LONG_MIN} • Gap≥{GAP_MIN:.3f} • Amostra≈{samples_s}"
+            )
+            await tg_send_text(TARGET_CHANNEL, msg_dbg)
         return {"ok": True, "skipped_low_conf_or_disagree": True}
 
     day, play_no = open_pending(best, conf_s, conf_l, post_s, post_l, base, pattern_key)
