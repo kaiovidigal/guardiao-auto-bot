@@ -27,10 +27,10 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 app = FastAPI(title="guardiao-auto-bot (GEN híbrido + estratégia)", version="3.1.1")
 
 # ========= HÍBRIDO (curta/longa) =========
-SHORT_WINDOW    = 40
+SHORT_WINDOW    = 500
 LONG_WINDOW     = 2000
-CONF_SHORT_MIN  = 0.58
-CONF_LONG_MIN   = 0.68
+CONF_SHORT_MIN  = 0.70
+CONF_LONG_MIN   = 0.80
 GAP_MIN         = 0.020
 FINAL_TIMEOUT   = 45       # começa quando houver 2 observados
 
