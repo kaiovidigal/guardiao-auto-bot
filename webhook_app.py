@@ -2,7 +2,7 @@
 # -- coding: utf-8 --
 
 """
-guardiao-auto-bot — GEN híbrido + relatório 1h
+guardiao-auto-bot — GEN híbrido + relatório 1h + entrada seca automática
 -> versão enxuta e estável para Render/railway (polling interno + FastAPI viva)
 """
 
@@ -10,39 +10,29 @@ import os, re, time, json, sqlite3, asyncio
 from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timezone, timedelta
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 import zoneinfo
 
 # ========= ENV =========
 TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
-WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()  # pode ficar vazio se não usar webhook
-TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1003804744331").strip()  # << NOVO GRUPO
-SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", os.getenv("PUBLIC_CHANNEL", "")).strip()  # opcional
+WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
+TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1003804744331").strip()  # seu canal
+SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", os.getenv("PUBLIC_CHANNEL", "")).strip()  # canal de sinais
 DB_PATH        = os.getenv("DB_PATH", "/var/data/data.db").strip() or "/var/data/data.db"
 
 if not TG_BOT_TOKEN:
     raise RuntimeError("Defina TG_BOT_TOKEN no ambiente.")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
-app = FastAPI(title="guardiao-auto-bot (relatório 1h)", version="3.2.0")
+app = FastAPI(title="guardiao-auto-bot (relatório 1h)", version="3.3.0")
 
 # ========= Fuso local =========
-from fastapi import Request
-
-# === Webhook do Telegram ===
-@app.post(f"/webhook/{WEBHOOK_TOKEN}")
-async def telegram_webhook(request: Request):
-    update = await request.json()
-    print(update)  # aparece no log do Render
-    return {"ok": True}
-# ============================= zoneinfo.ZoneInfo("America/Sao_Paulo")
+TZ_LOCAL = zoneinfo.ZoneInfo("America/Sao_Paulo")
 def now_local(): return datetime.now(TZ_LOCAL)
-def day_key(dt=None):
-    dt = dt or now_local(); return dt.strftime("%Y%m%d")
-def hour_key(dt=None):
-    dt = dt or now_local(); return dt.strftime("%Y%m%d%H")
+def day_key(dt=None): dt = dt or now_local(); return dt.strftime("%Y%m%d")
+def hour_key(dt=None): dt = dt or now_local(); return dt.strftime("%Y%m%d%H")
 
-# ========= Parâmetros de decisão (mantidos) =========
+# ========= Parâmetros de decisão =========
 SHORT_WINDOW    = 80
 LONG_WINDOW     = 800
 CONF_SHORT_MIN  = 0.70
@@ -93,7 +83,6 @@ def _query_all(sql: str, params: tuple=()) -> List[sqlite3.Row]:
 
 def migrate_db():
     con = _connect(); cur = con.cursor()
-    # tabelas usadas por pending/score (mantém compat)
     cur.execute("""CREATE TABLE IF NOT EXISTS timeline (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         created_at INTEGER NOT NULL,
@@ -125,7 +114,6 @@ def migrate_db():
     if not cur.execute("SELECT 1 FROM score WHERE id=1").fetchone():
         cur.execute("INSERT INTO score (id, green, loss) VALUES (1,0,0)")
 
-    # colunas que podem faltar
     for col, ddl in [
         ("d_final","ALTER TABLE pending ADD COLUMN d_final INTEGER"),
         ("last_post_short","ALTER TABLE pending ADD COLUMN last_post_short TEXT"),
@@ -139,11 +127,10 @@ def migrate_db():
         ("stage","ALTER TABLE pending ADD COLUMN stage TEXT"),
     ]:
         try: cur.execute(f"SELECT {col} FROM pending LIMIT 1")
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError: 
             try: cur.execute(ddl)
             except sqlite3.OperationalError: pass
 
-    # patches de relatório/controle por chat
     cur.execute("""
     CREATE TABLE IF NOT EXISTS relatorio_controle (
         chat_id TEXT NOT NULL,
@@ -260,10 +247,8 @@ async def _reporter_loop():
                 snap = _report_snapshot_day(str(chat_id))
 
                 if snap["day_green"] == 0 and snap["day_loss"] == 0:
-                    # nenhum sinal registrado até agora
                     txt = "🔍 Analisando gráfico... nenhum sinal confirmado nesta hora."
                 else:
-                    # relatório normal
                     txt = (
                         "📈 <b>Relatório do dia</b>\n"
                         f"G0: <b>{snap['g0']}</b> GREEN / <b>{snap['l0']}</b> LOSS\n"
@@ -279,10 +264,71 @@ async def _reporter_loop():
             print(f"[RELATORIO] erro: {e}")
         await asyncio.sleep(REPORT_EVERY_SEC)  # 1h
 
+# ========================= Captura e envio de sinais secos =========================
+HISTORICO_FILE = "/var/data/historico.json"
+if os.path.exists(HISTORICO_FILE):
+    with open(HISTORICO_FILE, "r") as f:
+        historico = json.load(f)
+else:
+    historico = {}  # {"numero": acertos}
+
+def salvar_historico():
+    with open(HISTORICO_FILE, "w") as f:
+        json.dump(historico, f)
+
+def escolher_numero(mensagem: str) -> Optional[str]:
+    numeros = re.findall(r"\d+", mensagem)
+    if not numeros:
+        return None
+    numeros_int = [int(n) for n in numeros]
+    numeros_pontuacao = [(n, historico.get(str(n),0)) for n in numeros_int]
+    numeros_pontuacao.sort(key=lambda x: x[1], reverse=True)
+    return str(numeros_pontuacao[0][0])
+
+def atualizar_historico(numero: str, resultado: str):
+    numero = str(numero)
+    if numero not in historico:
+        historico[numero] = 0
+    if resultado.lower() == "green":
+        historico[numero] += 1
+    else:
+        historico[numero] = max(historico[numero]-1, 0)
+    salvar_historico()
+
+@app.post(f"/webhook/{WEBHOOK_TOKEN}")
+async def telegram_webhook(request: Request):
+    update = await request.json()
+    channel_post = update.get("channel_post")
+    if channel_post:
+        chat_id = str(channel_post.get("chat", {}).get("id", ""))
+        texto = channel_post.get("text", "")
+
+        # Atualiza histórico se for resultado
+        if "GREEN" in texto.upper() or "RED" in texto.upper():
+            resultado = "green" if "GREEN" in texto.upper() else "red"
+            ultimo_numero = historico.get("ultimo_numero")
+            if ultimo_numero:
+                atualizar_historico(ultimo_numero, resultado)
+            return {"ok": True}
+
+        # Processa sinais do canal
+        if chat_id == SOURCE_CHANNEL or chat_id == "":
+            numero_escolhido = escolher_numero(texto)
+            if numero_escolhido:
+                historico["ultimo_numero"] = numero_escolhido
+                msg = (
+                    f"💰 ENTRADA SECA 💰\n"
+                    f"🎰 Mesa: Fantan - Evolution\n"
+                    f"🎲 Número sugerido: {numero_escolhido}\n"
+                    f"🚥 Até G2"
+                )
+                await tg_send_text(TARGET_CHANNEL, msg)
+
+    return {"ok": True}
+
 # ========= Vida da app (Render) =========
 @app.on_event("startup")
 async def _on_startup():
-    # Mensagem de boas-vindas no startup
     asyncio.create_task(tg_send_text(
         TARGET_CHANNEL,
         "🤖 Bot iniciado e já analisando o gráfico com os dados disponíveis..."
