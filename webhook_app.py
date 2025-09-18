@@ -258,16 +258,22 @@ async def _reporter_loop():
             gua_reset_if_new_day(str(chat_id))
             if gua_try_reserve_hour(str(chat_id)):
                 snap = _report_snapshot_day(str(chat_id))
-                txt = (
-                    "📈 <b>Relatório do dia</b>\n"
-                    f"G0: <b>{snap['g0']}</b> GREEN / <b>{snap['l0']}</b> LOSS\n"
-                    f"G1: <b>{snap['g1']}</b> GREEN / <b>{snap['l1']}</b> LOSS\n"
-                    f"G2: <b>{snap['g2']}</b> GREEN / <b>{snap['l2']}</b> LOSS\n"
-                    "—\n"
-                    f"📊 <b>Dia</b>: <b>{snap['day_green']}</b> GREEN × <b>{snap['day_loss']}</b> LOSS — "
-                    f"{snap['day_acc']*100:.1f}%\n"
-                    f"{_day_mood(snap['day_acc'])}"
-                )
+
+                if snap["day_green"] == 0 and snap["day_loss"] == 0:
+                    # nenhum sinal registrado até agora
+                    txt = "🔍 Analisando gráfico... nenhum sinal confirmado nesta hora."
+                else:
+                    # relatório normal
+                    txt = (
+                        "📈 <b>Relatório do dia</b>\n"
+                        f"G0: <b>{snap['g0']}</b> GREEN / <b>{snap['l0']}</b> LOSS\n"
+                        f"G1: <b>{snap['g1']}</b> GREEN / <b>{snap['l1']}</b> LOSS\n"
+                        f"G2: <b>{snap['g2']}</b> GREEN / <b>{snap['l2']}</b> LOSS\n"
+                        "—\n"
+                        f"📊 <b>Dia</b>: <b>{snap['day_green']}</b> GREEN × <b>{snap['day_loss']}</b> LOSS — "
+                        f"{snap['day_acc']*100:.1f}%\n"
+                        f"{_day_mood(snap['day_acc'])}"
+                    )
                 await tg_send_text(TARGET_CHANNEL, txt)
         except Exception as e:
             print(f"[RELATORIO] erro: {e}")
@@ -276,6 +282,11 @@ async def _reporter_loop():
 # ========= Vida da app (Render) =========
 @app.on_event("startup")
 async def _on_startup():
+    # Mensagem de boas-vindas no startup
+    asyncio.create_task(tg_send_text(
+        TARGET_CHANNEL,
+        "🤖 Bot iniciado e já analisando o gráfico com os dados disponíveis..."
+    ))
     asyncio.create_task(_reporter_loop())
 
 @app.get("/")
