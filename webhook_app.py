@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# -- coding: utf-8 --
 
 """
-Webhook (GEN híbrido + estratégia + timeout 45s + relatório 5min + reset diário)
+Webhook (GEN híbrido + estratégia + timeout 45s + relatório 1h + reset diário America/Sao_Paulo)
 """
 
 import os, re, time, json, sqlite3, asyncio
@@ -10,6 +10,7 @@ from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timezone, timedelta
 import httpx
 from fastapi import FastAPI, Request, HTTPException
+import zoneinfo  # fuso local
 
 # ========= ENV =========
 TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
@@ -24,20 +25,41 @@ if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
-app = FastAPI(title="guardiao-auto-bot (GEN híbrido + estratégia)", version="3.1.1")
+app = FastAPI(title="guardiao-auto-bot (GEN híbrido + estratégia)", version="3.2.0")
+
+# ========= Fuso local =========
+TZ_LOCAL = zoneinfo.ZoneInfo("America/Sao_Paulo")
+def now_local():
+    return datetime.now(TZ_LOCAL)
+def day_key(dt=None):
+    dt = dt or now_local()
+    return dt.strftime("%Y%m%d")
+def hour_key(dt=None):
+    dt = dt or now_local()
+    return dt.strftime("%Y%m%d%H")
 
 # ========= HÍBRIDO (curta/longa) =========
-SHORT_WINDOW    = 40
-LONG_WINDOW     = 1000
-CONF_SHORT_MIN  = 0.70
-CONF_LONG_MIN   = 0.80
-GAP_MIN         = 0.020
+# Parâmetros mais conservadores para reduzir overtrade e loss
+SHORT_WINDOW    = 80       # era 40
+LONG_WINDOW     = 800      # era 1000
+CONF_SHORT_MIN  = 0.85     # era 0.70
+CONF_LONG_MIN   = 0.90     # era 0.80
+GAP_MIN         = 0.050    # era 0.020
 FINAL_TIMEOUT   = 45       # começa quando houver 2 observados
 
+# Guard-rails adicionais (robustez da entrada)
+MIN_SAMPLES_SHORT = 120
+MIN_SAMPLES_LONG  = 400
+MAX_LOSS_STREAK   = 2
+COOLDOWN_SECONDS  = 120
+QUIET_HOURS       = [(0, 5)]  # evita operar entre 00:00 e 05:59
+_last_cooldown_until = 0  # memória
+
 # ========= Relatório / Sinais do dia =========
-REPORT_EVERY_SEC   = 5 * 60
-GOOD_DAY_THRESHOLD = 0.70
-BAD_DAY_THRESHOLD  = 0.40
+# Troca para 1x por hora (anti-flood) e thresholds mais rígidos
+REPORT_EVERY_SEC   = 60 * 60
+GOOD_DAY_THRESHOLD = 0.80
+BAD_DAY_THRESHOLD  = 0.50
 
 # ========= Utils =========
 def now_ts() -> int: return int(time.time())
@@ -123,12 +145,29 @@ def migrate_db():
             try: cur.execute(ddl)
             except sqlite3.OperationalError: pass
 
-    # 🔧 corrige linhas antigas com NULL/vazio onde o schema antigo exigia NOT NULL
+    # corrige linhas antigas com NULL/vazio
     try:
         cur.execute("UPDATE pending SET stage='OPEN'    WHERE stage IS NULL OR stage=''")
         cur.execute("UPDATE pending SET outcome='PENDING' WHERE outcome IS NULL OR outcome=''")
     except sqlite3.OperationalError:
         pass
+
+    # ===== PATCH-GUA schema de relatório/controle =====
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS relatorio_controle (
+        chat_id TEXT NOT NULL,
+        hour_key TEXT NOT NULL,
+        sent_at INTEGER NOT NULL,
+        PRIMARY KEY (chat_id, hour_key)
+    );
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS relatorio_dia (
+        chat_id TEXT PRIMARY KEY,
+        day_key TEXT NOT NULL
+    );
+    """)
+    # ===== PATCH-GUA (fim) =====
 
     con.commit(); con.close()
 
@@ -287,9 +326,52 @@ def choose_single_number_hybrid(after: Optional[int], candidates: List[int]) -> 
     b_s, c_s, g_s = _best_conf_gap(post_s)
     b_l, c_l, g_l = _best_conf_gap(post_l)
     best = None
+    # Exige consenso curto=long, confs altas e gaps reais
     if b_s == b_l and c_s >= CONF_SHORT_MIN and c_l >= CONF_LONG_MIN and g_s >= GAP_MIN and g_l >= GAP_MIN:
         best = b_s
     return best, c_s, c_l, len(tail_s), post_s, post_l
+
+# ========= Guard-rails: decisão final de entrada =========
+def get_loss_streak(limit=20):
+    rows = _query_all(
+        "SELECT outcome FROM pending WHERE closed_at IS NOT NULL ORDER BY id DESC LIMIT ?",
+        (int(limit),)
+    )
+    s = 0
+    for r in rows:
+        oc = (r["outcome"] or "").upper()
+        if oc == "LOSS":
+            s += 1
+        else:
+            break
+    return s
+
+def gua_can_enter(conf_s, conf_l, n_s, n_l, gap):
+    global _last_cooldown_until
+    if time.time() < _last_cooldown_until:
+        return False, "cooldown_timer"
+
+    hour_now = now_local().hour
+    for h0, h1 in QUIET_HOURS:
+        if h0 <= hour_now <= h1:
+            return False, "quiet_hours"
+
+    if n_s < MIN_SAMPLES_SHORT or n_l < MIN_SAMPLES_LONG:
+        return False, "few_samples"
+
+    if conf_s < CONF_SHORT_MIN:
+        return False, "low_conf_short"
+    if conf_l < CONF_LONG_MIN:
+        return False, "low_conf_long"
+    if abs(conf_s - conf_l) < GAP_MIN:
+        return False, "low_gap"
+
+    ls = get_loss_streak()
+    if ls >= MAX_LOSS_STREAK:
+        _last_cooldown_until = time.time() + COOLDOWN_SECONDS
+        return False, "loss_streak_cooldown"
+
+    return True, "ok"
 
 # ========= Pending helpers =========
 def get_open_pending() -> Optional[sqlite3.Row]:
@@ -335,7 +417,7 @@ def _close_now(row: sqlite3.Row, suggested:int, final_seen:List[str]):
 def open_pending(suggested: int, conf_short:float, conf_long:float,
                  post_short:Dict[int,float], post_long:Dict[int,float],
                  base:List[int], pattern_key:str):
-    # 🔒 grava stage/outcome não nulos para compatibilidade com esquemas antigos
+    # grava stage/outcome não nulos (compat)
     _exec_write("""INSERT INTO pending
         (created_at, suggested, open, seen, opened_at,
          last_post_short, last_post_long, last_conf_short, last_conf_long,
@@ -357,13 +439,44 @@ def _maybe_close_by_final_timeout():
         return _close_now(row, int(row["suggested"] or 0), seen_list)
     return None
 
-# ========= Relatório 5 em 5 minutos =========
-def _report_snapshot(last_secs:int=300) -> Dict[str,int]:
-    since = now_ts() - max(60, int(last_secs))
+# ========= Controle de reset diário por grupo e anti-duplicação por hora =========
+def gua_reset_if_new_day(chat_id: str):
+    dk = day_key()
+    rows = _query_all("SELECT day_key FROM relatorio_dia WHERE chat_id=?", (chat_id,))
+    if not rows:
+        _exec_write("INSERT OR REPLACE INTO relatorio_dia (chat_id, day_key) VALUES (?,?)", (chat_id, dk))
+        return
+    if rows[0]["day_key"] != dk:
+        # Se quiser zerar contadores por grupo, faça aqui (ex.: limpar tabela específica por chat_id)
+        _exec_write("UPDATE relatorio_dia SET day_key=? WHERE chat_id=?", (dk, chat_id))
+
+def gua_try_reserve_hour(chat_id: str) -> bool:
+    hk = hour_key()
+    ts = int(time.time())
+    try:
+        _exec_write(
+            "INSERT OR IGNORE INTO relatorio_controle(chat_id, hour_key, sent_at) VALUES (?,?,?)",
+            (chat_id, hk, ts)
+        )
+        rows = _query_all(
+            "SELECT sent_at FROM relatorio_controle WHERE chat_id=? AND hour_key=?",
+            (chat_id, hk)
+        )
+        return bool(rows) and int(rows[0]["sent_at"]) == ts
+    except Exception:
+        return False
+
+# ========= Relatório 1x por hora (por grupo) =========
+def _report_snapshot_day(chat_id: str) -> Dict[str,int]:
+    # janela do dia local (00:00 -> agora)
+    start = now_local().replace(hour=0, minute=0, second=0, microsecond=0)
+    start_ts = int(start.astimezone(timezone.utc).timestamp())
+
     rows = _query_all("""
         SELECT outcome, stage FROM pending
         WHERE closed_at IS NOT NULL AND closed_at >= ?
-    """, (since,))
+    """, (start_ts,))
+
     g0=g1=g2=0; l0=l1=l2=0
     for r in rows:
         oc = (r["outcome"] or "").upper()
@@ -376,152 +489,30 @@ def _report_snapshot(last_secs:int=300) -> Dict[str,int]:
             if st == "G0": l0 += 1
             elif st == "G1": l1 += 1
             else: l2 += 1
-    row = _query_all("SELECT green, loss FROM score WHERE id=1")[0] if _query_all("SELECT green, loss FROM score WHERE id=1") else None
-    g = int(row["green"] if row else 0); l = int(row["loss"] if row else 0)
+
+    row = _query_all("SELECT green, loss FROM score WHERE id=1")
+    g = int(row[0]["green"] if row else 0)
+    l = int(row[0]["loss"] if row else 0)
     total = g + l
     acc = (g/total) if total>0 else 0.0
     return {"g0":g0,"g1":g1,"g2":g2,"l0":l0,"l1":l1,"l2":l2,"day_green":g,"day_loss":l,"day_acc":acc}
 
 def _day_mood(acc: float) -> str:
-    if acc >= GOOD_DAY_THRESHOLD: return "🔥 <b>Dia bom</b> — continuando bem!"
-    if acc <= BAD_DAY_THRESHOLD:  return "⚠️ <b>Dia ruim</b> — atenção!"
-    return "🔎 <b>Dia neutro</b> — operação regular."
+    if acc >= GOOD_DAY_THRESHOLD: return "Dia bom"
+    if acc <= BAD_DAY_THRESHOLD:  return "Dia ruim"
+    return "Dia neutro"
 
 async def _reporter_loop():
     while True:
         try:
-            snap = _report_snapshot(300)
-            gtot = snap["g0"] + snap["g1"] + snap["g2"]
-            ltot = snap["l0"] + snap["l1"] + snap["l2"]
-            txt = (
-                "📈 <b>Relatório (últimos 5 min)</b>\n"
-                f"G0: <b>{snap['g0']}</b> GREEN / <b>{snap['l0']}</b> LOSS\n"
-                f"G1: <b>{snap['g1']}</b> GREEN / <b>{snap['l1']}</b> LOSS\n"
-                f"G2: <b>{snap['g2']}</b> GREEN / <b>{snap['l2']}</b> LOSS\n"
-                f"Total (5min): <b>{gtot}</b> GREEN × <b>{ltot}</b> LOSS\n"
-                "—\n"
-                f"📊 <b>Dia</b>: <b>{snap['day_green']}</b> GREEN × <b>{snap['day_loss']}</b> LOSS — "
-                f"{snap['day_acc']*100:.1f}%\n"
-                f"{_day_mood(snap['day_acc'])}"
-            )
-            await tg_send_text(TARGET_CHANNEL, txt)
-        except Exception as e:
-            print(f"[RELATORIO] erro: {e}")
-        await asyncio.sleep(REPORT_EVERY_SEC)
-
-# ========= Reset diário 00:00 UTC =========
-async def _daily_reset_loop():
-    while True:
-        try:
-            now = datetime.now(timezone.utc)
-            tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-            await asyncio.sleep(max(1.0, (tomorrow - now).total_seconds()))
-            reset_score()
-            await tg_send_text(TARGET_CHANNEL, "🕛 <b>Reset diário executado (00:00 UTC)</b>\n📊 Placar zerado para o novo dia.")
-        except Exception as e:
-            print(f"[RESET] erro: {e}")
-            await asyncio.sleep(60)
-
-# ========= Rotas =========
-@app.get("/")
-async def root():
-    return {"ok": True, "service": "guardiao-auto-bot (GEN híbrido + estratégia + timeout 45s + relatório 5min)"}
-
-@app.on_event("startup")
-async def _boot_tasks():
-    try: asyncio.create_task(_reporter_loop())
-    except Exception as e: print(f"[START] reporter error: {e}")
-    try: asyncio.create_task(_daily_reset_loop())
-    except Exception as e: print(f"[START] reset error: {e}")
-
-@app.get("/health")
-async def health():
-    pend = get_open_pending()
-    return {
-        "ok": True,
-        "db": DB_PATH,
-        "pending_open": bool(pend),
-        "pending_seen": (pend["seen"] if pend else ""),
-        "d_final": int(pend["d_final"] or 0) if pend else 0,
-        "time": ts_str()
-    }
-
-@app.post("/webhook/{token}")
-async def webhook(token: str, request: Request):
-    if token != WEBHOOK_TOKEN:
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    msg_timeout = _maybe_close_by_final_timeout()
-    if msg_timeout: await tg_send_text(TARGET_CHANNEL, msg_timeout)
-
-    data = await request.json()
-    msg = data.get("channel_post") or data.get("message") \
-        or data.get("edited_channel_post") or data.get("edited_message") or {}
-    text = (msg.get("text") or msg.get("caption") or "").strip()
-    chat = msg.get("chat") or {}
-    chat_id = str(chat.get("id") or "")
-    if SOURCE_CHANNEL and chat_id != str(SOURCE_CHANNEL):
-        return {"ok": True, "skipped": "outro_chat"}
-    if not text:
-        return {"ok": True, "skipped": "sem_texto"}
-
-    # Fechamentos
-    if GREEN_RX.search(text) or LOSS_RX.search(text):
-        pend = get_open_pending()
-        nums = parse_close_numbers(text)
-        if pend and nums:
-            seen = _seen_list(pend)
-            for n in nums:
-                if len(seen) >= 3: break
-                seen.append(str(int(n)))
-                suggested = int(pend["suggested"] or 0)
-                obs_nums = [int(x) for x in seen if x.isdigit()]
-                if (len(obs_nums) >= 1 and obs_nums[0] == suggested) or \
-                   (len(obs_nums) >= 2 and obs_nums[1] == suggested) or \
-                   (len(obs_nums) >= 3 and obs_nums[2] == suggested):
-                    out = _close_now(pend, suggested, seen)
-                    await tg_send_text(TARGET_CHANNEL, out)
-                    return {"ok": True, "closed": "green_imediato"}
-            _set_seen(int(pend["id"]), seen)
-            pend = get_open_pending()
-            if pend and len(_seen_list(pend)) == 2:
-                _ensure_final_deadline_when_two(pend)
-            pend = get_open_pending()
-            if pend and len(_seen_list(pend)) >= 3:
-                out = _close_now(pend, int(pend["suggested"] or 0), _seen_list(pend))
-                await tg_send_text(TARGET_CHANNEL, out)
-                return {"ok": True, "closed": "loss_3_observados"}
-        return {"ok": True, "noted_close": True}
-
-    # Entrada confirmada
-    parsed = parse_entry_text(text)
-    if not parsed:
-        return {"ok": True, "skipped": "nao_eh_entrada_confirmada"}
-
-    msg_timeout = _maybe_close_by_final_timeout()
-    if msg_timeout: await tg_send_text(TARGET_CHANNEL, msg_timeout)
-
-    seq = parsed["seq"] or []
-    if seq: append_timeline(seq)
-
-    after       = parsed["after"]
-    base        = parsed["base"] or [1,2,3,4]
-    pattern_key = parsed["pattern_key"] or "GEN"
-
-    best, conf_s, conf_l, samples_s, post_s, post_l = choose_single_number_hybrid(after, base)
-    if best is None:
-        return {"ok": True, "skipped_low_conf_or_disagree": True}
-
-    open_pending(best, conf_s, conf_l, post_s, post_l, base, pattern_key)
-
-    base_txt = ", ".join(str(x) for x in base) if base else "—"
-    aft_txt  = f" após {after}" if after else ""
-    txt = (
-        f"🎯 <b>Número seco (G0):</b> <b>{best}</b>\n"
-        f"🧩 <b>Padrão:</b> {pattern_key}{aft_txt}\n"
-        f"🧮 <b>Base:</b> [{base_txt}]\n"
-        f"📊 <b>Conf (curta/longa):</b> {conf_s*100:.2f}% / {conf_l*100:.2f}% "
-        f"| <b>Amostra≈</b>{samples_s}"
-    )
-    await tg_send_text(TARGET_CHANNEL, txt)
-    return {"ok": True, "posted": True, "best": best}
+            chat_id = TARGET_CHANNEL  # se tiver vários destinos, itere aqui
+            gua_reset_if_new_day(str(chat_id))
+            if gua_try_reserve_hour(str(chat_id)):
+                snap = _report_snapshot_day(str(chat_id))
+                txt = (
+                    "📈 <b>Relatório do dia</b>\n"
+                    f"G0: <b>{snap['g0']}</b> GREEN / <b>{snap['l0']}</b> LOSS\n"
+                    f"G1: <b>{snap['g1']}</b> GREEN / <b>{snap['l1']}</b> LOSS\n"
+                    f"G2: <b>{snap['g2']}</b> GREEN / <b>{snap['l2']}</b> LOSS\n"
+                    "—\n"
+                    f"📊 <b>Dia</b>: <b>{snap['day_green']}</b> GREEN × <b>{snap['day_loss']}</b> LOSS — "
