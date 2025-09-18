@@ -45,12 +45,12 @@ def hour_key(dt=None):
 # ========= Parâmetros de decisão (mantidos) =========
 SHORT_WINDOW    = 80
 LONG_WINDOW     = 800
-CONF_SHORT_MIN  = 0.85
-CONF_LONG_MIN   = 0.90
-GAP_MIN         = 0.050
+CONF_SHORT_MIN  = 0.70
+CONF_LONG_MIN   = 0.75
+GAP_MIN         = 0.01
 FINAL_TIMEOUT   = 45
-MIN_SAMPLES_SHORT = 120
-MIN_SAMPLES_LONG  = 400
+MIN_SAMPLES_SHORT = 60
+MIN_SAMPLES_LONG  = 200
 MAX_LOSS_STREAK   = 2
 COOLDOWN_SECONDS  = 120
 QUIET_HOURS       = [(0, 5)]
