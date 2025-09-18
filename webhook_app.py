@@ -505,14 +505,24 @@ def _day_mood(acc: float) -> str:
 async def _reporter_loop():
     while True:
         try:
-            chat_id = TARGET_CHANNEL  # se tiver vários destinos, itere aqui
-            gua_reset_if_new_day(str(chat_id))
-            if gua_try_reserve_hour(str(chat_id)):
-                snap = _report_snapshot_day(str(chat_id))
-                txt = (
-                    "📈 <b>Relatório do dia</b>\n"
-                    f"G0: <b>{snap['g0']}</b> GREEN / <b>{snap['l0']}</b> LOSS\n"
-                    f"G1: <b>{snap['g1']}</b> GREEN / <b>{snap['l1']}</b> LOSS\n"
-                    f"G2: <b>{snap['g2']}</b> GREEN / <b>{snap['l2']}</b> LOSS\n"
-                    "—\n"
-                    f"📊 <b>Dia</b>: <b>{snap['day_green']}</b> GREEN × <b>{snap['day_loss']}</b> LOSS — "
+            # pega snapshot da última 1h
+            snap = _report_snapshot(3600)
+            gtot = snap["g0"] + snap["g1"] + snap["g2"]
+            ltot = snap["l0"] + snap["l1"] + snap["l2"]
+
+            txt = (
+                "📈 <b>Relatório do dia (última 1h)</b>\n"
+                f"G0: <b>{snap['g0']}</b> GREEN / <b>{snap['l0']}</b> LOSS\n"
+                f"G1: <b>{snap['g1']}</b> GREEN / <b>{snap['l1']}</b> LOSS\n"
+                f"G2: <b>{snap['g2']}</b> GREEN / <b>{snap['l2']}</b> LOSS\n"
+                f"Total (1h): <b>{gtot}</b> GREEN × <b>{ltot}</b> LOSS\n"
+                "—\n"
+                f"📊 <b>Dia</b>: <b>{snap['day_green']}</b> GREEN × <b>{snap['day_loss']}</b> LOSS — "
+                f"{snap['day_acc']*100:.1f}%\n"
+                f"{_day_mood(snap['day_acc'])}"
+            )
+
+            await tg_send_text(TARGET_CHANNEL, txt)
+        except Exception as e:
+            print(f"[RELATORIO] erro: {e}")
+        await asyncio.sleep(3600)  # 1h
