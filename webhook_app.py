@@ -3,20 +3,25 @@
 
 """
 Webhook (GEN híbrido + estratégia + timeout 45s + relatório 1h + reset diário America/Sao_Paulo)
+— versão enxuta e estável, com os IDs atualizados
 """
 
 import os, re, time, json, sqlite3, asyncio
 from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timezone, timedelta
+
 import httpx
 from fastapi import FastAPI, Request, HTTPException
-import zoneinfo  # fuso local
+import zoneinfo
 
-# ========= ENV =========
+# ===================== ENV =====================
 TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
 WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
-TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1002796105884").strip()  # destino
-SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "-1002810508717").strip()  # fonte
+
+# >>> ATUALIZADOS <<<
+TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1003081474331").strip()  # destino (Sinal 24 fan tan)
+SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "-1002810508717").strip()  # fonte (Vidigal Fan Tan)
+
 DB_PATH        = os.getenv("DB_PATH", "/var/data/data.db").strip() or "/var/data/data.db"
 
 if not TG_BOT_TOKEN:
@@ -25,9 +30,10 @@ if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
+
 app = FastAPI(title="guardiao-auto-bot (GEN híbrido + estratégia)", version="3.2.0")
 
-# ========= Fuso local =========
+# ===================== Fuso/Hora =====================
 TZ_LOCAL = zoneinfo.ZoneInfo("America/Sao_Paulo")
 def now_local():
     return datetime.now(TZ_LOCAL)
@@ -37,37 +43,30 @@ def day_key(dt=None):
 def hour_key(dt=None):
     dt = dt or now_local()
     return dt.strftime("%Y%m%d%H")
+def now_ts() -> int:
+    return int(time.time())
 
-# ========= HÍBRIDO (curta/longa) =========
-# Parâmetros mais conservadores para reduzir overtrade e loss
-SHORT_WINDOW    = 80       # era 40
-LONG_WINDOW     = 800      # era 1000
-CONF_SHORT_MIN  = 0.85     # era 0.70
-CONF_LONG_MIN   = 0.90     # era 0.80
-GAP_MIN         = 0.050    # era 0.020
-FINAL_TIMEOUT   = 45       # começa quando houver 2 observados
+# ===================== Parâmetros Estratégia =====================
+# Híbrido curto/longa + guard-rails mais conservadores
+SHORT_WINDOW    = 80
+LONG_WINDOW     = 800
+CONF_SHORT_MIN  = 0.85
+CONF_LONG_MIN   = 0.90
+GAP_MIN         = 0.050
+FINAL_TIMEOUT   = 45
 
-# Guard-rails adicionais (robustez da entrada)
 MIN_SAMPLES_SHORT = 120
 MIN_SAMPLES_LONG  = 400
 MAX_LOSS_STREAK   = 2
 COOLDOWN_SECONDS  = 120
-QUIET_HOURS       = [(0, 5)]  # evita operar entre 00:00 e 05:59
-_last_cooldown_until = 0  # memória
+QUIET_HOURS       = [(0, 5)]  # 00h–05:59
+_last_cooldown_until = 0
 
-# ========= Relatório / Sinais do dia =========
-# Troca para 1x por hora (anti-flood) e thresholds mais rígidos
-REPORT_EVERY_SEC   = 60 * 60
+REPORT_EVERY_SEC   = 60*60  # 1x por hora
 GOOD_DAY_THRESHOLD = 0.80
 BAD_DAY_THRESHOLD  = 0.50
 
-# ========= Utils =========
-def now_ts() -> int: return int(time.time())
-def ts_str(ts=None) -> str:
-    if ts is None: ts = now_ts()
-    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-# ========= DB =========
+# ===================== DB =====================
 def _connect() -> sqlite3.Connection:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     con = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30.0)
@@ -145,14 +144,13 @@ def migrate_db():
             try: cur.execute(ddl)
             except sqlite3.OperationalError: pass
 
-    # corrige linhas antigas com NULL/vazio
     try:
-        cur.execute("UPDATE pending SET stage='OPEN'    WHERE stage IS NULL OR stage=''")
+        cur.execute("UPDATE pending SET stage='OPEN' WHERE stage IS NULL OR stage=''")
         cur.execute("UPDATE pending SET outcome='PENDING' WHERE outcome IS NULL OR outcome=''")
     except sqlite3.OperationalError:
         pass
 
-    # ===== PATCH-GUA schema de relatório/controle =====
+    # controle de relatório/duplicação (por chat)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS relatorio_controle (
         chat_id TEXT NOT NULL,
@@ -167,20 +165,18 @@ def migrate_db():
         day_key TEXT NOT NULL
     );
     """)
-    # ===== PATCH-GUA (fim) =====
-
     con.commit(); con.close()
 
 migrate_db()
 
-# ========= Telegram =========
+# ===================== Telegram helpers =====================
 async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
     async with httpx.AsyncClient(timeout=15) as client:
         await client.post(f"{TELEGRAM_API}/sendMessage",
                           json={"chat_id": chat_id, "text": text, "parse_mode": parse,
                                 "disable_web_page_preview": True})
 
-# ========= Score =========
+# ===================== Score =====================
 def bump_score(outcome: str):
     con = _connect(); cur = con.cursor()
     row = cur.execute("SELECT green, loss FROM score WHERE id=1").fetchone()
@@ -190,19 +186,21 @@ def bump_score(outcome: str):
     cur.execute("INSERT OR REPLACE INTO score (id, green, loss) VALUES (1,?,?)", (g, l))
     con.commit(); con.close()
 
-def reset_score(): _exec_write("INSERT OR REPLACE INTO score (id, green, loss) VALUES (1,0,0)")
+def reset_score():
+    _exec_write("INSERT OR REPLACE INTO score (id, green, loss) VALUES (1,0,0)")
 
 def score_text() -> str:
     con = _connect()
     row = con.execute("SELECT green, loss FROM score WHERE id=1").fetchone()
     con.close()
-    if not row: return "0 GREEN × 0 LOSS — 0.0%"
+    if not row:
+        return "0 GREEN × 0 LOSS — 0.0%"
     g, l = int(row["green"]), int(row["loss"])
     total = g + l
     acc = (g/total*100.0) if total>0 else 0.0
     return f"{g} GREEN × {l} LOSS — {acc:.1f}%"
 
-# ========= Timeline / N-gram =========
+# ===================== Timeline / N-gram =====================
 def append_timeline(seq: List[int]):
     for n in seq:
         _exec_write("INSERT INTO timeline (created_at, number) VALUES (?,?)", (now_ts(), int(n)))
@@ -258,7 +256,7 @@ def _best_conf_gap(post: Dict[int,float]) -> Tuple[int,float,float]:
     gap  = top[0][1] - (top[1][1] if len(top)>1 else 0.0)
     return best, conf, gap
 
-# ========= Parsers/estratégia =========
+# ===================== Parsers =====================
 ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
 SEQ_RX   = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
 AFTER_RX = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
@@ -266,9 +264,6 @@ KWOK_RX  = re.compile(r"\bKWOK\s*([1-4])\s*-\s*([1-4])", re.I)
 SSH_RX   = re.compile(r"\bSS?H\s*([1-4])(?:-([1-4]))?(?:-([1-4]))?(?:-([1-4]))?", re.I)
 ODD_RX   = re.compile(r"\bODD\b", re.I)
 EVEN_RX  = re.compile(r"\bEVEN\b", re.I)
-
-GREEN_RX = re.compile(r"(?:\bgr+e+e?n\b|\bwin\b|✅)", re.I)
-LOSS_RX  = re.compile(r"(?:\blo+s+s?\b|\bred\b|❌|\bperdemos\b)", re.I)
 
 PAREN_GROUP_RX = re.compile(r"\(([^)]*)\)")
 ANY_14_RX      = re.compile(r"[1-4]")
@@ -316,7 +311,7 @@ def parse_close_numbers(text: str) -> List[int]:
     nums = ANY_14_RX.findall(t)
     return [int(x) for x in nums][:3]
 
-# ========= Decisor (híbrido + estratégia) =========
+# ===================== Decisor =====================
 def choose_single_number_hybrid(after: Optional[int], candidates: List[int]) -> Tuple[Optional[int], float, float, int, Dict[int,float], Dict[int,float]]:
     candidates = sorted(list(dict.fromkeys([c for c in candidates if c in (1,2,3,4)]))) or [1,2,3,4]
     tail_s = get_tail(SHORT_WINDOW)
@@ -326,54 +321,40 @@ def choose_single_number_hybrid(after: Optional[int], candidates: List[int]) -> 
     b_s, c_s, g_s = _best_conf_gap(post_s)
     b_l, c_l, g_l = _best_conf_gap(post_l)
     best = None
-    # Exige consenso curto=long, confs altas e gaps reais
     if b_s == b_l and c_s >= CONF_SHORT_MIN and c_l >= CONF_LONG_MIN and g_s >= GAP_MIN and g_l >= GAP_MIN:
         best = b_s
     return best, c_s, c_l, len(tail_s), post_s, post_l
 
-# ========= Guard-rails: decisão final de entrada =========
 def get_loss_streak(limit=20):
-    rows = _query_all(
-        "SELECT outcome FROM pending WHERE closed_at IS NOT NULL ORDER BY id DESC LIMIT ?",
-        (int(limit),)
-    )
+    rows = _query_all("SELECT outcome FROM pending WHERE closed_at IS NOT NULL ORDER BY id DESC LIMIT ?", (int(limit),))
     s = 0
     for r in rows:
         oc = (r["outcome"] or "").upper()
-        if oc == "LOSS":
-            s += 1
-        else:
-            break
+        if oc == "LOSS": s += 1
+        else: break
     return s
 
 def gua_can_enter(conf_s, conf_l, n_s, n_l, gap):
     global _last_cooldown_until
-    if time.time() < _last_cooldown_until:
-        return False, "cooldown_timer"
-
+    if time.time() < _last_cooldown_until: return False, "cooldown_timer"
     hour_now = now_local().hour
     for h0, h1 in QUIET_HOURS:
         if h0 <= hour_now <= h1:
             return False, "quiet_hours"
-
     if n_s < MIN_SAMPLES_SHORT or n_l < MIN_SAMPLES_LONG:
         return False, "few_samples"
-
     if conf_s < CONF_SHORT_MIN:
         return False, "low_conf_short"
     if conf_l < CONF_LONG_MIN:
         return False, "low_conf_long"
     if abs(conf_s - conf_l) < GAP_MIN:
         return False, "low_gap"
-
-    ls = get_loss_streak()
-    if ls >= MAX_LOSS_STREAK:
+    if get_loss_streak() >= MAX_LOSS_STREAK:
         _last_cooldown_until = time.time() + COOLDOWN_SECONDS
         return False, "loss_streak_cooldown"
-
     return True, "ok"
 
-# ========= Pending helpers =========
+# ===================== Pending helpers =====================
 def get_open_pending() -> Optional[sqlite3.Row]:
     con = _connect()
     row = con.execute("SELECT * FROM pending WHERE open=1 ORDER BY id DESC LIMIT 1").fetchone()
@@ -393,15 +374,11 @@ def _ensure_final_deadline_when_two(row: sqlite3.Row):
         _exec_write("UPDATE pending SET d_final=? WHERE id=?", (now_ts() + FINAL_TIMEOUT, int(row["id"])))
 
 def _close_now(row: sqlite3.Row, suggested:int, final_seen:List[str]):
-    obs_nums = [int(x) for x in final_seen if x.isdigit()]
-    if len(obs_nums) >= 1 and obs_nums[0] == suggested:
-        outcome, stage_lbl = "GREEN", "G0"
-    elif len(obs_nums) >= 2 and obs_nums[1] == suggested:
-        outcome, stage_lbl = "GREEN", "G1"
-    elif len(obs_nums) >= 3 and obs_nums[2] == suggested:
-        outcome, stage_lbl = "GREEN", "G2"
-    else:
-        outcome, stage_lbl = "LOSS", "G2"
+    obs = [int(x) for x in final_seen if x.isdigit()]
+    if len(obs) >= 1 and obs[0] == suggested: outcome, stage_lbl = "GREEN", "G0"
+    elif len(obs) >= 2 and obs[1] == suggested: outcome, stage_lbl = "GREEN", "G1"
+    elif len(obs) >= 3 and obs[2] == suggested: outcome, stage_lbl = "GREEN", "G2"
+    else: outcome, stage_lbl = "LOSS", "G2"
 
     _exec_write("""UPDATE pending
                       SET open=0, seen=?, closed_at=?, outcome=?, stage=?
@@ -417,7 +394,6 @@ def _close_now(row: sqlite3.Row, suggested:int, final_seen:List[str]):
 def open_pending(suggested: int, conf_short:float, conf_long:float,
                  post_short:Dict[int,float], post_long:Dict[int,float],
                  base:List[int], pattern_key:str):
-    # grava stage/outcome não nulos (compat)
     _exec_write("""INSERT INTO pending
         (created_at, suggested, open, seen, opened_at,
          last_post_short, last_post_long, last_conf_short, last_conf_long,
@@ -439,7 +415,7 @@ def _maybe_close_by_final_timeout():
         return _close_now(row, int(row["suggested"] or 0), seen_list)
     return None
 
-# ========= Controle de reset diário por grupo e anti-duplicação por hora =========
+# ===================== Relatório/Reset por grupo =====================
 def gua_reset_if_new_day(chat_id: str):
     dk = day_key()
     rows = _query_all("SELECT day_key FROM relatorio_dia WHERE chat_id=?", (chat_id,))
@@ -447,8 +423,8 @@ def gua_reset_if_new_day(chat_id: str):
         _exec_write("INSERT OR REPLACE INTO relatorio_dia (chat_id, day_key) VALUES (?,?)", (chat_id, dk))
         return
     if rows[0]["day_key"] != dk:
-        # Se quiser zerar contadores por grupo, faça aqui (ex.: limpar tabela específica por chat_id)
         _exec_write("UPDATE relatorio_dia SET day_key=? WHERE chat_id=?", (dk, chat_id))
+        reset_score()
 
 def gua_try_reserve_hour(chat_id: str) -> bool:
     hk = hour_key()
@@ -466,17 +442,10 @@ def gua_try_reserve_hour(chat_id: str) -> bool:
     except Exception:
         return False
 
-# ========= Relatório 1x por hora (por grupo) =========
 def _report_snapshot_day(chat_id: str) -> Dict[str,int]:
-    # janela do dia local (00:00 -> agora)
     start = now_local().replace(hour=0, minute=0, second=0, microsecond=0)
     start_ts = int(start.astimezone(timezone.utc).timestamp())
-
-    rows = _query_all("""
-        SELECT outcome, stage FROM pending
-        WHERE closed_at IS NOT NULL AND closed_at >= ?
-    """, (start_ts,))
-
+    rows = _query_all("SELECT outcome, stage FROM pending WHERE closed_at IS NOT NULL AND closed_at >= ?", (start_ts,))
     g0=g1=g2=0; l0=l1=l2=0
     for r in rows:
         oc = (r["outcome"] or "").upper()
@@ -489,7 +458,6 @@ def _report_snapshot_day(chat_id: str) -> Dict[str,int]:
             if st == "G0": l0 += 1
             elif st == "G1": l1 += 1
             else: l2 += 1
-
     row = _query_all("SELECT green, loss FROM score WHERE id=1")
     g = int(row[0]["green"] if row else 0)
     l = int(row[0]["loss"] if row else 0)
@@ -502,27 +470,45 @@ def _day_mood(acc: float) -> str:
     if acc <= BAD_DAY_THRESHOLD:  return "Dia ruim"
     return "Dia neutro"
 
-async def _reporter_loop():
+async def reporter_once():
+    snap = _report_snapshot_day(TARGET_CHANNEL)
+    gtot = snap["g0"] + snap["g1"] + snap["g2"]
+    ltot = snap["l0"] + snap["l1"] + snap["l2"]
+    txt = (
+        "📈 <b>Relatório do dia (última 1h)</b>\n"
+        f"G0: <b>{snap['g0']}</b> GREEN / <b>{snap['l0']}</b> LOSS\n"
+        f"G1: <b>{snap['g1']}</b> GREEN / <b>{snap['l1']}</b> LOSS\n"
+        f"G2: <b>{snap['g2']}</b> GREEN / <b>{snap['l2']}</b> LOSS\n"
+        f"Total (1h): <b>{gtot}</b> GREEN × <b>{ltot}</b> LOSS\n"
+        "—\n"
+        f"📊 <b>Dia</b>: <b>{snap['day_green']}</b> GREEN × <b>{snap['day_loss']}</b> LOSS "
+        f"(<b>{snap['day_acc']*100:.1f}%</b>) — { _day_mood(snap['day_acc']) }"
+    )
+    if gua_try_reserve_hour(TARGET_CHANNEL):
+        await tg_send_text(TARGET_CHANNEL, txt)
+
+async def reporter_loop():
     while True:
         try:
-            # pega snapshot da última 1h
-            snap = _report_snapshot(3600)
-            gtot = snap["g0"] + snap["g1"] + snap["g2"]
-            ltot = snap["l0"] + snap["l1"] + snap["l2"]
+            await reporter_once()
+        except Exception:
+            pass
+        await asyncio.sleep(REPORT_EVERY_SEC)
 
-            txt = (
-                "📈 <b>Relatório do dia (última 1h)</b>\n"
-                f"G0: <b>{snap['g0']}</b> GREEN / <b>{snap['l0']}</b> LOSS\n"
-                f"G1: <b>{snap['g1']}</b> GREEN / <b>{snap['l1']}</b> LOSS\n"
-                f"G2: <b>{snap['g2']}</b> GREEN / <b>{snap['l2']}</b> LOSS\n"
-                f"Total (1h): <b>{gtot}</b> GREEN × <b>{ltot}</b> LOSS\n"
-                "—\n"
-                f"📊 <b>Dia</b>: <b>{snap['day_green']}</b> GREEN × <b>{snap['day_loss']}</b> LOSS — "
-                f"{snap['day_acc']*100:.1f}%\n"
-                f"{_day_mood(snap['day_acc'])}"
-            )
+# ===================== Core: processar mensagens =====================
+async def process_source_text(text: str):
+    """
+    Recebe texto do canal fonte, atualiza timeline/abre entradas/fecha quando necessário.
+    """
+    # 1) Entrada confirmada?
+    entry = parse_entry_text(text)
+    if entry:
+        # atualizar timeline com a sequência crua (se houver)
+        if entry["seq"]:
+            append_timeline(entry["seq"])
 
-            await tg_send_text(TARGET_CHANNEL, txt)
-        except Exception as e:
-            print(f"[RELATORIO] erro: {e}")
-        await asyncio.sleep(3600)  # 1h
+        # decidir número seco (híbrido)
+        best, c_s, c_l, n_s, post_s, post_l = choose_single_number_hybrid(entry["after"], entry["base"])
+
+        # guard-rails finais
+        can, reason = gua_can_enter(c_s, c_l, n_s, len(get_tail
