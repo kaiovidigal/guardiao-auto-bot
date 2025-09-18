@@ -277,6 +277,10 @@ def salvar_historico():
         json.dump(historico, f)
 
 def escolher_numero(mensagem: str) -> Optional[str]:
+    """
+    Recebe mensagem com 2 ou 3 números e devolve 1 número mais provável.
+    Usa histórico de greens como critério.
+    """
     numeros = re.findall(r"\d+", mensagem)
     if not numeros:
         return None
@@ -311,7 +315,7 @@ async def telegram_webhook(request: Request):
                 atualizar_historico(ultimo_numero, resultado)
             return {"ok": True}
 
-        # Processa sinais do canal
+        # Processa sinais do canal (2 ou 3 números -> entrada seca em 1 só)
         if chat_id == SOURCE_CHANNEL or chat_id == "":
             numero_escolhido = escolher_numero(texto)
             if numero_escolhido:
