@@ -27,7 +27,15 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 app = FastAPI(title="guardiao-auto-bot (relatório 1h)", version="3.2.0")
 
 # ========= Fuso local =========
-TZ_LOCAL = zoneinfo.ZoneInfo("America/Sao_Paulo")
+from fastapi import Request
+
+# === Webhook do Telegram ===
+@app.post(f"/webhook/{WEBHOOK_TOKEN}")
+async def telegram_webhook(request: Request):
+    update = await request.json()
+    print(update)  # aparece no log do Render
+    return {"ok": True}
+# ============================= zoneinfo.ZoneInfo("America/Sao_Paulo")
 def now_local(): return datetime.now(TZ_LOCAL)
 def day_key(dt=None):
     dt = dt or now_local(); return dt.strftime("%Y%m%d")
