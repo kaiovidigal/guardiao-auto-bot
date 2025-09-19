@@ -4,12 +4,13 @@ import asyncio
 from fastapi import FastAPI, Request
 from datetime import datetime
 import httpx
+import random
 
 # ===================== CONFIGURAÇÃO =====================
 TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
 WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
-TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "1003081474331").strip()  # Sinal 24 Fan Tan
-SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "1002810508717").strip()  # Vidigal
+TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "1003081474331").strip()  # Canal de envio de sinais
+SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "1002810508717").strip()  # Canal de origem das mensagens
 DB_PATH        = os.getenv("DB_PATH", "/var/data/data.db").strip() or "/var/data/data.db"
 
 # ===================== BANCO =====================
@@ -19,29 +20,17 @@ def _connect():
 def migrate_db():
     con = _connect()
     cur = con.cursor()
-    
-    # Cria a tabela se não existir
+    # Cria tabela com coluna stage obrigatória
     cur.execute("""
         CREATE TABLE IF NOT EXISTS pending (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at INTEGER
+            created_at INTEGER,
+            message TEXT DEFAULT '',
+            predicted TEXT DEFAULT '',
+            outcome TEXT DEFAULT '',
+            stage TEXT NOT NULL DEFAULT 'initial'
         )
     """)
-
-    # Função para checar se coluna existe
-    def column_exists(table, column):
-        cur.execute(f"PRAGMA table_info({table})")
-        columns = [info[1] for info in cur.fetchall()]
-        return column in columns
-
-    # Adiciona colunas se não existirem
-    if not column_exists("pending", "message"):
-        cur.execute("ALTER TABLE pending ADD COLUMN message TEXT DEFAULT ''")
-    if not column_exists("pending", "predicted"):
-        cur.execute("ALTER TABLE pending ADD COLUMN predicted TEXT DEFAULT ''")
-    if not column_exists("pending", "outcome"):
-        cur.execute("ALTER TABLE pending ADD COLUMN outcome TEXT DEFAULT ''")
-
     con.commit()
     con.close()
 
@@ -55,19 +44,18 @@ async def send_telegram_message(chat_id: str, text: str):
     async with httpx.AsyncClient() as client:
         await client.post(url, data={"chat_id": chat_id, "text": text})
 
-def save_message(message_text: str, predicted: str = "", outcome: str = ""):
+def save_message(message_text: str, predicted="", outcome="", stage="initial"):
     con = _connect()
     cur = con.cursor()
     cur.execute(
-        "INSERT INTO pending (created_at, message, predicted, outcome) VALUES (?, ?, ?, ?)",
-        (int(datetime.now().timestamp()), message_text, predicted, outcome)
+        "INSERT INTO pending (created_at, message, predicted, outcome, stage) VALUES (?, ?, ?, ?, ?)",
+        (int(datetime.now().timestamp()), message_text, predicted, outcome, stage)
     )
     con.commit()
     con.close()
 
 def generate_signal(message_text: str) -> str:
-    """Simples IA placeholder: retorna GREEN ou LOSS aleatoriamente"""
-    import random
+    """IA placeholder: retorna sinal aleatório com emojis"""
     return random.choice(["✅ GREEN", "❌ LOSS"])
 
 @app.post(f"/webhook/{WEBHOOK_TOKEN}")
@@ -77,18 +65,26 @@ async def webhook(request: Request):
     chat_id = str(data.get("message", {}).get("chat", {}).get("id", ""))
     print(f"[DEBUG] Recebido: {message_text} do chat {chat_id}")
 
+    # Filtra apenas o canal de origem
     if chat_id != SOURCE_CHANNEL:
         return {"status": "ignored"}
 
     # Salva no banco
-    save_message(message_text)
+    save_message(message_text, stage="received")
 
-    # Gera e envia sinal
+    # Gera sinal e envia
     signal = generate_signal(message_text)
-    save_message(f"Sinal automático: {signal}", predicted=signal, outcome="")  # registra no DB
+    save_message(f"Sinal gerado: {signal}", predicted=signal, outcome="", stage="sent")
     await send_telegram_message(TARGET_CHANNEL, f"Sinal automático: {signal}")
 
     return {"status": "ok"}
+
+# ===================== SINAL INICIAL AO START =====================
+async def send_initial_signal():
+    await asyncio.sleep(5)  # espera o bot subir
+    signal_outcome = generate_signal("Sinal inicial")
+    save_message("Sinal inicial de teste", predicted=signal_outcome, outcome=signal_outcome, stage="initial")
+    await send_telegram_message(TARGET_CHANNEL, f"🚀 Sinal inicial: {signal_outcome}")
 
 # ===================== RELATÓRIO =====================
 async def send_daily_report():
@@ -98,20 +94,14 @@ async def send_daily_report():
         cur = con.cursor()
         cur.execute("SELECT predicted, outcome FROM pending")
         rows = cur.fetchall()
-        green = sum(1 for r in rows if r[1] == "✅ GREEN")
-        loss = sum(1 for r in rows if r[1] == "❌ LOSS")
+        green = sum(1 for r in rows if "GREEN" in r[1])
+        loss = sum(1 for r in rows if "LOSS" in r[1])
         acuracia = green / max(1, (green + loss)) * 100
-        report = f"📈 Relatório do dia\n📊 GREEN: {green} × LOSS: {loss}\nAcurácia: {acuracia:.1f}%"
+        report = f"📈 Relatório do dia\n📊 ✅ GREEN: {green} × ❌ LOSS: {loss}\n🎯 Acurácia: {acuracia:.1f}%"
         await send_telegram_message(TARGET_CHANNEL, report)
         con.close()
 
-# ===================== SINAL INICIAL =====================
-async def send_initial_signal():
-    await asyncio.sleep(5)  # espera 5 segundos depois do startup
-    signal_outcome = generate_signal("Teste inicial")
-    await send_telegram_message(TARGET_CHANNEL, f"🚀 Sinal inicial de teste: {signal_outcome}")
-    save_message("Sinal inicial de teste", predicted=signal_outcome, outcome="")
-
+# ===================== STARTUP =====================
 @app.on_event("startup")
 async def startup_event():
     print("[STARTUP] Bot iniciado, aguardando mensagens...")
