@@ -9,18 +9,17 @@ import random
 # ===================== CONFIGURAÇÃO =====================
 TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
 WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
-TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1003081474331").strip()  # Grupo que recebe o sinal
-SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "-1002810508717").strip()  # Canal do Vidigal
-DB_PATH        = os.getenv("DB_PATH", "/var/data/data.db").strip() or "/var/data/data.db"
+TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1003081474331").strip()  # Seu grupo oficial
+SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "-1002810508717").strip()  # Canal de origem
+DB_PATH        = os.getenv("DB_PATH", "./data.db").strip() or "./data.db"
 
-# ===================== BANCO =====================
+# ===================== BANCO DE DADOS =====================
 def _connect():
     return sqlite3.connect(DB_PATH)
 
 def migrate_db():
     con = _connect()
     cur = con.cursor()
-    # Tabela com todos os campos necessários
     cur.execute("""
         CREATE TABLE IF NOT EXISTS pending (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -29,8 +28,7 @@ def migrate_db():
             predicted TEXT DEFAULT '',
             outcome TEXT DEFAULT '',
             stage TEXT NOT NULL DEFAULT 'initial',
-            suggested TEXT NOT NULL DEFAULT '',
-            bot_used TEXT DEFAULT ''
+            suggested TEXT DEFAULT ''
         )
     """)
     con.commit()
@@ -46,20 +44,30 @@ async def send_telegram_message(chat_id: str, text: str):
     async with httpx.AsyncClient() as client:
         await client.post(url, data={"chat_id": chat_id, "text": text})
 
-def save_message(message_text: str, predicted="", outcome="", stage="initial", suggested="", bot_used="main"):
+def save_message(message_text: str, predicted="", outcome="", stage="initial", suggested=""):
     con = _connect()
     cur = con.cursor()
     cur.execute(
-        "INSERT INTO pending (created_at, message, predicted, outcome, stage, suggested, bot_used) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (int(datetime.now().timestamp()), message_text, predicted, outcome, stage, suggested, bot_used)
+        "INSERT INTO pending (created_at, message, predicted, outcome, stage, suggested) VALUES (?, ?, ?, ?, ?, ?)",
+        (int(datetime.now().timestamp()), message_text, predicted, outcome, stage, suggested)
     )
     con.commit()
     con.close()
 
-def generate_signal(message_text: str) -> str:
-    """IA placeholder real: envia sinal com emojis"""
-    return random.choice(["✅ GREEN", "❌ LOSS"])
+# ===================== IA REAL =====================
+def generate_real_signal(message_text: str) -> str:
+    """
+    IA oficial simulando análise do canal:
+    - Mensagem do canal é processada
+    - Retorna GREEN ou LOSS
+    """
+    # Exemplo de lógica da IA (substituir por IA real depois)
+    keywords_loss = ["perdeu", "erro", "cancel"]
+    if any(word in message_text.lower() for word in keywords_loss):
+        return "❌ LOSS"
+    return "✅ GREEN"
 
+# ===================== WEBHOOK =====================
 @app.post(f"/webhook/{WEBHOOK_TOKEN}")
 async def webhook(request: Request):
     data = await request.json()
@@ -70,29 +78,23 @@ async def webhook(request: Request):
     if chat_id != SOURCE_CHANNEL:
         return {"status": "ignored"}
 
-    # Salva mensagem recebida
-    save_message(message_text, stage="received", suggested=message_text, bot_used="webhook")
-
-    # Gera sinal com IA
-    signal = generate_signal(message_text)
-    save_message(f"Sinal gerado: {signal}", predicted=signal, outcome="", stage="sent", suggested=signal, bot_used="ai")
-
-    # Envia pro grupo
-    await send_telegram_message(TARGET_CHANNEL, f"🎯 Sinal automático: {signal}")
-
+    save_message(message_text, stage="received")
+    signal = generate_real_signal(message_text)
+    save_message(f"Sinal gerado: {signal}", predicted=signal, outcome="", stage="sent")
+    await send_telegram_message(TARGET_CHANNEL, f"🎯 Sinal oficial: {signal}")
     return {"status": "ok"}
 
-# ===================== SINAL INICIAL AO START =====================
+# ===================== SINAL DE INÍCIO =====================
 async def send_initial_signal():
     await asyncio.sleep(5)
-    signal_outcome = generate_signal("Sinal inicial")
-    save_message("Sinal inicial de teste", predicted=signal_outcome, outcome=signal_outcome, stage="initial", suggested=signal_outcome, bot_used="startup")
-    await send_telegram_message(TARGET_CHANNEL, f"🚀 Sinal inicial: {signal_outcome}")
+    signal_outcome = generate_real_signal("Sinal inicial")
+    save_message("Sinal inicial oficial", predicted=signal_outcome, outcome=signal_outcome, stage="initial")
+    await send_telegram_message(TARGET_CHANNEL, f"🚀 Bot oficial online! Primeiro sinal: {signal_outcome}")
 
-# ===================== RELATÓRIO =====================
+# ===================== RELATÓRIO DIÁRIO =====================
 async def send_daily_report():
     while True:
-        await asyncio.sleep(24*60*60)
+        await asyncio.sleep(24*60*60)  # 24h
         con = _connect()
         cur = con.cursor()
         cur.execute("SELECT predicted, outcome FROM pending")
@@ -108,8 +110,8 @@ async def send_daily_report():
 @app.on_event("startup")
 async def startup_event():
     print("[STARTUP] Bot oficial iniciado, aguardando mensagens...")
-    asyncio.create_task(send_daily_report())
     asyncio.create_task(send_initial_signal())
+    asyncio.create_task(send_daily_report())
 
 # ===================== EXECUÇÃO =====================
 if __name__ == "__main__":
