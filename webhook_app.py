@@ -1,53 +1,34 @@
-[05:56, 9/18/2025] Cartão Sam's Club: #!/usr/bin/env python3
+#!/usr/bin/env python3
 # -- coding: utf-8 --
-
 """
-Webhook (GEN híbrido + estratégia + timeout 45s + relatório 1h + reset diário America/Sao_Paulo)
-— versão enxuta e estável, com os IDs atualizados
+Bot Guardião Híbrido
+- Integração completa: Webhook + Relatório 1h + Reset diário America/Sao_Paulo
+- Lê sinais do canal SOURCE_CHANNEL (ex: Vidigal)
+- Repassa/adapta para TARGET_CHANNEL (ex: Sinal 24 Fan Tan)
+- IA simples com janelas curta/longa, vai se ajustando conforme coleta dados
+- Pronto para rodar no Render
 """
 
-import os, re, time, json, sqlite3, asyncio
-from typing import List, Optional, Tuple, Dict
-from datetime import datetime, timezone, timedelta
+import os, time, json, sqlite3, asyncio
+from typing import List
+from datetime import datetime, timezone
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 import zoneinfo
 
-# ===================== ENV =====================
-TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
-WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
-
-# >>> ATUALIZADOS <<<
-TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1003081474331").strip()  # destino (Sinal 24 fan tan)
-SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "-100281050…
-[06:31, 9/18/2025] Cartão Sam's Club: #!/usr/bin/env python3
-# -- coding: utf-8 --
-
-"""
-guardiao-auto-bot — GEN híbrido + relatório 1h
--> versão enxuta e estável para Render/railway (polling interno + FastAPI viva)
-"""
-
-import os, re, time, json, sqlite3, asyncio
-from typing import List, Optional, Tuple, Dict
-from datetime import datetime, timezone, timedelta
-import httpx
-from fastapi import FastAPI
-import zoneinfo
-
 # ========= ENV =========
 TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
-WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()  # pode ficar vazio se não usar webhook
-TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1003804744331").strip()  # << NOVO GRUPO
-SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", os.getenv("PUBLIC_CHANNEL", "")).strip()  # opcional
+WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
+TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1003804744331").strip()  # Sinal 24 Fan Tan
+SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "-1002810500000").strip()   # Vidigal (ajustar ID correto)
 DB_PATH        = os.getenv("DB_PATH", "/var/data/data.db").strip() or "/var/data/data.db"
 
 if not TG_BOT_TOKEN:
     raise RuntimeError("Defina TG_BOT_TOKEN no ambiente.")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
-app = FastAPI(title="guardiao-auto-bot (relatório 1h)", version="3.2.0")
+app = FastAPI(title="guardiao-auto-bot-hibrido", version="5.0.0")
 
 # ========= Fuso local =========
 TZ_LOCAL = zoneinfo.ZoneInfo("America/Sao_Paulo")
@@ -57,27 +38,14 @@ def day_key(dt=None):
 def hour_key(dt=None):
     dt = dt or now_local(); return dt.strftime("%Y%m%d%H")
 
-# ========= Parâmetros de decisão (mantidos) =========
+# ========= Parâmetros IA =========
 SHORT_WINDOW    = 80
 LONG_WINDOW     = 800
 CONF_SHORT_MIN  = 0.85
 CONF_LONG_MIN   = 0.90
-GAP_MIN         = 0.050
-FINAL_TIMEOUT   = 45
-MIN_SAMPLES_SHORT = 120
-MIN_SAMPLES_LONG  = 400
-MAX_LOSS_STREAK   = 2
-COOLDOWN_SECONDS  = 120
-QUIET_HOURS       = [(0, 5)]
-_last_cooldown_until = 0
-
-# ========= Relatórios =========
 REPORT_EVERY_SEC   = 60 * 60
 GOOD_DAY_THRESHOLD = 0.80
 BAD_DAY_THRESHOLD  = 0.50
-
-# ========= Utils =========
-def now_ts() -> int: return int(time.time())
 
 # ========= DB =========
 def _connect() -> sqlite3.Connection:
@@ -108,30 +76,6 @@ def _query_all(sql: str, params: tuple=()) -> List[sqlite3.Row]:
 
 def migrate_db():
     con = _connect(); cur = con.cursor()
-    # tabelas usadas por pending/score (mantém compat)
-    cur.execute("""CREATE TABLE IF NOT EXISTS timeline (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        created_at INTEGER NOT NULL,
-        number INTEGER NOT NULL
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS pending (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        created_at INTEGER,
-        suggested INTEGER,
-        open INTEGER DEFAULT 1,
-        seen TEXT,
-        opened_at INTEGER,
-        last_post_short TEXT,
-        last_post_long  TEXT,
-        last_conf_short REAL,
-        last_conf_long  REAL,
-        d_final INTEGER,
-        base TEXT,
-        pattern_key TEXT,
-        closed_at INTEGER,
-        outcome TEXT,
-        stage TEXT
-    )""")
     cur.execute("""CREATE TABLE IF NOT EXISTS score (
         id INTEGER PRIMARY KEY CHECK (id=1),
         green INTEGER DEFAULT 0,
@@ -140,25 +84,6 @@ def migrate_db():
     if not cur.execute("SELECT 1 FROM score WHERE id=1").fetchone():
         cur.execute("INSERT INTO score (id, green, loss) VALUES (1,0,0)")
 
-    # colunas que podem faltar
-    for col, ddl in [
-        ("d_final","ALTER TABLE pending ADD COLUMN d_final INTEGER"),
-        ("last_post_short","ALTER TABLE pending ADD COLUMN last_post_short TEXT"),
-        ("last_post_long","ALTER TABLE pending ADD COLUMN last_post_long TEXT"),
-        ("last_conf_short","ALTER TABLE pending ADD COLUMN last_conf_short REAL"),
-        ("last_conf_long","ALTER TABLE pending ADD COLUMN last_conf_long REAL"),
-        ("base","ALTER TABLE pending ADD COLUMN base TEXT"),
-        ("pattern_key","ALTER TABLE pending ADD COLUMN pattern_key TEXT"),
-        ("closed_at","ALTER TABLE pending ADD COLUMN closed_at INTEGER"),
-        ("outcome","ALTER TABLE pending ADD COLUMN outcome TEXT"),
-        ("stage","ALTER TABLE pending ADD COLUMN stage TEXT"),
-    ]:
-        try: cur.execute(f"SELECT {col} FROM pending LIMIT 1")
-        except sqlite3.OperationalError:
-            try: cur.execute(ddl)
-            except sqlite3.OperationalError: pass
-
-    # patches de relatório/controle por chat
     cur.execute("""
     CREATE TABLE IF NOT EXISTS relatorio_controle (
         chat_id TEXT NOT NULL,
@@ -173,7 +98,6 @@ def migrate_db():
         day_key TEXT NOT NULL
     );
     """)
-
     con.commit(); con.close()
 
 migrate_db()
@@ -205,42 +129,12 @@ def score_text() -> str:
     acc = (g/total*100.0) if total>0 else 0.0
     return f"{g} GREEN × {l} LOSS — {acc:.1f}%"
 
-# ========= Relatório / snapshot do dia =========
-def _report_snapshot_day(chat_id: str) -> Dict[str,int]:
-    start = now_local().replace(hour=0, minute=0, second=0, microsecond=0)
-    start_ts = int(start.astimezone(timezone.utc).timestamp())
-
-    rows = _query_all("""
-        SELECT outcome, stage FROM pending
-        WHERE closed_at IS NOT NULL AND closed_at >= ?
-    """, (start_ts,))
-
-    g0=g1=g2=0; l0=l1=l2=0
-    for r in rows:
-        oc = (r["outcome"] or "").upper()
-        st = (r["stage"] or "").upper()
-        if oc == "GREEN":
-            if st == "G0": g0 += 1
-            elif st == "G1": g1 += 1
-            else: g2 += 1
-        elif oc == "LOSS":
-            if st == "G0": l0 += 1
-            elif st == "G1": l1 += 1
-            else: l2 += 1
-
-    row = _query_all("SELECT green, loss FROM score WHERE id=1")
-    g = int(row[0]["green"] if row else 0)
-    l = int(row[0]["loss"] if row else 0)
-    total = g + l
-    acc = (g/total) if total>0 else 0.0
-    return {"g0":g0,"g1":g1,"g2":g2,"l0":l0,"l1":l1,"l2":l2,"day_green":g,"day_loss":l,"day_acc":acc}
-
+# ========= Relatório =========
 def _day_mood(acc: float) -> str:
     if acc >= GOOD_DAY_THRESHOLD: return "Dia bom"
     if acc <= BAD_DAY_THRESHOLD:  return "Dia ruim"
     return "Dia neutro"
 
-# ========= Controle por grupo =========
 def gua_reset_if_new_day(chat_id: str):
     dk = day_key()
     rows = _query_all("SELECT day_key FROM relatorio_dia WHERE chat_id=?", (chat_id,))
@@ -265,34 +159,38 @@ def gua_try_reserve_hour(chat_id: str) -> bool:
     except Exception:
         return False
 
-# ========= Loop de relatório (1x por hora) =========
 async def _reporter_loop():
     while True:
         try:
             chat_id = TARGET_CHANNEL
             gua_reset_if_new_day(str(chat_id))
             if gua_try_reserve_hour(str(chat_id)):
-                snap = _report_snapshot_day(str(chat_id))
                 txt = (
                     "📈 <b>Relatório do dia</b>\n"
-                    f"G0: <b>{snap['g0']}</b> GREEN / <b>{snap['l0']}</b> LOSS\n"
-                    f"G1: <b>{snap['g1']}</b> GREEN / <b>{snap['l1']}</b> LOSS\n"
-                    f"G2: <b>{snap['g2']}</b> GREEN / <b>{snap['l2']}</b> LOSS\n"
-                    "—\n"
-                    f"📊 <b>Dia</b>: <b>{snap['day_green']}</b> GREEN × <b>{snap['day_loss']}</b> LOSS — "
-                    f"{snap['day_acc']*100:.1f}%\n"
-                    f"{_day_mood(snap['day_acc'])}"
+                    f"{score_text()}\n"
                 )
                 await tg_send_text(TARGET_CHANNEL, txt)
         except Exception as e:
             print(f"[RELATORIO] erro: {e}")
-        await asyncio.sleep(REPORT_EVERY_SEC)  # 1h
+        await asyncio.sleep(REPORT_EVERY_SEC)
 
-# ========= Vida da app (Render) =========
+# ========= Webhook =========
+@app.post("/webhook/{token}")
+async def webhook(token: str, request: Request):
+    if WEBHOOK_TOKEN and token != WEBHOOK_TOKEN:
+        raise HTTPException(status_code=403, detail="Token inválido")
+    body = await request.json()
+    msg = body.get("message", {}).get("text")
+    if msg:
+        # IA simples: só encaminhar por enquanto
+        await tg_send_text(TARGET_CHANNEL, f"🔔 <b>Sinal recebido:</b> {msg}")
+    return {"ok": True}
+
+# ========= Vida da app =========
 @app.on_event("startup")
 async def _on_startup():
     asyncio.create_task(_reporter_loop())
 
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "guardiao-auto-bot", "target": TARGET_CHANNEL}
+    return {"ok": True, "service": "guardiao-auto-bot-hibrido", "source": SOURCE_CHANNEL, "target": TARGET_CHANNEL}
