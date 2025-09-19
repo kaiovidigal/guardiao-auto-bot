@@ -9,8 +9,8 @@ import random
 # ===================== CONFIGURAÇÃO =====================
 TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
 WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
-TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "1003081474331").strip()  # Canal de envio de sinais
-SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "1002810508717").strip()  # Canal de origem das mensagens
+TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1003081474331").strip()  # Seu grupo
+SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "-1002810508717").strip()  # Canal Vidigal
 DB_PATH        = os.getenv("DB_PATH", "/var/data/data.db").strip() or "/var/data/data.db"
 
 # ===================== BANCO =====================
@@ -20,7 +20,6 @@ def _connect():
 def migrate_db():
     con = _connect()
     cur = con.cursor()
-    # Cria tabela com coluna stage obrigatória
     cur.execute("""
         CREATE TABLE IF NOT EXISTS pending (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,7 +54,7 @@ def save_message(message_text: str, predicted="", outcome="", stage="initial"):
     con.close()
 
 def generate_signal(message_text: str) -> str:
-    """IA placeholder: retorna sinal aleatório com emojis"""
+    """Gera sinal teste com emojis (substituir pela IA real depois)"""
     return random.choice(["✅ GREEN", "❌ LOSS"])
 
 @app.post(f"/webhook/{WEBHOOK_TOKEN}")
@@ -65,31 +64,29 @@ async def webhook(request: Request):
     chat_id = str(data.get("message", {}).get("chat", {}).get("id", ""))
     print(f"[DEBUG] Recebido: {message_text} do chat {chat_id}")
 
-    # Filtra apenas o canal de origem
     if chat_id != SOURCE_CHANNEL:
         return {"status": "ignored"}
 
-    # Salva no banco
     save_message(message_text, stage="received")
 
-    # Gera sinal e envia
     signal = generate_signal(message_text)
     save_message(f"Sinal gerado: {signal}", predicted=signal, outcome="", stage="sent")
-    await send_telegram_message(TARGET_CHANNEL, f"Sinal automático: {signal}")
+    await send_telegram_message(TARGET_CHANNEL, f"🎯 Sinal automático: {signal}")
 
     return {"status": "ok"}
 
-# ===================== SINAL INICIAL AO START =====================
+# ===================== SINAL INICIAL =====================
 async def send_initial_signal():
-    await asyncio.sleep(5)  # espera o bot subir
+    await asyncio.sleep(5)
     signal_outcome = generate_signal("Sinal inicial")
     save_message("Sinal inicial de teste", predicted=signal_outcome, outcome=signal_outcome, stage="initial")
     await send_telegram_message(TARGET_CHANNEL, f"🚀 Sinal inicial: {signal_outcome}")
+    print("[INFO] Sinal inicial enviado!")
 
 # ===================== RELATÓRIO =====================
 async def send_daily_report():
     while True:
-        await asyncio.sleep(24*60*60)  # 24 horas
+        await asyncio.sleep(24*60*60)
         con = _connect()
         cur = con.cursor()
         cur.execute("SELECT predicted, outcome FROM pending")
@@ -107,3 +104,8 @@ async def startup_event():
     print("[STARTUP] Bot iniciado, aguardando mensagens...")
     asyncio.create_task(send_daily_report())
     asyncio.create_task(send_initial_signal())
+
+# ===================== RODA SERVIDOR =====================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
