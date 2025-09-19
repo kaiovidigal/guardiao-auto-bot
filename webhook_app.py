@@ -9,8 +9,8 @@ import random
 # ===================== CONFIGURAÇÃO =====================
 TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
 WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
-TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "1003081474331").strip()
-SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "1002810508717").strip()
+TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1003081474331").strip()  # Grupo que recebe o sinal
+SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "-1002810508717").strip()  # Canal do Vidigal
 DB_PATH        = os.getenv("DB_PATH", "/var/data/data.db").strip() or "/var/data/data.db"
 
 # ===================== BANCO =====================
@@ -20,6 +20,7 @@ def _connect():
 def migrate_db():
     con = _connect()
     cur = con.cursor()
+    # Tabela com todos os campos necessários
     cur.execute("""
         CREATE TABLE IF NOT EXISTS pending (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -28,7 +29,8 @@ def migrate_db():
             predicted TEXT DEFAULT '',
             outcome TEXT DEFAULT '',
             stage TEXT NOT NULL DEFAULT 'initial',
-            suggested TEXT DEFAULT ''
+            suggested TEXT NOT NULL DEFAULT '',
+            bot_used TEXT DEFAULT ''
         )
     """)
     con.commit()
@@ -44,18 +46,18 @@ async def send_telegram_message(chat_id: str, text: str):
     async with httpx.AsyncClient() as client:
         await client.post(url, data={"chat_id": chat_id, "text": text})
 
-def save_message(message_text: str, predicted="", outcome="", stage="initial", suggested=""):
+def save_message(message_text: str, predicted="", outcome="", stage="initial", suggested="", bot_used="main"):
     con = _connect()
     cur = con.cursor()
     cur.execute(
-        "INSERT INTO pending (created_at, message, predicted, outcome, stage, suggested) VALUES (?, ?, ?, ?, ?, ?)",
-        (int(datetime.now().timestamp()), message_text, predicted, outcome, stage, suggested)
+        "INSERT INTO pending (created_at, message, predicted, outcome, stage, suggested, bot_used) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (int(datetime.now().timestamp()), message_text, predicted, outcome, stage, suggested, bot_used)
     )
     con.commit()
     con.close()
 
 def generate_signal(message_text: str) -> str:
-    """Sinal aleatório com emojis para teste"""
+    """IA placeholder real: envia sinal com emojis"""
     return random.choice(["✅ GREEN", "❌ LOSS"])
 
 @app.post(f"/webhook/{WEBHOOK_TOKEN}")
@@ -68,19 +70,23 @@ async def webhook(request: Request):
     if chat_id != SOURCE_CHANNEL:
         return {"status": "ignored"}
 
-    save_message(message_text, stage="received")
+    # Salva mensagem recebida
+    save_message(message_text, stage="received", suggested=message_text, bot_used="webhook")
 
+    # Gera sinal com IA
     signal = generate_signal(message_text)
-    save_message(f"Sinal gerado: {signal}", predicted=signal, outcome="", stage="sent")
-    await send_telegram_message(TARGET_CHANNEL, f"Sinal automático: {signal}")
+    save_message(f"Sinal gerado: {signal}", predicted=signal, outcome="", stage="sent", suggested=signal, bot_used="ai")
+
+    # Envia pro grupo
+    await send_telegram_message(TARGET_CHANNEL, f"🎯 Sinal automático: {signal}")
 
     return {"status": "ok"}
 
-# ===================== SINAL INICIAL =====================
+# ===================== SINAL INICIAL AO START =====================
 async def send_initial_signal():
     await asyncio.sleep(5)
     signal_outcome = generate_signal("Sinal inicial")
-    save_message("Sinal inicial de teste", predicted=signal_outcome, outcome=signal_outcome, stage="initial", suggested="")
+    save_message("Sinal inicial de teste", predicted=signal_outcome, outcome=signal_outcome, stage="initial", suggested=signal_outcome, bot_used="startup")
     await send_telegram_message(TARGET_CHANNEL, f"🚀 Sinal inicial: {signal_outcome}")
 
 # ===================== RELATÓRIO =====================
@@ -101,6 +107,11 @@ async def send_daily_report():
 # ===================== STARTUP =====================
 @app.on_event("startup")
 async def startup_event():
-    print("[STARTUP] Bot iniciado, aguardando mensagens...")
+    print("[STARTUP] Bot oficial iniciado, aguardando mensagens...")
     asyncio.create_task(send_daily_report())
     asyncio.create_task(send_initial_signal())
+
+# ===================== EXECUÇÃO =====================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
