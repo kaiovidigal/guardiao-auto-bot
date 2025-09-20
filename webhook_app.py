@@ -40,9 +40,9 @@ app = FastAPI(title="guardiao-auto-bot (GEN híbrido + estratégia + ML)", versi
 
 # ========= HÍBRIDO (curta/longa) =========
 SHORT_WINDOW    = 40
-LONG_WINDOW     = 5000
-CONF_SHORT_MIN  = 0.45
-CONF_LONG_MIN   = 0.55
+LONG_WINDOW     = 600
+CONF_SHORT_MIN  = 0.55
+CONF_LONG_MIN   = 0.65
 GAP_MIN         = 0.021
 FINAL_TIMEOUT   = 45       # começa quando houver 2 observados
 
