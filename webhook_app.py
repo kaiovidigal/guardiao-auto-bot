@@ -2,23 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-guardiao-auto-bot (GEN híbrido + estratégia + timeout 45s + relatório 5min + ML por padrão)
-Arquivo consolidado com:
-- thresholds endurecidos e filtros de qualidade
-- cooldown de proteção por sequência/dia ruim
-- ensemble com suporte a modelos por padrão (GEN/KWOK/SSH/SEQ/ODD/EVEN) via registry.json
+Webhook (GEN híbrido + estratégia + timeout 45s + relatório 5min + reset diário + ML opcional)
 """
 
 import os, re, time, json, sqlite3, asyncio, pickle
 from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timezone, timedelta
+from math import isfinite
 from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
-
-# novo: joblib para carregar modelos
-import joblib
 
 # ========= ENV =========
 TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
@@ -31,15 +25,10 @@ DB_PATH        = os.getenv("DB_PATH", "/var/data/data.db").strip() or "/var/data
 RESET_TZ       = os.getenv("RESET_TZ", "America/Sao_Paulo").strip()
 
 # ========= ML (opcional) =========
-MODEL_PATH    = os.getenv("MODEL_PATH", "/var/data/model.pkl").strip()  # legado/global
-ML_MIN_PROBA  = float(os.getenv("ML_MIN_PROBA", "0.78"))   # limiar mínimo p/ aceitar previsão
-ML_GAP_MIN    = float(os.getenv("ML_GAP_MIN", "0.08"))     # gap vs segundo melhor
-ENSEMBLE_MODE = os.getenv("ENSEMBLE_MODE", "blend").strip() # "gate" | "blend" | "ml_only"
-
-# modelos por padrão
-MODEL_DIR = os.getenv("MODEL_DIR", "/var/data").strip() or "/var/data"
-_MODELS_BY_PATTERN: Dict[str, object] = {}
-_REGISTRY: Optional[Dict] = None
+MODEL_PATH    = os.getenv("MODEL_PATH", "/var/data/model.pkl").strip()
+ML_MIN_PROBA  = float(os.getenv("ML_MIN_PROBA", "0.75"))   # limiar mínimo p/ aceitar previsão
+ML_GAP_MIN    = float(os.getenv("ML_GAP_MIN", "0.05"))     # gap vs segundo melhor
+ENSEMBLE_MODE = os.getenv("ENSEMBLE_MODE", "gate").strip() # "gate" | "blend" | "ml_only"
 
 if not TG_BOT_TOKEN:
     raise RuntimeError("Defina TG_BOT_TOKEN no ambiente.")
@@ -47,48 +36,25 @@ if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
-app = FastAPI(title="guardiao-auto-bot (GEN híbrido + estratégia + ML por padrão)", version="3.3.0-ml-pattern")
+app = FastAPI(title="guardiao-auto-bot (GEN híbrido + estratégia + ML)", version="3.2.0-ml")
 
 # ========= HÍBRIDO (curta/longa) =========
 SHORT_WINDOW    = 40
 LONG_WINDOW     = 600
-
-# thresholds mais fortes (qualidade > quantidade)
-CONF_SHORT_MIN  = 0.56      # antes 0.49
-CONF_LONG_MIN   = 0.64      # antes 0.59
-GAP_MIN         = 0.05      # antes 0.025
-
-# ========= Filtros de qualidade =========
-MIN_SUPPORT_SHORT = 12      # amostras mínimas na janela curta
-MIN_SUPPORT_LONG  = 60      # amostras mínimas na janela longa
-MIN_TOTAL_CTX     = 180     # mínimo de registros totais na timeline (segurança)
-
-# thresholds por padrão (opcionais, sobrepõem os gerais)
-PATTERN_THRESHOLDS = {
-    "KWOK": {"conf_s": 0.58, "conf_l": 0.66, "gap": 0.06},
-    "SSH":  {"conf_s": 0.56, "conf_l": 0.64, "gap": 0.05},
-    "SEQ":  {"conf_s": 0.58, "conf_l": 0.66, "gap": 0.05},
-    "ODD":  {"conf_s": 0.60, "conf_l": 0.68, "gap": 0.06},
-    "EVEN": {"conf_s": 0.60, "conf_l": 0.68, "gap": 0.06},
-    "GEN":  {"conf_s": 0.62, "conf_l": 0.70, "gap": 0.07},
-}
-
-GAP_MIN         = float(os.getenv("GAP_MIN", str(GAP_MIN)))
-CONF_SHORT_MIN  = float(os.getenv("CONF_SHORT_MIN", str(CONF_SHORT_MIN)))
-CONF_LONG_MIN   = float(os.getenv("CONF_LONG_MIN", str(CONF_LONG_MIN)))
-
-FINAL_TIMEOUT   = int(os.getenv("FINAL_TIMEOUT", "45"))  # começa quando houver 2 observados
-
-# ========= Guard rails de risco =========
-MAX_LOSS_STREAK   = int(os.getenv("MAX_LOSS_STREAK", "3"))        # pausa após 3 reds seguidos
-COOLDOWN_SECONDS  = int(os.getenv("COOLDOWN_SECONDS", str(30*60)))# 30 min parado
-MIN_DAY_ACC_GO    = float(os.getenv("MIN_DAY_ACC_GO", "0.55"))    # se o dia < 55% pausa
-_last_cooldown_until = 0
+CONF_SHORT_MIN  = 0.49
+CONF_LONG_MIN   = 0.59
+GAP_MIN         = 0.025
+FINAL_TIMEOUT   = 45       # começa quando houver 2 observados
 
 # ========= Relatório / Sinais do dia =========
 REPORT_EVERY_SEC   = 5 * 60
 GOOD_DAY_THRESHOLD = 0.70
 BAD_DAY_THRESHOLD  = 0.40
+
+# ========= Proteções operacionais (PATCH) =========
+# bloqueios de segurança para não “moer” quando o dia está ruim
+MAX_LOSS_STREAK = int(os.getenv("MAX_LOSS_STREAK", "3"))   # nº máximo de LOSS seguidos
+DAY_MIN_ACC     = float(os.getenv("DAY_MIN_ACC", "0.40"))  # acurácia mínima do dia (0.0..1.0)
 
 # ========= Utils =========
 def now_ts() -> int: return int(time.time())
@@ -293,10 +259,6 @@ def _best_conf_gap(post: Dict[int,float]) -> Tuple[int,float,float]:
     gap  = top[0][1] - (top[1][1] if len(top)>1 else 0.0)
     return best, conf, gap
 
-def _support_from_tail(tail: List[int], ctx_len: int) -> int:
-    # aproximação do total de pares/trincas úteis para posterior
-    return max(0, len(tail) - max(1, ctx_len))
-
 # ========= Parsers/estratégia =========
 ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
 SEQ_RX   = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
@@ -356,49 +318,35 @@ def parse_close_numbers(text: str) -> List[int]:
     return [int(x) for x in nums][:3]
 
 # ========= Decisor (híbrido + estratégia) =========
-def choose_single_number_hybrid(after: Optional[int], candidates: List[int], pattern_key: str = "GEN") -> Tuple[Optional[int], float, float, int, Dict[int,float], Dict[int,float]]:
+def choose_single_number_hybrid(after: Optional[int], candidates: List[int]) -> Tuple[Optional[int], float, float, int, Dict[int,float], Dict[int,float]]:
     candidates = sorted(list(dict.fromkeys([c for c in candidates if c in (1,2,3,4)]))) or [1,2,3,4]
     tail_s = get_tail(SHORT_WINDOW)
     tail_l = get_tail(LONG_WINDOW)
-
-    # dados suficientes?
-    total_ctx = len(get_tail(LONG_WINDOW))
-    if total_ctx < MIN_TOTAL_CTX:
-        return None, 0.0, 0.0, len(tail_s), {}, {}
-
     post_s = _post_from_tail(tail_s, after, candidates)
     post_l = _post_from_tail(tail_l, after, candidates)
     b_s, c_s, g_s = _best_conf_gap(post_s)
     b_l, c_l, g_l = _best_conf_gap(post_l)
-
-    # suporte mínimo por janela
-    sup_s = _support_from_tail(tail_s, 2)
-    sup_l = _support_from_tail(tail_l, 3)
-    if sup_s < MIN_SUPPORT_SHORT or sup_l < MIN_SUPPORT_LONG:
-        return None, c_s, c_l, len(tail_s), post_s, post_l
-
-    # thresholds por padrão
-    pk = (pattern_key or "GEN").upper()
-    # normaliza chave base (ODD/EVEN/GEN) para mapping
-    base_pk = "GEN"
-    if pk.startswith("KWOK"): base_pk = "KWOK"
-    elif pk.startswith("SSH"): base_pk = "SSH"
-    elif pk.startswith("SEQ"): base_pk = "SEQ"
-    elif pk == "ODD": base_pk = "ODD"
-    elif pk == "EVEN": base_pk = "EVEN"
-    thr = PATTERN_THRESHOLDS.get(base_pk, {"conf_s": CONF_SHORT_MIN, "conf_l": CONF_LONG_MIN, "gap": GAP_MIN})
-    conf_s_min = max(CONF_SHORT_MIN,  thr.get("conf_s", CONF_SHORT_MIN))
-    conf_l_min = max(CONF_LONG_MIN,   thr.get("conf_l", CONF_LONG_MIN))
-    gap_min    = max(GAP_MIN,         thr.get("gap", GAP_MIN))
-
     best = None
-    if b_s == b_l and c_s >= conf_s_min and c_l >= conf_l_min and g_s >= gap_min and g_l >= gap_min:
+    if b_s == b_l and c_s >= CONF_SHORT_MIN and c_l >= CONF_LONG_MIN and g_s >= GAP_MIN and g_l >= GAP_MIN:
         best = b_s
-
     return best, c_s, c_l, len(tail_s), post_s, post_l
 
 # ========= ML helpers =========
-_MODEL = None  # legado (não usado com modelos por padrão)
+_MODEL = None
+def load_model():
+    global _MODEL
+    if _MODEL is not None:
+        return _MODEL
+    try:
+        if os.path.exists(MODEL_PATH):
+            with open(MODEL_PATH, "rb") as f:
+                _MODEL = pickle.load(f)
+        else:
+            _MODEL = None
+    except Exception as e:
+        print(f"[ML] Falha ao carregar modelo: {e}")
+        _MODEL = None
+    return _MODEL
 
 def _top2_from_post(post: Dict[int,float]) -> Tuple[float,float]:
     vals = sorted(post.values(), reverse=True)
@@ -414,8 +362,7 @@ def build_features_for_candidates(after: Optional[int], base: List[int],
     a_l, b_l = _top2_from_post(post_l)
     gap_s = max(0.0, a_s - b_s)
     gap_l = max(0.0, a_l - b_l)
-    pk = (pattern_key or "GEN").upper()
-    return {
+    feats = {
         "after": float(after or 0),
         "has_after": 1.0 if after else 0.0,
         "conf_short": float(conf_s or 0.0),
@@ -424,13 +371,14 @@ def build_features_for_candidates(after: Optional[int], base: List[int],
         "gap_long":   float(gap_l),
         "samples_short": float(samples_s or 0),
         "base_len": float(len(base or [])),
-        "pat_GEN":   1.0 if pk.startswith("GEN") else 0.0,
-        "pat_KWOK":  1.0 if pk.startswith("KWOK") else 0.0,
-        "pat_SSH":   1.0 if pk.startswith("SSH") else 0.0,
-        "pat_SEQ":   1.0 if pk.startswith("SEQ") else 0.0,
-        "pat_ODD":   1.0 if pk == "ODD" else 0.0,
-        "pat_EVEN":  1.0 if pk == "EVEN" else 0.0,
+        "pat_GEN":   1.0 if (pattern_key or "").upper().startswith("GEN") else 0.0,
+        "pat_KWOK":  1.0 if (pattern_key or "").upper().startswith("KWOK") else 0.0,
+        "pat_SSH":   1.0 if (pattern_key or "").upper().startswith("SSH") else 0.0,
+        "pat_SEQ":   1.0 if (pattern_key or "").upper().startswith("SEQ") else 0.0,
+        "pat_ODD":   1.0 if (pattern_key or "").upper()=="ODD" else 0.0,
+        "pat_EVEN":  1.0 if (pattern_key or "").upper()=="EVEN" else 0.0,
     }
+    return feats
 
 def expand_candidate_features(base_feats: Dict[str,float], cand: int,
                               post_s: Dict[int,float], post_l: Dict[int,float]) -> Dict[str,float]:
@@ -442,50 +390,6 @@ def expand_candidate_features(base_feats: Dict[str,float], cand: int,
     })
     return x
 
-def _load_registry():
-    global _REGISTRY
-    if _REGISTRY is not None:
-        return _REGISTRY
-    try:
-        with open(os.path.join(MODEL_DIR, "registry.json"), "r", encoding="utf-8") as f:
-            _REGISTRY = json.load(f)
-    except Exception:
-        _REGISTRY = {"models": {}, "skipped": {}}
-    return _REGISTRY
-
-def load_model_for(pattern_key: str):
-    """Retorna o modelo específico do padrão (se existir), senão GLOBAL, senão None."""
-    pk = (pattern_key or "GEN").upper()
-    base_pk = "GEN"
-    if pk.startswith("KWOK"): base_pk = "KWOK"
-    elif pk.startswith("SSH"): base_pk = "SSH"
-    elif pk.startswith("SEQ"): base_pk = "SEQ"
-    elif pk == "ODD": base_pk = "ODD"
-    elif pk == "EVEN": base_pk = "EVEN"
-
-    reg = _load_registry()
-
-    # 1) tenta modelo específico
-    entry = reg.get("models", {}).get(base_pk)
-    if entry:
-        path = entry.get("path")
-        if path and os.path.exists(path):
-            if base_pk not in _MODELS_BY_PATTERN:
-                _MODELS_BY_PATTERN[base_pk] = joblib.load(path)
-            return _MODELS_BY_PATTERN[base_pk]
-
-    # 2) fallback GLOBAL
-    glob = reg.get("models", {}).get("GLOBAL")
-    if glob:
-        gpath = glob.get("path")
-        if gpath and os.path.exists(gpath):
-            if "GLOBAL" not in _MODELS_BY_PATTERN:
-                _MODELS_BY_PATTERN["GLOBAL"] = joblib.load(gpath)
-            return _MODELS_BY_PATTERN["GLOBAL"]
-
-    # 3) sem modelo → None (o bot cai pro híbrido)
-    return None
-
 def ml_score_candidates(candidates: List[int],
                         after: Optional[int],
                         base: List[int],
@@ -493,10 +397,9 @@ def ml_score_candidates(candidates: List[int],
                         conf_s: float, conf_l: float,
                         post_s: Dict[int,float], post_l: Dict[int,float],
                         samples_s: int) -> Tuple[Optional[int], Dict[int,float], float]:
-    model = load_model_for(pattern_key)
+    model = load_model()
     if model is None:
         return None, {}, 0.0
-
     base_feats = build_features_for_candidates(after, base, conf_s, conf_l, post_s, post_l, samples_s, pattern_key)
     X, order = [], []
     for c in candidates:
@@ -513,7 +416,6 @@ def ml_score_candidates(candidates: List[int],
     except Exception as e:
         print(f"[ML] predict_proba falhou: {e}")
         return None, {}, 0.0
-
     proba_by_cand = {order[i][0]: p_green[i] for i in range(len(order))}
     top = sorted(proba_by_cand.items(), key=lambda kv: kv[1], reverse=True)[:2]
     if not top:
@@ -632,6 +534,33 @@ def _day_mood(acc: float) -> str:
     if acc <= BAD_DAY_THRESHOLD:  return "⚠️ <b>Dia ruim</b> — atenção!"
     return "🔎 <b>Dia neutro</b> — operação regular."
 
+# ========= Proteções (PATCH) =========
+def _loss_streak(limit: int = 100) -> int:
+    """Conta LOSS consecutivos olhando fechamentos recentes."""
+    try:
+        rows = _query_all(
+            "SELECT outcome FROM pending WHERE closed_at IS NOT NULL ORDER BY id DESC LIMIT ?",
+            (int(limit),)
+        )
+    except Exception:
+        return 0
+    streak = 0
+    for r in rows:
+        oc = (r["outcome"] or "").upper()
+        if oc == "LOSS":
+            streak += 1
+        elif oc == "GREEN":
+            break
+    return streak
+
+def _day_acc_ok(min_acc: float = None) -> bool:
+    """Valida se a acurácia do dia está acima do mínimo aceitável."""
+    if min_acc is None:
+        min_acc = DAY_MIN_ACC  # ex.: 0.40
+    snap = _report_snapshot(300)
+    day_acc = float(snap.get("day_acc", 0.0))
+    return day_acc >= min_acc
+
 async def _reporter_loop():
     while True:
         try:
@@ -676,7 +605,7 @@ async def _daily_reset_loop():
 # ========= Rotas =========
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "guardiao-auto-bot (GEN híbrido + estratégia + ML por padrão)"}
+    return {"ok": True, "service": "guardiao-auto-bot (GEN híbrido + estratégia + timeout 45s + relatório 5min + ML opcional)"}
 
 @app.on_event("startup")
 async def _boot_tasks():
@@ -701,6 +630,13 @@ async def health():
 async def webhook(token: str, request: Request):
     if token != WEBHOOK_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
+
+    # bloqueios de segurança (PATCH) — se o dia estiver ruim, não entra
+    try:
+        if _loss_streak() >= MAX_LOSS_STREAK or (not _day_acc_ok()):
+            return {"ok": True, "skipped": "safety_block"}
+    except Exception as e:
+        print(f"[SAFETY] erro: {e}")
 
     msg_timeout = _maybe_close_by_final_timeout()
     if msg_timeout: await tg_send_text(TARGET_CHANNEL, msg_timeout)
@@ -755,24 +691,14 @@ async def webhook(token: str, request: Request):
     seq = parsed["seq"] or []
     if seq: append_timeline(seq)
 
-    # ===== Guard-rails de risco / cooldown =====
-    global _last_cooldown_until
-    now = now_ts()
-    if now < _last_cooldown_until:
-        return {"ok": True, "skipped": "cooldown"}
-    if _loss_streak() >= MAX_LOSS_STREAK or (not _day_acc_ok()):
-        _last_cooldown_until = now + COOLDOWN_SECONDS
-        await tg_send_text(TARGET_CHANNEL, "⛔️ <b>Pausa de proteção ativada</b> (sequência de loss/dia ruim). Retomamos automaticamente depois.")
-        return {"ok": True, "cooldown_started": True}
-
     after       = parsed["after"]
     base        = parsed["base"] or [1,2,3,4]
     pattern_key = parsed["pattern_key"] or "GEN"
 
-    # 1) decisão híbrida (endurecida + thresholds por padrão)
-    best_h, conf_s, conf_l, samples_s, post_s, post_l = choose_single_number_hybrid(after, base, pattern_key)
+    # 1) decisão híbrida (original)
+    best_h, conf_s, conf_l, samples_s, post_s, post_l = choose_single_number_hybrid(after, base)
 
-    # 2) decisão ML (por padrão, se houver modelo)
+    # 2) decisão ML (se houver modelo)
     best_ml, proba_by_cand, ml_gap = ml_score_candidates(base, after, base, pattern_key, conf_s, conf_l, post_s, post_l, samples_s)
 
     # 3) ensemble
@@ -782,17 +708,14 @@ async def webhook(token: str, request: Request):
         if best_ml is not None:
             chosen, chosen_by = best_ml, "ml"
     elif ENSEMBLE_MODE == "blend":
-        # concordância → perfeito
         if (best_h is not None) and (best_ml is not None) and (best_h == best_ml):
             chosen, chosen_by = best_h, "ensemble"
-        # ML muito confiante leva
-        elif best_ml is not None and proba_by_cand.get(best_ml, 0.0) >= ML_MIN_PROBA:
+        elif (best_h is None) and (best_ml is not None):
             chosen, chosen_by = best_ml, "ml"
-        # só híbrido forte quando ML fraco/indisponível
-        elif (best_h is not None) and ((best_ml is None) or (proba_by_cand.get(best_ml,0.0) < ML_MIN_PROBA*0.9)):
+        elif (best_h is not None) and (best_ml is None):
             chosen, chosen_by = best_h, "hybrid"
-        else:
-            chosen, chosen_by = None, "no_consensus"
+        elif (best_h is not None) and (best_ml is not None) and (best_h != best_ml):
+            chosen, chosen_by = best_h, "hybrid"
     else:  # "gate" (conservador)
         if best_h is not None:
             if best_ml is not None and best_ml != best_h:
