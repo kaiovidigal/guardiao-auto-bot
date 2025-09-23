@@ -2,9 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 Treina **um modelo por padrão** (GEN, KWOK, SSH, SEQ, ODD, EVEN) a partir do SQLite do bot.
-Saídas: model_<PADRAO>.pkl (ex.: model_GEN.pkl) em MODEL_DIR (default: /var/data)
-Se um padrão tiver poucos exemplos, ele é pulado e o script registra isso no registry.json.
-Compatível com o extrator de features do runtime (mesmas chaves e ordem de features).
+- Cria as tabelas necessárias (ml_log/pending) se não existirem, para evitar erro.
+- Se não houver dados suficientes, apenas registra e sai sem falhar.
+Saídas: model_<PADRAO>.pkl em MODEL_DIR (default: /var/data) + registry.json
+Compatível com o extrator de features do runtime (mesmas chaves e ordem).
 """
 import os
 import json
@@ -24,6 +25,49 @@ DEFAULT_MODEL_DIR = os.getenv("MODEL_DIR", "/var/data")
 MIN_SAMPLES_PER_PATTERN = int(os.getenv("MIN_SAMPLES_PER_PATTERN", "120"))  # ajuste se necessário
 
 PATTERNS = ["GEN","KWOK","SSH","SEQ","ODD","EVEN"]
+
+# ========= Schema helper =========
+def ensure_schema(db_path: str):
+    con = sqlite3.connect(db_path)
+    cur = con.cursor()
+
+    # Tabela ml_log compatível com o webhook (campos usados no treino)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS ml_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at INTEGER NOT NULL,
+        pending_id INTEGER,
+        after INTEGER,
+        base TEXT,
+        pattern_key TEXT,
+        conf_short REAL,
+        conf_long REAL,
+        gap_short REAL,
+        gap_long REAL,
+        samples_short INTEGER,
+        proba_json TEXT,
+        chosen INTEGER,
+        chosen_by TEXT,
+        label INTEGER,
+        stage TEXT,
+        outcome TEXT
+    )
+    """)
+
+    # Tabela pending (apenas colunas que o SELECT usa)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS pending (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        last_post_short TEXT,
+        last_post_long  TEXT,
+        suggested INTEGER,
+        outcome TEXT,
+        seen TEXT
+    )
+    """)
+
+    con.commit()
+    con.close()
 
 # ========= Feature helpers (espelham o runtime) =========
 def build_base_feats(after: int, base: List[int], pattern_key: str,
@@ -154,7 +198,19 @@ def main():
 
     os.makedirs(args.outdir, exist_ok=True)
 
+    # Garante que as tabelas existam (evita 'no such table')
+    ensure_schema(args.db)
+
     rows = load_rows(args.db)
+    if not rows:
+        print("⚠️ Sem dados rotulados em ml_log.label — nada para treinar ainda. Deixe o webhook rodar e tente mais tarde.")
+        # Mesmo assim, escreve um registry vazio para não falhar o deploy
+        reg_path = os.path.join(args.outdir, "registry.json")
+        with open(reg_path, "w", encoding="utf-8") as f:
+            json.dump({"models": {}, "skipped": {"ALL":"no_data"}}, f, ensure_ascii=False, indent=2)
+        print(f"📘 Registry salvo em: {reg_path}")
+        return
+
     registry = {"models": {}, "skipped": {}}
 
     for pat in PATTERNS:
@@ -178,7 +234,7 @@ def main():
             "feature_names_sorted": feat_names,
         }
 
-    # global fallback (todos os padrões juntos), caso queira
+    # global fallback (todos os padrões juntos)
     Xg, yg, feat_names_g = rows_to_dataset(rows, pattern_filter="")
     if len(Xg) >= max(200, args.min_samples) and len(set(yg)) >= 2:
         print(f"\n=== Treinando [GLOBAL] ===")
