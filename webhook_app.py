@@ -1,30 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-webhook_app.py — v4.4.0 (Fluxo estrito + IA local como 4º especialista)
-------------------------------------------------------------------------
-FastAPI + Telegram webhook que:
-- Lê mensagens do canal-fonte e publica um "número seco" (1..4) no canal-alvo.
-- Fluxo ESTRITO: nunca abre novo sinal enquanto o anterior não fechou de verdade.
-- Gales (G1/G2) e fechamento robusto (GREEN/LOSS) por observados (+ timeout inteligente).
-- Aprendizado online (feedback) e ENSEMBLE (Hedge) com 4 especialistas:
-  1) n-grama + feedback
-  2) frequência curta
-  3) frequência longa
-  4) IA local (LLM estilo ChatGPT) via llama-cpp (JSON de probabilidades)
-- Anti-tilt (sem cortar o volume por padrão), dedupe por update_id, mensagens de debug, etc.
-- Suporte a updates de canal (channel_post) e mensagens (message), regex tolerante (keycaps 1️⃣ 2️⃣ 3️⃣ 4️⃣).
-- BYPASS_SOURCE opcional para diagnosticar sem filtrar canal-fonte.
+webhook_app.py — v4.4.1
+- Fluxo estrito + Anti-tilt sem reduzir sinais + robustez de canal
+- IA local (LLM) como 4º especialista (opcional)
+- Aviso "⏳ Aguardando..." APENAS 1x por pendência
+- Placar zera todo dia às 00:00 (fuso TZ_NAME, default America/Sao_Paulo)
 
 ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
 ENV opcionais:    TARGET_CHANNEL, SOURCE_CHANNEL, DB_PATH, DEBUG_MSG, BYPASS_SOURCE
                   LLM_ENABLED, LLM_MODEL_PATH, LLM_CTX_TOKENS, LLM_N_THREADS, LLM_TEMP, LLM_TOP_P
+                  TZ_NAME
 Webhook:          POST /webhook/{WEBHOOK_TOKEN}
 """
 import os, re, time, sqlite3, math, json
 from contextlib import contextmanager
 from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timezone
+
+# ---- timezone (reset diário) ----
+TZ_NAME = os.getenv("TZ_NAME", "America/Sao_Paulo").strip()
+try:
+    from zoneinfo import ZoneInfo
+    _TZ = ZoneInfo(TZ_NAME)
+except Exception:
+    _TZ = timezone.utc
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -53,26 +53,26 @@ if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
 # ========= App =========
-app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="4.4.0")
+app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="4.4.1")
 
 # ========= Parâmetros =========
 DECAY = 0.980
 W4, W3, W2, W1 = 0.42, 0.30, 0.18, 0.10
 OBS_TIMEOUT_SEC = 240  # fecha por timeout só se já houver 2 observados
 
-# ======== Gates (continuam não bloqueando abertura) ========
+# ======== Gates (não bloqueiam abertura) ========
 CONF_MIN    = 0.55
 GAP_MIN     = 0.08
 H_MAX       = 0.80
 FREQ_WINDOW = 120
 
-# ======== Cooldown após RED (mantemos estado, mas sem cortar fluxo) ========
+# ======== Cooldown após RED (sem cortar fluxo) ========
 COOLDOWN_N     = 2
 CD_CONF_BOOST  = 0.04
 CD_GAP_BOOST   = 0.03
 
-# ======== Modo "sempre entrar" (mantém volume) ========
-ALWAYS_ENTER = True  # se quiser travar mais o fluxo, pode pôr False e aplicar gates na sua lógica
+# ======== Modo "sempre entrar" ========
+ALWAYS_ENTER = True
 
 # ======== Online Learning (feedback) ========
 FEED_BETA   = 0.45
@@ -80,9 +80,6 @@ FEED_POS    = 1.0
 FEED_NEG    = 1.0
 FEED_DECAY  = 0.995
 WF4, WF3, WF2, WF1 = W4, W3, W2, W1
-
-# ======== Empate técnico (legado) ========
-GAP_SOFT = 0.010
 
 # ======== Ensemble Hedge ========
 HEDGE_ETA = 0.6
@@ -97,8 +94,11 @@ def ts_str(ts=None) -> str:
     if ts is None: ts = now_ts()
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+def tz_today_ymd() -> str:
+    dt = datetime.now(_TZ)
+    return dt.strftime("%Y-%m-%d")
+
 def _entropy_norm(post: Dict[int, float]) -> float:
-    """Entropia normalizada (base 4). 0=concentrada, 1=uniforme."""
     eps = 1e-12
     H = -sum((p+eps) * math.log(p+eps, 4) for p in post.values())
     return H
@@ -117,7 +117,6 @@ def _column_exists(con: sqlite3.Connection, table: str, col: str) -> bool:
     r = con.execute(f"PRAGMA table_info({table})").fetchall()
     return any((row["name"] if isinstance(row, sqlite3.Row) else row[1]) == col for row in r)
 
-from contextlib import contextmanager
 @contextmanager
 def _tx():
     con = _connect()
@@ -154,7 +153,8 @@ def migrate_db():
         seen TEXT,
         opened_at INTEGER,
         "after" INTEGER,
-        ctx1 TEXT, ctx2 TEXT, ctx3 TEXT, ctx4 TEXT
+        ctx1 TEXT, ctx2 TEXT, ctx3 TEXT, ctx4 TEXT,
+        wait_notice_sent INTEGER DEFAULT 0
     )""")
     # score
     cur.execute("""CREATE TABLE IF NOT EXISTS score (
@@ -175,20 +175,28 @@ def migrate_db():
         update_id TEXT PRIMARY KEY,
         seen_at   INTEGER NOT NULL
     )""")
-    # state (cooldown + loss_streak)
+    # state
     cur.execute("""CREATE TABLE IF NOT EXISTS state (
         id INTEGER PRIMARY KEY CHECK (id=1),
         cooldown_left INTEGER DEFAULT 0,
-        loss_streak   INTEGER DEFAULT 0
+        loss_streak   INTEGER DEFAULT 0,
+        last_reset_ymd TEXT DEFAULT ''
     )""")
     row = con.execute("SELECT 1 FROM state WHERE id=1").fetchone()
     if not row:
-        cur.execute("INSERT INTO state (id, cooldown_left, loss_streak) VALUES (1,0,0)")
+        cur.execute("INSERT INTO state (id, cooldown_left, loss_streak, last_reset_ymd) VALUES (1,0,0,'')")
+    # --- migrações leves (idempotentes) ---
+    # pending.wait_notice_sent
     try:
-        cur.execute("ALTER TABLE state ADD COLUMN loss_streak INTEGER DEFAULT 0")
+        cur.execute("ALTER TABLE pending ADD COLUMN wait_notice_sent INTEGER DEFAULT 0")
     except sqlite3.OperationalError:
         pass
-    # expert weights (Hedge) — agora com w4
+    # state.last_reset_ymd
+    try:
+        cur.execute("ALTER TABLE state ADD COLUMN last_reset_ymd TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
+    # expert weights (4 especialistas p/ LLM)
     cur.execute("""CREATE TABLE IF NOT EXISTS expert_w (
         id INTEGER PRIMARY KEY CHECK (id=1),
         w1 REAL NOT NULL,
@@ -245,6 +253,9 @@ def bump_score(outcome: str) -> Tuple[int, int]:
         con.execute("INSERT OR REPLACE INTO score (id, green, loss) VALUES (1,?,?)", (g, l))
         return g, l
 
+def reset_score():
+    _exec_write("INSERT OR REPLACE INTO score (id, green, loss) VALUES (1,0,0)")
+
 def score_text() -> str:
     con = _connect()
     row = con.execute("SELECT green, loss FROM score WHERE id=1").fetchone()
@@ -255,6 +266,23 @@ def score_text() -> str:
     total = g + l
     acc = (g/total*100.0) if total > 0 else 0.0
     return f"{g} GREEN × {l} LOSS — {acc:.1f}%"
+
+# ========= Daily reset =========
+def _get_last_reset_ymd() -> str:
+    con = _connect()
+    row = con.execute("SELECT last_reset_ymd FROM state WHERE id=1").fetchone()
+    con.close()
+    return (row["last_reset_ymd"] or "") if row else ""
+
+def _set_last_reset_ymd(ymd: str):
+    _exec_write("UPDATE state SET last_reset_ymd=? WHERE id=1", (ymd,))
+
+def check_and_maybe_reset_score():
+    today = tz_today_ymd()
+    last = _get_last_reset_ymd()
+    if last != today:
+        reset_score()
+        _set_last_reset_ymd(today)
 
 # ========= State helpers =========
 def _get_cooldown() -> int:
@@ -387,7 +415,6 @@ def _decision_context(after: Optional[int]) -> Tuple[List[int], List[int], List[
     return ctx1, ctx2, ctx3, ctx4
 
 def _post_from_tail(tail: List[int], after: Optional[int]) -> Dict[int, float]:
-    """Distribuição E1: n-grama + feedback."""
     cands = [1,2,3,4]
     scores = {c: 0.0 for c in cands}
     if not tail:
@@ -547,15 +574,12 @@ def choose_single_number(after: Optional[int]):
     post_e2 = _post_freq_k(tail, K_SHORT)          # freq curta
     post_e3 = _post_freq_k(tail, K_LONG)           # freq longa
     post_e4 = _llm_probs_from_tail(tail) or {1:0.25,2:0.25,3:0.25,4:0.25}  # IA local
-
     post, (w1,w2,w3,w4) = _hedge_blend4(post_e1, post_e2, post_e3, post_e4)
-
     ranking = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
     top2 = ranking[:2]
     gap = (top2[0][1] - top2[1][1]) if len(top2) >= 2 else ranking[0][1]
     base_best = ranking[0][0]
     conf = float(post[base_best])
-
     ls = _get_loss_streak()
     best, reason, post_adj = _streak_adjust_choice(post, gap, ls)
     conf = float(post_adj[best])
@@ -627,6 +651,10 @@ def _seen_append(row: sqlite3.Row, new_items: List[str]):
     seen_txt = "-".join(cur_seen[:3])
     with _tx() as con:
         con.execute("UPDATE pending SET seen=? WHERE id=?", (seen_txt, int(row["id"])))
+
+def _mark_wait_notice_sent(row_id: int):
+    with _tx() as con:
+        con.execute("UPDATE pending SET wait_notice_sent=1 WHERE id=?", (int(row_id),))
 
 def _stage_from_observed(suggested: int, obs: List[int]) -> Tuple[str, str]:
     if not obs:
@@ -749,7 +777,7 @@ def _maybe_close_by_timeout():
     return None
 
 def close_pending(outcome:str):
-    """Compat: força fechar preenchendo X até 3 observados (não usada no fluxo normal)."""
+    """Força fechar preenchendo X até 3 observados (não usada no fluxo normal)."""
     row = get_open_pending()
     if not row: return
     seen_list = _seen_list(row)
@@ -767,8 +795,8 @@ def _open_pending_with_ctx(suggested:int, after:Optional[int], ctx1,ctx2,ctx3,ct
         row = con.execute("SELECT 1 FROM pending WHERE open=1 LIMIT 1").fetchone()
         if row:
             return False
-        con.execute("""INSERT INTO pending (created_at, suggested, stage, open, seen, opened_at, after, ctx1, ctx2, ctx3, ctx4)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        con.execute("""INSERT INTO pending (created_at, suggested, stage, open, seen, opened_at, after, ctx1, ctx2, ctx3, ctx4, wait_notice_sent)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,0)""",
                     (now_ts(), int(suggested), 0, 1, "", now_ts(), after,
                      _ctx_to_key(ctx1), _ctx_to_key(ctx2), _ctx_to_key(ctx3), _ctx_to_key(ctx4)))
         return True
@@ -787,12 +815,26 @@ async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
 # ========= Rotas =========
 @app.get("/")
 async def root():
+    # reset diário lazy
+    check_and_maybe_reset_score()
     return {"ok": True, "service": "guardiao-auto-bot (GEN webhook)"}
+
+@app.get("/health")
+async def health():
+    # reset diário lazy
+    check_and_maybe_reset_score()
+    pend = get_open_pending()
+    pend_open = bool(pend)
+    seen = (pend["seen"] if pend else "")
+    return {"ok": True, "db": DB_PATH, "pending_open": pend_open, "pending_seen": seen, "time": ts_str(), "tz": TZ_NAME}
 
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
     if token != WEBHOOK_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
+
+    # reset diário lazy no início de qualquer evento
+    check_and_maybe_reset_score()
 
     data = await request.json()
 
@@ -842,7 +884,6 @@ async def webhook(token: str, request: Request):
             if nums:
                 _seen_append(pend, [str(n) for n in nums])
                 pend = get_open_pending()
-
             seen_list = _seen_list(pend) if pend else []
             if pend and len(seen_list) >= 3:
                 suggested = int(pend["suggested"] or 0)
@@ -863,7 +904,7 @@ async def webhook(token: str, request: Request):
 
     pend = get_open_pending()
     if pend:
-        # Se já houver 3 observados, fecha agora (fechamento real)
+        # Se já houver 3 observados, fecha agora
         seen_list = _seen_list(pend)
         if len(seen_list) >= 3:
             suggested = int(pend["suggested"] or 0)
@@ -874,9 +915,11 @@ async def webhook(token: str, request: Request):
             await tg_send_text(TARGET_CHANNEL, out_msg)
             pend = get_open_pending()
 
-        # Fluxo estrito: se ainda existir pendente (1 ou 2 observados), NÃO abre novo.
+        # Se ainda existir pendente (1 ou 2 observados), NÃO abre novo — e envia aviso só 1x
         if pend:
-            await tg_send_text(TARGET_CHANNEL, "⏳ Aguardando fechamento do sinal anterior…")
+            if int(pend.get("wait_notice_sent") or 0) == 0:
+                await tg_send_text(TARGET_CHANNEL, "⏳ Aguardando fechamento do sinal anterior…")
+                _mark_wait_notice_sent(int(pend["id"]))
             return {"ok": True, "kept_open_waiting_close": True}
 
     # Alimenta memória com a sequência (se houver)
@@ -886,7 +929,7 @@ async def webhook(token: str, request: Request):
     after = parsed["after"]
     best, conf, samples, post, gap, reason = choose_single_number(after)
 
-    # Abertura (gates não bloqueiam; ALWAYS_ENTER=True)
+    # Abertura (ALWAYS_ENTER=True)
     ctx1, ctx2, ctx3, ctx4 = _decision_context(after)
     opened = _open_pending_with_ctx(best, after, ctx1, ctx2, ctx3, ctx4)
     if not opened:
@@ -904,11 +947,3 @@ async def webhook(token: str, request: Request):
     )
     await tg_send_text(TARGET_CHANNEL, txt)
     return {"ok": True, "posted": True, "best": best, "conf": conf, "gap": gap, "samples": samples}
-
-# ===== Debug/help endpoint =====
-@app.get("/health")
-async def health():
-    pend = get_open_pending()
-    pend_open = bool(pend)
-    seen = (pend["seen"] if pend else "")
-    return {"ok": True, "db": DB_PATH, "pending_open": pend_open, "pending_seen": seen, "time": ts_str()}
