@@ -462,7 +462,7 @@ def _streak_adjust_choice(post:Dict[int,float], gap:float, ls:int) -> Tuple[int,
         top2 = ranking[:2]
         if len(top2) == 2:
             # se gap pequeno, pega o segundo para quebrar sequência
-            if gap < 0.05:  # 5pp
+            if gap < 0.07:  # 5pp
                 best = top2[1][0]
                 reason = "IA_runnerup_ls2"
     return best, reason, post
