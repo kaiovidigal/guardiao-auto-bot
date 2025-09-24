@@ -46,7 +46,7 @@ W4, W3, W2, W1 = 0.35, 0.35, 0.20, 0.10
 OBS_TIMEOUT_SEC = 240
 
 # ======== Gates (LIGADOS para diminuir o LOSS) ========
-CONF_MIN    = 0.45 # <<<<< AJUSTADO PARA TESTE >>>>>
+CONF_MIN    = 0.35 # <<<<< AJUSTADO PARA TESTE >>>>>
 GAP_MIN     = 0.08
 H_MAX       = 0.80
 FREQ_WINDOW = 120
