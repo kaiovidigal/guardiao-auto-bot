@@ -655,4 +655,3 @@ async def handle_webhook(webhook_token: str, request: Request):
         await _process_incoming(message, update_id)
     
     return {"ok": True}
-
