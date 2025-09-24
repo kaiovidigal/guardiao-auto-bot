@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-webhook_app.py — v4.3.0 (Fluxo estrito + Anti-tilt sem reduzir sinais + robustez de canal)
-------------------------------------------------------------------------------------------
+webhook_app.py — v4.4.0 (Fluxo estrito + IA local como 4º especialista)
+------------------------------------------------------------------------
 FastAPI + Telegram webhook que:
 - Lê mensagens do canal-fonte e publica um "número seco" (1..4) no canal-alvo.
 - Fluxo ESTRITO: nunca abre novo sinal enquanto o anterior não fechou de verdade.
-- Acompanha gales (G1/G2) e fecha robusto (GREEN/LOSS) por observados.
-- Aprende online com feedback: penaliza erro e REFORÇA o número vencedor real.
-- Usa ENSEMBLE (Hedge) de 3 especialistas (n-grama+feedback, freq curta, freq longa).
-- Consciência de sequência (loss_streak) e jogada anti-tilt (sem reduzir volume).
-- Dedupe por update_id, abertura transacional, timeout (fecha com "X" só por tempo quando já há 2 observados).
-- Suporte a updates de canais (channel_post) e mensagens (message). Regex tolerante (keycaps 1️⃣ 2️⃣ 3️⃣ 4️⃣).
-- BYPASS_SOURCE opcional para diagnosticar sem filtrar canal-fonte. DEBUG_MSG para logs no alvo.
+- Gales (G1/G2) e fechamento robusto (GREEN/LOSS) por observados (+ timeout inteligente).
+- Aprendizado online (feedback) e ENSEMBLE (Hedge) com 4 especialistas:
+  1) n-grama + feedback
+  2) frequência curta
+  3) frequência longa
+  4) IA local (LLM estilo ChatGPT) via llama-cpp (JSON de probabilidades)
+- Anti-tilt (sem cortar o volume por padrão), dedupe por update_id, mensagens de debug, etc.
+- Suporte a updates de canal (channel_post) e mensagens (message), regex tolerante (keycaps 1️⃣ 2️⃣ 3️⃣ 4️⃣).
+- BYPASS_SOURCE opcional para diagnosticar sem filtrar canal-fonte.
+
 ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
 ENV opcionais:    TARGET_CHANNEL, SOURCE_CHANNEL, DB_PATH, DEBUG_MSG, BYPASS_SOURCE
+                  LLM_ENABLED, LLM_MODEL_PATH, LLM_CTX_TOKENS, LLM_N_THREADS, LLM_TEMP, LLM_TOP_P
 Webhook:          POST /webhook/{WEBHOOK_TOKEN}
 """
-import os, re, time, sqlite3, math
+import os, re, time, sqlite3, math, json
 from contextlib import contextmanager
 from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timezone
@@ -35,32 +39,40 @@ DEBUG_MSG      = os.getenv("DEBUG_MSG", "0").strip() in ("1","true","True","yes"
 BYPASS_SOURCE  = os.getenv("BYPASS_SOURCE", "0").strip() in ("1","true","True","yes","YES")
 TELEGRAM_API   = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
+# ===== LLM (IA local tipo ChatGPT) =====
+LLM_ENABLED    = os.getenv("LLM_ENABLED", "1").strip() in ("1","true","True","yes","YES")
+LLM_MODEL_PATH = os.getenv("LLM_MODEL_PATH", "models/phi-3-mini.gguf").strip()
+LLM_CTX_TOKENS = int(os.getenv("LLM_CTX_TOKENS", "2048"))
+LLM_N_THREADS  = int(os.getenv("LLM_N_THREADS", "4"))
+LLM_TEMP       = float(os.getenv("LLM_TEMP", "0.2"))
+LLM_TOP_P      = float(os.getenv("LLM_TOP_P", "0.95"))
+
 if not TG_BOT_TOKEN:
     raise RuntimeError("Defina TG_BOT_TOKEN no ambiente.")
 if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
 # ========= App =========
-app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="4.3.0")
+app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="4.4.0")
 
 # ========= Parâmetros =========
 DECAY = 0.980
 W4, W3, W2, W1 = 0.42, 0.30, 0.18, 0.10
 OBS_TIMEOUT_SEC = 240  # fecha por timeout só se já houver 2 observados
 
-# ======== Gates (DESLIGADOS para não reduzir sinais) ========
+# ======== Gates (continuam não bloqueando abertura) ========
 CONF_MIN    = 0.55
 GAP_MIN     = 0.08
 H_MAX       = 0.80
 FREQ_WINDOW = 120
 
-# ======== Cooldown após RED (mantemos estado, mas não cortamos abertura por gates) ========
+# ======== Cooldown após RED (mantemos estado, mas sem cortar fluxo) ========
 COOLDOWN_N     = 2
 CD_CONF_BOOST  = 0.04
 CD_GAP_BOOST   = 0.03
 
-# ======== Modo "sempre entrar" (NÃO reduzir volume de sinais) ========
-ALWAYS_ENTER = True  # mantém volume
+# ======== Modo "sempre entrar" (mantém volume) ========
+ALWAYS_ENTER = True  # se quiser travar mais o fluxo, pode pôr False e aplicar gates na sua lógica
 
 # ======== Online Learning (feedback) ========
 FEED_BETA   = 0.45
@@ -105,6 +117,7 @@ def _column_exists(con: sqlite3.Connection, table: str, col: str) -> bool:
     r = con.execute(f"PRAGMA table_info({table})").fetchall()
     return any((row["name"] if isinstance(row, sqlite3.Row) else row[1]) == col for row in r)
 
+from contextlib import contextmanager
 @contextmanager
 def _tx():
     con = _connect()
@@ -175,16 +188,22 @@ def migrate_db():
         cur.execute("ALTER TABLE state ADD COLUMN loss_streak INTEGER DEFAULT 0")
     except sqlite3.OperationalError:
         pass
-    # expert weights (Hedge)
+    # expert weights (Hedge) — agora com w4
     cur.execute("""CREATE TABLE IF NOT EXISTS expert_w (
         id INTEGER PRIMARY KEY CHECK (id=1),
         w1 REAL NOT NULL,
         w2 REAL NOT NULL,
-        w3 REAL NOT NULL
+        w3 REAL NOT NULL,
+        w4 REAL NOT NULL
     )""")
     row = con.execute("SELECT 1 FROM expert_w WHERE id=1").fetchone()
     if not row:
-        cur.execute("INSERT INTO expert_w (id, w1, w2, w3) VALUES (1, 1.0, 1.0, 1.0)")
+        cur.execute("INSERT INTO expert_w (id, w1, w2, w3, w4) VALUES (1, 1.0, 1.0, 1.0, 1.0)")
+    else:
+        try:
+            con.execute("ALTER TABLE expert_w ADD COLUMN w4 REAL NOT NULL DEFAULT 1.0")
+        except sqlite3.OperationalError:
+            pass
     con.commit(); con.close()
 migrate_db()
 
@@ -399,7 +418,71 @@ def _post_from_tail(tail: List[int], after: Optional[int]) -> Dict[int, float]:
     tot = sum(scores.values()) or 1e-9
     return {k: v/tot for k,v in scores.items()}
 
-# ========= Ensemble (Hedge) =========
+# ========= LLM local (Especialista 4) =========
+try:
+    from llama_cpp import Llama
+    _LLM = None
+    def _llm_load():
+        global _LLM
+        if _LLM is None and LLM_ENABLED and os.path.exists(LLM_MODEL_PATH):
+            _LLM = Llama(
+                model_path=LLM_MODEL_PATH,
+                n_ctx=LLM_CTX_TOKENS,
+                n_threads=LLM_N_THREADS,
+                verbose=False
+            )
+        return _LLM
+except Exception:
+    _LLM = None
+    def _llm_load():
+        return None
+
+_LLM_SYSTEM = (
+    "Você é um assistente que prevê o próximo número de um stream discreto com classes {1,2,3,4}.\n"
+    "Responda APENAS um JSON com as probabilidades normalizadas em porcentagem, "
+    "com esta forma exata: {\"1\":p1,\"2\":p2,\"3\":p3,\"4\":p4}. Sem texto extra."
+)
+
+def _llm_probs_from_tail(tail: List[int]) -> Dict[int,float]:
+    llm = _llm_load()
+    if llm is None or not LLM_ENABLED:
+        return {}
+    win60  = tail[-60:] if len(tail) >= 60 else tail
+    win300 = tail[-300:] if len(tail) >= 300 else tail
+    def freq(win, n): return win.count(n)/max(1, len(win))
+    feats = {
+        "len": len(tail),
+        "last10": tail[-10:],
+        "freq60": {n: freq(win60, n) for n in (1,2,3,4)},
+        "freq300": {n: freq(win300, n) for n in (1,2,3,4)},
+    }
+    user = (
+        f"Historico_Recente={tail[-50:]}\n"
+        f"Feats={feats}\n"
+        "Devolva JSON com as probabilidades (%) para o PRÓXIMO número. "
+        "Formato: {\"1\":p1,\"2\":p2,\"3\":p3,\"4\":p4}"
+    )
+    try:
+        out = llm.create_chat_completion(
+            messages=[
+                {"role":"system","content":_LLM_SYSTEM},
+                {"role":"user","content":user}
+            ],
+            temperature=LLM_TEMP,
+            top_p=LLM_TOP_P,
+            max_tokens=128
+        )
+        text = out["choices"][0]["message"]["content"].strip()
+        m = re.search(r"\{.*\}", text, re.S)
+        jtxt = m.group(0) if m else text
+        data = json.loads(jtxt)
+        raw = {int(k): float(v) for k,v in data.items() if str(k) in ("1","2","3","4")}
+        S = sum(raw.values()) or 1e-9
+        return {k: max(0.0, v/S) for k,v in raw.items() if k in (1,2,3,4)}
+    except Exception:
+        return {}
+
+# ========= Ensemble (Hedge) — 4 especialistas =========
 def _norm_dict(d: Dict[int,float]) -> Dict[int,float]:
     s = sum(d.values()) or 1e-9
     return {k: v/s for k,v in d.items()}
@@ -412,70 +495,60 @@ def _post_freq_k(tail: List[int], k: int) -> Dict[int,float]:
 
 def _get_expert_w():
     con = _connect()
-    row = con.execute("SELECT w1,w2,w3 FROM expert_w WHERE id=1").fetchone()
+    row = con.execute("SELECT w1,w2,w3,w4 FROM expert_w WHERE id=1").fetchone()
     con.close()
-    if not row: return (1.0, 1.0, 1.0)
-    return float(row["w1"]), float(row["w2"]), float(row["w3"])
+    if not row: return (1.0, 1.0, 1.0, 1.0)
+    return float(row["w1"]), float(row["w2"]), float(row["w3"]), float(row["w4"])
 
-def _set_expert_w(w1, w2, w3):
-    _exec_write("UPDATE expert_w SET w1=?, w2=?, w3=? WHERE id=1", (float(w1), float(w2), float(w3)))
+def _set_expert_w(w1, w2, w3, w4):
+    _exec_write("UPDATE expert_w SET w1=?, w2=?, w3=?, w4=? WHERE id=1",
+                (float(w1), float(w2), float(w3), float(w4)))
 
-def _hedge_blend(p1:Dict[int,float], p2:Dict[int,float], p3:Dict[int,float]):
-    w1, w2, w3 = _get_expert_w()
-    s = (w1 + w2 + w3) or 1e-9
-    w1, w2, w3 = (w1/s, w2/s, w3/s)
-    blended = {c: w1*p1.get(c,0)+w2*p2.get(c,0)+w3*p3.get(c,0) for c in [1,2,3,4]}
-    return _norm_dict(blended), (w1,w2,w3)
+def _hedge_blend4(p1:Dict[int,float], p2:Dict[int,float], p3:Dict[int,float], p4:Dict[int,float]):
+    w1, w2, w3, w4 = _get_expert_w()
+    S = (w1 + w2 + w3 + w4) or 1e-9
+    w1, w2, w3, w4 = (w1/S, w2/S, w3/S, w4/S)
+    blended = {c: w1*p1.get(c,0)+w2*p2.get(c,0)+w3*p3.get(c,0)+w4*p4.get(c,0) for c in [1,2,3,4]}
+    s2 = sum(blended.values()) or 1e-9
+    return {k: v/s2 for k,v in blended.items()}, (w1,w2,w3,w4)
 
-def _hedge_update(true_c:int, p1:Dict[int,float], p2:Dict[int,float], p3:Dict[int,float]):
-    # perda = 1 - p(true); Hedge: w_i <- w_i * exp(-eta * (1 - p_i(true)))
-    w1, w2, w3 = _get_expert_w()
-    l1 = 1.0 - p1.get(true_c, 0.0)
-    l2 = 1.0 - p2.get(true_c, 0.0)
-    l3 = 1.0 - p3.get(true_c, 0.0)
+def _hedge_update4(true_c:int, p1:Dict[int,float], p2:Dict[int,float], p3:Dict[int,float], p4:Dict[int,float]):
+    w1, w2, w3, w4 = _get_expert_w()
+    l = lambda p: 1.0 - p.get(true_c, 0.0)
     from math import exp
-    w1n = w1 * exp(-HEDGE_ETA * (1.0 - l1))
-    w2n = w2 * exp(-HEDGE_ETA * (1.0 - l2))
-    w3n = w3 * exp(-HEDGE_ETA * (1.0 - l3))
-    s = (w1n + w2n + w3n) or 1e-9
-    _set_expert_w(w1n/s, w2n/s, w3n/s)
+    w1n = w1 * exp(-HEDGE_ETA * (1.0 - l(p1)))
+    w2n = w2 * exp(-HEDGE_ETA * (1.0 - l(p2)))
+    w3n = w3 * exp(-HEDGE_ETA * (1.0 - l(p3)))
+    w4n = w4 * exp(-HEDGE_ETA * (1.0 - l(p4)))
+    S = (w1n + w2n + w3n + w4n) or 1e-9
+    _set_expert_w(w1n/S, w2n/S, w3n/S, w4n/S)
 
-# ========= Escolha (streak-aware, sem reduzir sinais) =========
+# ========= Anti-tilt (sem reduzir sinais) =========
 def _streak_adjust_choice(post:Dict[int,float], gap:float, ls:int) -> Tuple[int,str,Dict[int,float]]:
-    """
-    Ajusta a jogada quando há sequência de LOSS (anti-tilt), sem reduzir sinais.
-      - ls >= 2 e gap pequeno -> pode escolher o 2º mais provável.
-      - ls >= 3 -> mistura 30% da distribuição complementar (1 - p) para quebrar padrão.
-    """
     reason = "IA"
     ranking = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
     best = ranking[0][0]
-
     if ls >= 3:
         comp = _norm_dict({c: max(1e-9, 1.0 - post[c]) for c in [1,2,3,4]})
         post = _norm_dict({c: 0.7*post[c] + 0.3*comp[c] for c in [1,2,3,4]})
         ranking = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
         best = ranking[0][0]
         reason = "IA_anti_tilt_mix"
-
     if ls >= 2:
-        ranking = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
         top2 = ranking[:2]
-        if len(top2) == 2 and gap < 0.05:  # 5pp
+        if len(top2) == 2 and gap < 0.05:
             best = top2[1][0]
             reason = "IA_runnerup_ls2"
     return best, reason, post
 
 def choose_single_number(after: Optional[int]):
-    """
-    Retorna:
-      best(int), conf(float), samples(int), post(dict), gap(float), reason(str)
-    """
     tail = get_tail(400)
-    post_e1 = _post_from_tail(tail, after)
-    post_e2 = _post_freq_k(tail, K_SHORT)
-    post_e3 = _post_freq_k(tail, K_LONG)
-    post, (w1,w2,w3) = _hedge_blend(post_e1, post_e2, post_e3)
+    post_e1 = _post_from_tail(tail, after)         # n-grama + feedback
+    post_e2 = _post_freq_k(tail, K_SHORT)          # freq curta
+    post_e3 = _post_freq_k(tail, K_LONG)           # freq longa
+    post_e4 = _llm_probs_from_tail(tail) or {1:0.25,2:0.25,3:0.25,4:0.25}  # IA local
+
+    post, (w1,w2,w3,w4) = _hedge_blend4(post_e1, post_e2, post_e3, post_e4)
 
     ranking = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
     top2 = ranking[:2]
@@ -504,7 +577,6 @@ PAREN_GROUP_RX = re.compile(r"\(([^)]*)\)")
 ANY_14_RX      = re.compile(r"[1-4]")
 
 KEYCAP_MAP = {"1️⃣":"1","2️⃣":"2","3️⃣":"3","4️⃣":"4"}
-
 def _normalize_keycaps(s: str) -> str:
     return "".join(KEYCAP_MAP.get(ch, ch) for ch in (s or ""))
 
@@ -596,6 +668,7 @@ def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_l
     except Exception:
         pass
 
+    # Feedback
     try:
         ctxs = []
         for ncol in ("ctx1","ctx2","ctx3","ctx4"):
@@ -624,12 +697,14 @@ def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_l
     except Exception:
         pass
 
+    # Timeline
     try:
         obs_add = [int(x) for x in final_seen.split("-") if x.isdigit()]
         append_seq(obs_add)
     except Exception:
         pass
 
+    # Hedge update — 4 especialistas (inclui IA local)
     try:
         true_first = None
         try:
@@ -641,7 +716,8 @@ def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_l
             post_e1 = _post_from_tail(tail_now, after=None)
             post_e2 = _post_freq_k(tail_now, K_SHORT)
             post_e3 = _post_freq_k(tail_now, K_LONG)
-            _hedge_update(true_first, post_e1, post_e2, post_e3)
+            post_e4 = _llm_probs_from_tail(tail_now) or {1:0.25,2:0.25,3:0.25,4:0.25}
+            _hedge_update4(true_first, post_e1, post_e2, post_e3, post_e4)
     except Exception:
         pass
 
@@ -720,7 +796,7 @@ async def webhook(token: str, request: Request):
 
     data = await request.json()
 
-    # DEDUPE por update_id (marca SEMPRE pra não reprocessar)
+    # DEDUPE por update_id
     upd_id = str(data.get("update_id", "")) if isinstance(data, dict) else ""
     if _is_processed(upd_id):
         return {"ok": True, "skipped": "duplicate_update"}
@@ -731,7 +807,6 @@ async def webhook(token: str, request: Request):
     if timeout_msg:
         await tg_send_text(TARGET_CHANNEL, timeout_msg)
 
-    # Suporte a canais e mensagens
     msg = data.get("channel_post") or data.get("message") \
         or data.get("edited_channel_post") or data.get("edited_message") or {}
 
@@ -799,7 +874,7 @@ async def webhook(token: str, request: Request):
             await tg_send_text(TARGET_CHANNEL, out_msg)
             pend = get_open_pending()
 
-        # FLUXO ESTRITO: se ainda existir pendente (só 1 ou 2 observados), NÃO abre novo.
+        # Fluxo estrito: se ainda existir pendente (1 ou 2 observados), NÃO abre novo.
         if pend:
             await tg_send_text(TARGET_CHANNEL, "⏳ Aguardando fechamento do sinal anterior…")
             return {"ok": True, "kept_open_waiting_close": True}
@@ -811,7 +886,7 @@ async def webhook(token: str, request: Request):
     after = parsed["after"]
     best, conf, samples, post, gap, reason = choose_single_number(after)
 
-    # (Gates desligados por ALWAYS_ENTER=True — não reduzimos sinais)
+    # Abertura (gates não bloqueiam; ALWAYS_ENTER=True)
     ctx1, ctx2, ctx3, ctx4 = _decision_context(after)
     opened = _open_pending_with_ctx(best, after, ctx1, ctx2, ctx3, ctx4)
     if not opened:
@@ -822,7 +897,7 @@ async def webhook(token: str, request: Request):
     aft_txt = f" após {after}" if after else ""
     ls = _get_loss_streak()
     txt = (
-        f"🎯 <b>Número seco (G0):</b> <b>{best}</b>\n"
+        f"🤖 <b>IA SUGERE</b> — <b>{best}</b>\n"
         f"🧩 <b>Padrão:</b> GEN{aft_txt}\n"
         f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples} | <b>gap≈</b>{gap*100:.1f}pp\n"
         f"🧠 <b>Modo:</b> {reason} | <b>streak RED:</b> {ls}"
