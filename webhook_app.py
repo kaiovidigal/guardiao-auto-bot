@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-webhook_app.py — v4.3.0 (Fluxo estrito + IA com cooldown adaptativo e 4 especialistas)
+webhook_app.py — v4.3.1 (Ajuste de Confiança para teste)
 ----------------------------------------------------------------------
 FastAPI + Telegram webhook que:
 - Lê mensagens do canal-fonte e publica um "número seco" (1..4) no canal-alvo.
@@ -38,31 +38,31 @@ if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
 # ========= App =========
-app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="4.3.0")
+app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="4.3.1")
 
 # ========= Parâmetros =========
 DECAY = 0.980
-W4, W3, W2, W1 = 0.35, 0.35, 0.20, 0.10 # Ajustado para focar em memória mais curta
-OBS_TIMEOUT_SEC = 240  # tempo para fechar por timeout só se já houver 2 observados
+W4, W3, W2, W1 = 0.35, 0.35, 0.20, 0.10
+OBS_TIMEOUT_SEC = 240
 
 # ======== Gates (LIGADOS para diminuir o LOSS) ========
-CONF_MIN    = 0.60
+CONF_MIN    = 0.55 # <<<<< AJUSTADO PARA TESTE >>>>>
 GAP_MIN     = 0.08
 H_MAX       = 0.80
 FREQ_WINDOW = 120
 
 # ======== Cooldown após RED ========
-COOLDOWN_N     = 3 # Aumentado para dar um tempo maior
+COOLDOWN_N     = 3
 CD_CONF_BOOST  = 0.04
 CD_GAP_BOOST   = 0.03
 
 # ======== Modo "sempre entrar" (DESLIGADO para filtrar sinais) ========
-ALWAYS_ENTER = False  # <<<<<<<<<<<<<<<<<<<<<<
+ALWAYS_ENTER = False
 
 # ======== Online Learning (feedback) ========
-FEED_BETA   = 0.55 # Aumentado para aprender mais rápido
-FEED_POS    = 1.1  # Aumentado
-FEED_NEG    = 1.2  # Aumentado - Punição base
+FEED_BETA   = 0.55
+FEED_POS    = 1.1
+FEED_NEG    = 1.2
 FEED_DECAY  = 0.995
 WF4, WF3, WF2, WF1 = W4, W3, W2, W1
 
@@ -70,7 +70,7 @@ WF4, WF3, WF2, WF1 = W4, W3, W2, W1
 GAP_SOFT = 0.010
 
 # ======== Ensemble Hedge ========
-HEDGE_ETA = 0.8 # Aumentado para se adaptar mais rápido
+HEDGE_ETA = 0.8
 K_SHORT   = 60
 K_LONG    = 300
 
@@ -184,7 +184,6 @@ def migrate_db():
     if not row:
         cur.execute("INSERT INTO expert_w (id, w1, w2, w3, w4) VALUES (1, 1.0, 1.0, 1.0, 1.0)")
     else:
-        # Migração: adiciona w4 se não existir
         if not _column_exists(con, 'expert_w', 'w4'):
             cur.execute("ALTER TABLE expert_w ADD COLUMN w4 REAL DEFAULT 1.0")
     con.commit(); con.close()
@@ -418,28 +417,24 @@ def _post_trend_analysis(tail: List[int]) -> Dict[int, float]:
     scores = {c: 0.25 for c in cands}
     if len(tail) < 3: return scores
 
-    # Análise da tendência mais recente (últimos 3-4 números)
     last_4 = tail[-4:] if len(tail) >= 4 else tail
 
-    # Padrão de aumento: 1, 2, 3...
     if all(last_4[i] < last_4[i+1] for i in range(len(last_4)-1)):
         next_num = last_4[-1] + 1
         if next_num in cands:
             scores = {c: 0.10 for c in cands}
             scores[next_num] = 0.70
 
-    # Padrão de queda: 4, 3, 2...
     elif all(last_4[i] > last_4[i+1] for i in range(len(last_4)-1)):
         next_num = last_4[-1] - 1
         if next_num in cands:
             scores = {c: 0.10 for c in cands}
             scores[next_num] = 0.70
             
-    # Padrão de paridade (par/ímpar)
     elif len(last_4) >= 3:
         is_even = lambda n: n % 2 == 0
         patt = [is_even(n) for n in last_4]
-        if all(p == patt[0] for p in patt): # Todos pares ou todos ímpares
+        if all(p == patt[0] for p in patt):
             scores = {c: 0.10 for c in cands}
             for c in cands:
                 if is_even(c) == patt[0]:
