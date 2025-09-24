@@ -1,26 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-webhook_app.py — v5.0.0
----------------------------------------------
-FastAPI + Telegram webhook com fluxo de sinal robusto:
-
-• Lê posts do canal-fonte (ou mensagens) e publica "número seco" (1..4) no canal-alvo.
-• Fluxo ESTRITO: nunca abre novo sinal enquanto existir um aberto.
-• Gales G1/G2 com fechamento GREEN/LOSS (ou por timeout).
-• Aprendizado online limpo (feedback) + Hedge (4 especialistas) realmente atualizando pesos.
-• Anti-tilt/cooldown configuráveis e gates de qualidade (confiança, gap, entropia).
-• Deduplicação por update_id em TODOS os caminhos.
-• Suporte a updates de canal (channel_post) e chat (message).
-• Mensagens de "ignorado" controladas por DEBUG_MSG (sem poluir canal).
-
+webhook_app.py — v4.3.0 (Fluxo estrito + Anti-tilt sem reduzir sinais + robustez de canal)
+------------------------------------------------------------------------------------------
+FastAPI + Telegram webhook que:
+- Lê mensagens do canal-fonte e publica um "número seco" (1..4) no canal-alvo.
+- Fluxo ESTRITO: nunca abre novo sinal enquanto o anterior não fechou de verdade.
+- Acompanha gales (G1/G2) e fecha robusto (GREEN/LOSS) por observados.
+- Aprende online com feedback: penaliza erro e REFORÇA o número vencedor real.
+- Usa ENSEMBLE (Hedge) de 3 especialistas (n-grama+feedback, freq curta, freq longa).
+- Consciência de sequência (loss_streak) e jogada anti-tilt (sem reduzir volume).
+- Dedupe por update_id, abertura transacional, timeout (fecha com "X" só por tempo quando já há 2 observados).
+- Suporte a updates de canais (channel_post) e mensagens (message). Regex tolerante (keycaps 1️⃣ 2️⃣ 3️⃣ 4️⃣).
+- BYPASS_SOURCE opcional para diagnosticar sem filtrar canal-fonte. DEBUG_MSG para logs no alvo.
 ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
-ENV opcionais:    TARGET_CHANNEL, SOURCE_CHANNEL, DB_PATH, DEBUG_MSG
+ENV opcionais:    TARGET_CHANNEL, SOURCE_CHANNEL, DB_PATH, DEBUG_MSG, BYPASS_SOURCE
 Webhook:          POST /webhook/{WEBHOOK_TOKEN}
 """
 import os, re, time, sqlite3, math
 from contextlib import contextmanager
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timezone
 
 import httpx
@@ -31,8 +30,9 @@ TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
 WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1002796105884").strip()
 SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "").strip()  # se vazio, não filtra
-DB_PATH        = (os.getenv("DB_PATH", "/var/data/data.db").strip() or "/var/data/data.db")
-DEBUG_MSG      = os.getenv("DEBUG_MSG", "0").strip() in ("1", "true", "True", "yes", "YES")
+DB_PATH        = os.getenv("DB_PATH", "/var/data/data.db").strip() or "/var/data/data.db"
+DEBUG_MSG      = os.getenv("DEBUG_MSG", "0").strip() in ("1","true","True","yes","YES")
+BYPASS_SOURCE  = os.getenv("BYPASS_SOURCE", "0").strip() in ("1","true","True","yes","YES")
 TELEGRAM_API   = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 if not TG_BOT_TOKEN:
@@ -41,34 +41,39 @@ if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
 # ========= App =========
-app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="5.0.0")
+app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="4.3.0")
 
 # ========= Parâmetros =========
 DECAY = 0.980
-W4, W3, W2, W1 = 0.35, 0.35, 0.20, 0.10
-OBS_TIMEOUT_SEC = 240
+W4, W3, W2, W1 = 0.42, 0.30, 0.18, 0.10
+OBS_TIMEOUT_SEC = 240  # fecha por timeout só se já houver 2 observados
 
-# ======== Gates (ajuste fino) ========
-CONF_MIN    = 0.40      # subir/baixar agressividade
-GAP_MIN     = 0.10
-H_MAX       = 0.80      # entropia normalizada (base 4); >H_MAX = muito difuso
+# ======== Gates (DESLIGADOS para não reduzir sinais) ========
+CONF_MIN    = 0.55
+GAP_MIN     = 0.08
+H_MAX       = 0.80
 FREQ_WINDOW = 120
 
-# ======== Cooldown / Anti-tilt ========
-COOLDOWN_N       = 3    # após LOSS
-ANTI_TILT_ON     = True
-ANTI_TILT_MAXRED = 3    # não abre novo se loss_streak >= 3
+# ======== Cooldown após RED (mantemos estado, mas não cortamos abertura por gates) ========
+COOLDOWN_N     = 2
+CD_CONF_BOOST  = 0.04
+CD_GAP_BOOST   = 0.03
 
-# ======== Modo "sempre entrar" ========
-ALWAYS_ENTER = False
+# ======== Modo "sempre entrar" (NÃO reduzir volume de sinais) ========
+ALWAYS_ENTER = True  # mantém volume
 
 # ======== Online Learning (feedback) ========
-FEED_POS    = 1.1
-FEED_NEG    = 1.2
-FEED_DECAY  = 0.995     # esquecimento suave
+FEED_BETA   = 0.45
+FEED_POS    = 1.0
+FEED_NEG    = 1.0
+FEED_DECAY  = 0.995
+WF4, WF3, WF2, WF1 = W4, W3, W2, W1
+
+# ======== Empate técnico (legado) ========
+GAP_SOFT = 0.010
 
 # ======== Ensemble Hedge ========
-HEDGE_ETA = 0.8
+HEDGE_ETA = 0.6
 K_SHORT   = 60
 K_LONG    = 300
 
@@ -83,18 +88,8 @@ def ts_str(ts=None) -> str:
 def _entropy_norm(post: Dict[int, float]) -> float:
     """Entropia normalizada (base 4). 0=concentrada, 1=uniforme."""
     eps = 1e-12
-    return -sum((p+eps) * math.log(p+eps, 4) for p in post.values())
-
-def _escape_md(s: str) -> str:
-    # Escape básico para parse_mode=Markdown
-    return re.sub(r'([_*`])', r'\\\1', s or "")
-
-def _is_valid_nxt(n: Any) -> bool:
-    try:
-        n = int(n)
-    except Exception:
-        return False
-    return n in (1, 2, 3, 4)
+    H = -sum((p+eps) * math.log(p+eps, 4) for p in post.values())
+    return H
 
 # ========= DB helpers =========
 def _connect() -> sqlite3.Connection:
@@ -105,6 +100,10 @@ def _connect() -> sqlite3.Connection:
     con.execute("PRAGMA synchronous=NORMAL;")
     con.execute("PRAGMA busy_timeout=10000;")
     return con
+
+def _column_exists(con: sqlite3.Connection, table: str, col: str) -> bool:
+    r = con.execute(f"PRAGMA table_info({table})").fetchall()
+    return any((row["name"] if isinstance(row, sqlite3.Row) else row[1]) == col for row in r)
 
 @contextmanager
 def _tx():
@@ -120,72 +119,73 @@ def _tx():
         con.close()
 
 def migrate_db():
-    with _tx() as con:
-        cur = con.cursor()
-        # timeline
-        cur.execute("""CREATE TABLE IF NOT EXISTS timeline (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at INTEGER NOT NULL,
-            number INTEGER NOT NULL
-        )""")
-        # ngram
-        cur.execute("""CREATE TABLE IF NOT EXISTS ngram (
-            n INTEGER NOT NULL, ctx TEXT NOT NULL, nxt INTEGER NOT NULL, w REAL NOT NULL,
-            PRIMARY KEY (n, ctx, nxt)
-        )""")
-        # pending
-        cur.execute("""CREATE TABLE IF NOT EXISTS pending (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at INTEGER,
-            suggested INTEGER,
-            stage INTEGER DEFAULT 0,
-            open INTEGER DEFAULT 1,
-            seen TEXT,
-            opened_at INTEGER,
-            "after" INTEGER,
-            ctx1 INTEGER, ctx2 INTEGER, ctx3 INTEGER, ctx4 INTEGER
-        )""")
-        # score
-        cur.execute("""CREATE TABLE IF NOT EXISTS score (
-            id INTEGER PRIMARY KEY CHECK (id=1),
-            green INTEGER DEFAULT 0,
-            loss  INTEGER DEFAULT 0
-        )""")
-        # init row
-        row = cur.execute("SELECT 1 FROM score WHERE id=1").fetchone()
-        if not row:
-            cur.execute("INSERT INTO score (id, green, loss) VALUES (1,0,0)")
-        # feedback
-        cur.execute("""CREATE TABLE IF NOT EXISTS feedback (
-            n INTEGER NOT NULL, ctx TEXT NOT NULL, nxt INTEGER NOT NULL, w REAL NOT NULL,
-            PRIMARY KEY (n, ctx, nxt)
-        )""")
-        # processed (dedupe)
-        cur.execute("""CREATE TABLE IF NOT EXISTS processed (
-            update_id TEXT PRIMARY KEY,
-            seen_at   INTEGER NOT NULL
-        )""")
-        # state (cooldown + loss_streak)
-        cur.execute("""CREATE TABLE IF NOT EXISTS state (
-            id INTEGER PRIMARY KEY CHECK (id=1),
-            cooldown_left INTEGER DEFAULT 0,
-            loss_streak   INTEGER DEFAULT 0
-        )""")
-        row = cur.execute("SELECT 1 FROM state WHERE id=1").fetchone()
-        if not row:
-            cur.execute("INSERT INTO state (id, cooldown_left, loss_streak) VALUES (1,0,0)")
-        # expert weights (Hedge)
-        cur.execute("""CREATE TABLE IF NOT EXISTS expert_w (
-            id INTEGER PRIMARY KEY CHECK (id=1),
-            w1 REAL NOT NULL,
-            w2 REAL NOT NULL,
-            w3 REAL NOT NULL,
-            w4 REAL NOT NULL
-        )""")
-        row = cur.execute("SELECT 1 FROM expert_w WHERE id=1").fetchone()
-        if not row:
-            cur.execute("INSERT INTO expert_w (id, w1, w2, w3, w4) VALUES (1,1.0,1.0,1.0,1.0)")
-
+    con = _connect(); cur = con.cursor()
+    # timeline
+    cur.execute("""CREATE TABLE IF NOT EXISTS timeline (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at INTEGER NOT NULL,
+        number INTEGER NOT NULL
+    )""")
+    # ngram
+    cur.execute("""CREATE TABLE IF NOT EXISTS ngram (
+        n INTEGER NOT NULL, ctx TEXT NOT NULL, nxt INTEGER NOT NULL, w REAL NOT NULL,
+        PRIMARY KEY (n, ctx, nxt)
+    )""")
+    # pending
+    cur.execute("""CREATE TABLE IF NOT EXISTS pending (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at INTEGER,
+        suggested INTEGER,
+        stage INTEGER DEFAULT 0,
+        open INTEGER DEFAULT 1,
+        seen TEXT,
+        opened_at INTEGER,
+        "after" INTEGER,
+        ctx1 TEXT, ctx2 TEXT, ctx3 TEXT, ctx4 TEXT
+    )""")
+    # score
+    cur.execute("""CREATE TABLE IF NOT EXISTS score (
+        id INTEGER PRIMARY KEY CHECK (id=1),
+        green INTEGER DEFAULT 0,
+        loss  INTEGER DEFAULT 0
+    )""")
+    row = con.execute("SELECT 1 FROM score WHERE id=1").fetchone()
+    if not row:
+        cur.execute("INSERT INTO score (id, green, loss) VALUES (1,0,0)")
+    # feedback
+    cur.execute("""CREATE TABLE IF NOT EXISTS feedback (
+        n INTEGER NOT NULL, ctx TEXT NOT NULL, nxt INTEGER NOT NULL, w REAL NOT NULL,
+        PRIMARY KEY (n, ctx, nxt)
+    )""")
+    # processed (dedupe)
+    cur.execute("""CREATE TABLE IF NOT EXISTS processed (
+        update_id TEXT PRIMARY KEY,
+        seen_at   INTEGER NOT NULL
+    )""")
+    # state (cooldown + loss_streak)
+    cur.execute("""CREATE TABLE IF NOT EXISTS state (
+        id INTEGER PRIMARY KEY CHECK (id=1),
+        cooldown_left INTEGER DEFAULT 0,
+        loss_streak   INTEGER DEFAULT 0
+    )""")
+    row = con.execute("SELECT 1 FROM state WHERE id=1").fetchone()
+    if not row:
+        cur.execute("INSERT INTO state (id, cooldown_left, loss_streak) VALUES (1,0,0)")
+    try:
+        cur.execute("ALTER TABLE state ADD COLUMN loss_streak INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    # expert weights (Hedge)
+    cur.execute("""CREATE TABLE IF NOT EXISTS expert_w (
+        id INTEGER PRIMARY KEY CHECK (id=1),
+        w1 REAL NOT NULL,
+        w2 REAL NOT NULL,
+        w3 REAL NOT NULL
+    )""")
+    row = con.execute("SELECT 1 FROM expert_w WHERE id=1").fetchone()
+    if not row:
+        cur.execute("INSERT INTO expert_w (id, w1, w2, w3) VALUES (1, 1.0, 1.0, 1.0)")
+    con.commit(); con.close()
 migrate_db()
 
 def _exec_write(sql: str, params: tuple=()):
@@ -195,15 +195,17 @@ def _exec_write(sql: str, params: tuple=()):
                 con.execute(sql, params)
             return
         except sqlite3.OperationalError as e:
-            if "locked" in str(e).lower() or "busy" in str(e).lower():
-                time.sleep(0.25*(attempt+1)); continue
+            emsg = str(e).lower()
+            if "locked" in emsg or "busy" in emsg:
+                time.sleep(0.25*(attempt+1))
+                continue
             raise
 
 # ========= Dedupe =========
 def _is_processed(update_id: str) -> bool:
     if not update_id: return False
     con = _connect()
-    row = con.execute("SELECT 1 FROM processed WHERE update_id=?", (str(update_id),)).fetchone()
+    row = con.execute("SELECT 1 FROM processed WHERE update_id=?", (update_id,)).fetchone()
     con.close()
     return bool(row)
 
@@ -228,7 +230,9 @@ def score_text() -> str:
     con = _connect()
     row = con.execute("SELECT green, loss FROM score WHERE id=1").fetchone()
     con.close()
-    g, l = (int(row["green"]), int(row["loss"])) if row else (0, 0)
+    if not row:
+        return "0 GREEN × 0 LOSS — 0.0%"
+    g, l = int(row["green"]), int(row["loss"])
     total = g + l
     acc = (g/total*100.0) if total > 0 else 0.0
     return f"{g} GREEN × {l} LOSS — {acc:.1f}%"
@@ -263,7 +267,8 @@ def _bump_loss_streak(reset: bool):
     if reset:
         _set_loss_streak(0)
     else:
-        _set_loss_streak(_get_loss_streak() + 1)
+        cur = _get_loss_streak()
+        _set_loss_streak(cur + 1)
 
 # ========= N-gram & Feedback =========
 def timeline_size() -> int:
@@ -323,358 +328,512 @@ def _prob_from_ngrams(ctx: List[int], cand: int) -> float:
 def _ctx_to_key(ctx: List[int]) -> str:
     return ",".join(str(x) for x in ctx) if ctx else ""
 
-def _feedback_upsert(n:int, ctx_key:str, nxt:int, factor: float) -> None:
+def _feedback_upsert(n:int, ctx_key:str, nxt:int, delta:float):
     with _tx() as con:
+        con.execute("UPDATE feedback SET w = w * ?", (FEED_DECAY,))
         con.execute("""
           INSERT INTO feedback (n, ctx, nxt, w)
           VALUES (?,?,?,?)
-          ON CONFLICT(n, ctx, nxt) DO UPDATE SET w = w * excluded.w
-        """, (n, ctx_key, nxt, float(factor)))
+          ON CONFLICT(n, ctx, nxt) DO UPDATE SET w = w + excluded.w
+        """, (n, ctx_key, int(nxt), float(delta)))
 
-def _feedback_apply(ctx: List[int], nxt: int) -> None:
-    if not _is_valid_nxt(nxt): return
-    if len(ctx) >= 4:
-        _feedback_upsert(4, _ctx_to_key(ctx[-4:]), nxt, FEED_POS)
-    if len(ctx) >= 3:
-        _feedback_upsert(3, _ctx_to_key(ctx[-3:]), nxt, FEED_POS)
-    if len(ctx) >= 2:
-        _feedback_upsert(2, _ctx_to_key(ctx[-2:]), nxt, FEED_POS)
-    _feedback_upsert(1, _ctx_to_key([]), nxt, FEED_POS)
-
-def _feedback_penalize(ctx: List[int], nxt: int) -> None:
-    if not _is_valid_nxt(nxt): return
-    if len(ctx) >= 4:
-        _feedback_upsert(4, _ctx_to_key(ctx[-4:]), nxt, 1.0/FEED_NEG)
-    if len(ctx) >= 3:
-        _feedback_upsert(3, _ctx_to_key(ctx[-3:]), nxt, 1.0/FEED_NEG)
-    if len(ctx) >= 2:
-        _feedback_upsert(2, _ctx_to_key(ctx[-2:]), nxt, 1.0/FEED_NEG)
-    _feedback_upsert(1, _ctx_to_key([]), nxt, 1.0/FEED_NEG)
-
-def _decay_feedback(decay: float=FEED_DECAY):
-    _exec_write("UPDATE feedback SET w = w * ? WHERE w > 0.01", (decay,))
-
-# ========= Expert Weights (Hedge) =========
-def _get_expert_w() -> Tuple[float, float, float, float]:
+def _feedback_prob(n:int, ctx: List[int], cand:int) -> float:
+    if not ctx: return 0.0
+    ctx_key = _ctx_to_key(ctx)
     con = _connect()
-    row = con.execute("SELECT w1, w2, w3, w4 FROM expert_w WHERE id=1").fetchone()
+    row_tot = con.execute("SELECT SUM(w) AS s FROM feedback WHERE n=? AND ctx=?", (n, ctx_key)).fetchone()
+    tot = (row_tot["s"] or 0.0) if row_tot else 0.0
+    if tot <= 0:
+        con.close(); return 0.0
+    row_c = con.execute("SELECT w FROM feedback WHERE n=? AND ctx=? AND nxt=?", (n, ctx_key, int(cand))).fetchone()
+    w = (row_c["w"] or 0.0) if row_c else 0.0
     con.close()
-    return (row["w1"], row["w2"], row["w3"], row["w4"]) if row else (1.0, 1.0, 1.0, 1.0)
+    tot = abs(tot)
+    return max(0.0, w) / (tot if tot > 0 else 1e-9)
 
-def _update_expert_w(outcome: str, experts: Dict[str, int]):
-    if not experts: return
-    with _tx() as con:
-        row = con.execute("SELECT w1, w2, w3, w4 FROM expert_w WHERE id=1").fetchone()
-        w1, w2, w3, w4 = (row["w1"], row["w2"], row["w3"], row["w4"]) if row else (1.0,1.0,1.0,1.0)
-
-        # Reforça o especialista que coincidiu com o sugerido (e_winner)
-        def upd(w, e):
-            return w * (1 + HEDGE_ETA) if e == experts.get("e_winner") else w * (1 - HEDGE_ETA)
-
-        w1 = upd(w1, experts.get("e1"))
-        w2 = upd(w2, experts.get("e2"))
-        w3 = upd(w3, experts.get("e3"))
-        w4 = upd(w4, experts.get("e4"))
-
-        # Normaliza soma constante (4.0)
-        total = max(1e-9, (w1 + w2 + w3 + w4))
-        k = 4.0 / total
-        w1, w2, w3, w4 = w1*k, w2*k, w3*k, w4*k
-
-        con.execute("UPDATE expert_w SET w1=?, w2=?, w3=?, w4=? WHERE id=1",
-                    (w1, w2, w3, w4))
-
-# ========= Business Logic =========
-def _get_last_open_signal() -> Optional[Dict]:
-    con = _connect()
-    row = con.execute("SELECT * FROM pending WHERE open=1 ORDER BY created_at DESC LIMIT 1").fetchone()
-    con.close()
-    return dict(row) if row else None
-
-def _reconstruct_ctx_experts(p: Dict) -> Tuple[List[int], Dict[str, int]]:
-    ctx = [int(x) for x in (p.get("ctx1"), p.get("ctx2"), p.get("ctx3"), p.get("ctx4")) if _is_valid_nxt(x)]
-    experts = {
-        "e1": p.get("ctx1"),
-        "e2": p.get("ctx2"),
-        "e3": p.get("ctx3"),
-        "e4": p.get("ctx4"),
-        "e_winner": p.get("suggested"),
-    }
-    return ctx, experts
-
-def _close_signal(
-    signal_id: int,
-    outcome: str,
-    actual_number: int,
-    stage: int,
-    ctx: List[int],
-    experts: Dict[str, int],
-    suggested: int,
-):
-    _exec_write("UPDATE pending SET open=0, after=? WHERE id=?", (int(actual_number), signal_id))
-
-    # perda/ganho e streaks
-    is_green = outcome.upper() == "GREEN"
-    _bump_loss_streak(reset=is_green)
-    bump_score(outcome)
-
-    # feedback limpo
-    if is_green:
-        _feedback_apply(ctx, actual_number)           # reforça o real vencedor
+def _decision_context(after: Optional[int]) -> Tuple[List[int], List[int], List[int], List[int]]:
+    tail = get_tail(400)
+    if tail and after is not None and after in tail:
+        idxs = [i for i,v in enumerate(tail) if v == after]
+        i = idxs[-1]
+        ctx1 = tail[max(0,i):i+1]
+        ctx2 = tail[max(0,i-1):i+1] if i-1>=0 else []
+        ctx3 = tail[max(0,i-2):i+1] if i-2>=0 else []
+        ctx4 = tail[max(0,i-3):i+1] if i-3>=0 else []
     else:
-        _feedback_penalize(ctx, suggested)            # penaliza o sugerido
-        if _is_valid_nxt(actual_number):
-            _feedback_penalize(ctx, actual_number)    # penaliza também o real se fizer sentido
+        ctx4 = tail[-4:] if len(tail)>=4 else []
+        ctx3 = tail[-3:] if len(tail)>=3 else []
+        ctx2 = tail[-2:] if len(tail)>=2 else []
+        ctx1 = tail[-1:] if len(tail)>=1 else []
+    return ctx1, ctx2, ctx3, ctx4
 
-    # hedge
-    _update_expert_w(outcome, experts)
+def _post_from_tail(tail: List[int], after: Optional[int]) -> Dict[int, float]:
+    """Distribuição E1: n-grama + feedback."""
+    cands = [1,2,3,4]
+    scores = {c: 0.0 for c in cands}
+    if not tail:
+        return {c: 0.25 for c in cands}
+    if after is not None and after in tail:
+        idxs = [i for i,v in enumerate(tail) if v == after]
+        i = idxs[-1]
+        ctx1 = tail[max(0,i):i+1]
+        ctx2 = tail[max(0,i-1):i+1] if i-1>=0 else []
+        ctx3 = tail[max(0,i-2):i+1] if i-2>=0 else []
+        ctx4 = tail[max(0,i-3):i+1] if i-3>=0 else []
+    else:
+        ctx4 = tail[-4:] if len(tail)>=4 else []
+        ctx3 = tail[-3:] if len(tail)>=3 else []
+        ctx2 = tail[-2:] if len(tail)>=2 else []
+        ctx1 = tail[-1:] if len(tail)>=1 else []
+    for c in cands:
+        s = 0.0
+        if len(ctx4)==4: s += W4 * _prob_from_ngrams(ctx4[:-1], c)
+        if len(ctx3)==3: s += W3 * _prob_from_ngrams(ctx3[:-1], c)
+        if len(ctx2)==2: s += W2 * _prob_from_ngrams(ctx2[:-1], c)
+        if len(ctx1)==1: s += W1 * _prob_from_ngrams(ctx1[:-1], c)
+        if len(ctx4)==4: s += FEED_BETA * WF4 * _feedback_prob(4, ctx4[:-1], c)
+        if len(ctx3)==3: s += FEED_BETA * WF3 * _feedback_prob(3, ctx3[:-1], c)
+        if len(ctx2)==2: s += FEED_BETA * WF2 * _feedback_prob(2, ctx2[:-1], c)
+        if len(ctx1)==1: s += FEED_BETA * WF1 * _feedback_prob(1, ctx1[:-1], c)
+        scores[c] = s
+    tot = sum(scores.values()) or 1e-9
+    return {k: v/tot for k,v in scores.items()}
 
-    # cooldown
-    if outcome.upper() == "LOSS":
-        _set_cooldown(COOLDOWN_N)
+# ========= Ensemble (Hedge) =========
+def _norm_dict(d: Dict[int,float]) -> Dict[int,float]:
+    s = sum(d.values()) or 1e-9
+    return {k: v/s for k,v in d.items()}
 
-async def _send_telegram(text: str, channel_id: str = TARGET_CHANNEL):
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                f"{TELEGRAM_API}/sendMessage",
-                json={"chat_id": channel_id, "text": _escape_md(text), "parse_mode": "Markdown"}
-            )
-            resp.raise_for_status()
-            return resp.json()
-    except Exception as e:
-        print(f"Erro ao enviar mensagem para o Telegram: {e}")
+def _post_freq_k(tail: List[int], k: int) -> Dict[int,float]:
+    if not tail: return {1:0.25,2:0.25,3:0.25,4:0.25}
+    win = tail[-k:] if len(tail) >= k else tail
+    tot = max(1, len(win))
+    return _norm_dict({c: win.count(c)/tot for c in [1,2,3,4]})
+
+def _get_expert_w():
+    con = _connect()
+    row = con.execute("SELECT w1,w2,w3 FROM expert_w WHERE id=1").fetchone()
+    con.close()
+    if not row: return (1.0, 1.0, 1.0)
+    return float(row["w1"]), float(row["w2"]), float(row["w3"])
+
+def _set_expert_w(w1, w2, w3):
+    _exec_write("UPDATE expert_w SET w1=?, w2=?, w3=? WHERE id=1", (float(w1), float(w2), float(w3)))
+
+def _hedge_blend(p1:Dict[int,float], p2:Dict[int,float], p3:Dict[int,float]):
+    w1, w2, w3 = _get_expert_w()
+    s = (w1 + w2 + w3) or 1e-9
+    w1, w2, w3 = (w1/s, w2/s, w3/s)
+    blended = {c: w1*p1.get(c,0)+w2*p2.get(c,0)+w3*p3.get(c,0) for c in [1,2,3,4]}
+    return _norm_dict(blended), (w1,w2,w3)
+
+def _hedge_update(true_c:int, p1:Dict[int,float], p2:Dict[int,float], p3:Dict[int,float]):
+    # perda = 1 - p(true); Hedge: w_i <- w_i * exp(-eta * (1 - p_i(true)))
+    w1, w2, w3 = _get_expert_w()
+    l1 = 1.0 - p1.get(true_c, 0.0)
+    l2 = 1.0 - p2.get(true_c, 0.0)
+    l3 = 1.0 - p3.get(true_c, 0.0)
+    from math import exp
+    w1n = w1 * exp(-HEDGE_ETA * (1.0 - l1))
+    w2n = w2 * exp(-HEDGE_ETA * (1.0 - l2))
+    w3n = w3 * exp(-HEDGE_ETA * (1.0 - l3))
+    s = (w1n + w2n + w3n) or 1e-9
+    _set_expert_w(w1n/s, w2n/s, w3n/s)
+
+# ========= Escolha (streak-aware, sem reduzir sinais) =========
+def _streak_adjust_choice(post:Dict[int,float], gap:float, ls:int) -> Tuple[int,str,Dict[int,float]]:
+    """
+    Ajusta a jogada quando há sequência de LOSS (anti-tilt), sem reduzir sinais.
+      - ls >= 2 e gap pequeno -> pode escolher o 2º mais provável.
+      - ls >= 3 -> mistura 30% da distribuição complementar (1 - p) para quebrar padrão.
+    """
+    reason = "IA"
+    ranking = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
+    best = ranking[0][0]
+
+    if ls >= 3:
+        comp = _norm_dict({c: max(1e-9, 1.0 - post[c]) for c in [1,2,3,4]})
+        post = _norm_dict({c: 0.7*post[c] + 0.3*comp[c] for c in [1,2,3,4]})
+        ranking = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
+        best = ranking[0][0]
+        reason = "IA_anti_tilt_mix"
+
+    if ls >= 2:
+        ranking = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
+        top2 = ranking[:2]
+        if len(top2) == 2 and gap < 0.05:  # 5pp
+            best = top2[1][0]
+            reason = "IA_runnerup_ls2"
+    return best, reason, post
+
+def choose_single_number(after: Optional[int]):
+    """
+    Retorna:
+      best(int), conf(float), samples(int), post(dict), gap(float), reason(str)
+    """
+    tail = get_tail(400)
+    post_e1 = _post_from_tail(tail, after)
+    post_e2 = _post_freq_k(tail, K_SHORT)
+    post_e3 = _post_freq_k(tail, K_LONG)
+    post, (w1,w2,w3) = _hedge_blend(post_e1, post_e2, post_e3)
+
+    ranking = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
+    top2 = ranking[:2]
+    gap = (top2[0][1] - top2[1][1]) if len(top2) >= 2 else ranking[0][1]
+    base_best = ranking[0][0]
+    conf = float(post[base_best])
+
+    ls = _get_loss_streak()
+    best, reason, post_adj = _streak_adjust_choice(post, gap, ls)
+    conf = float(post_adj[best])
+    r2 = sorted(post_adj.items(), key=lambda kv: kv[1], reverse=True)[:2]
+    gap2 = (r2[0][1] - r2[1][1]) if len(r2) == 2 else r2[0][1]
+    return best, conf, timeline_size(), post_adj, gap2, reason
+
+# ========= Parse (tolerante com keycaps) =========
+ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
+SEQ_RX   = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
+AFTER_RX = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
+GALE1_RX = re.compile(r"Estamos\s+no\s*1[ºo]\s*gale", re.I)
+GALE2_RX = re.compile(r"Estamos\s+no\s*2[ºo]\s*gale", re.I)
+
+GREEN_RX = re.compile(r"(?:\bgr+e+e?n\b|\bwin\b|✅)", re.I)
+LOSS_RX  = re.compile(r"(?:\blo+s+s?\b|\bred\b|❌|\bperdemos\b)", re.I)
+
+PAREN_GROUP_RX = re.compile(r"\(([^)]*)\)")
+ANY_14_RX      = re.compile(r"[1-4]")
+
+KEYCAP_MAP = {"1️⃣":"1","2️⃣":"2","3️⃣":"3","4️⃣":"4"}
+
+def _normalize_keycaps(s: str) -> str:
+    return "".join(KEYCAP_MAP.get(ch, ch) for ch in (s or ""))
+
+def parse_entry_text(text: str) -> Optional[Dict]:
+    t = _normalize_keycaps(re.sub(r"\s+", " ", text).strip())
+    if not ENTRY_RX.search(t):
         return None
+    mseq = SEQ_RX.search(t)
+    seq = []
+    if mseq:
+        parts = re.findall(r"[1-4]", _normalize_keycaps(mseq.group(1)))
+        seq = [int(x) for x in parts]
+    mafter = AFTER_RX.search(t)
+    after_num = int(mafter.group(1)) if mafter else None
+    return {"seq": seq, "after": after_num, "raw": t}
 
-def _get_prediction(tail: List[int]) -> Tuple[int, Dict[int, float], Dict]:
-    # Especialista 1: N-grama + pesos base
-    n_gram_probs = {1:0.0, 2:0.0, 3:0.0, 4:0.0}
-    ctx = tail[-4:]
-    # pesos por ordem (W4..W1) somam 1.0 — aqui usamos como "mistura por ordem"
-    for i in range(2, 6):
-        if len(ctx) >= i-1:
-            n_ctx = ctx[-(i-1):]
-            n_gram_probs[1] += _prob_from_ngrams(n_ctx, 1) * W4
-            n_gram_probs[2] += _prob_from_ngrams(n_ctx, 2) * W3
-            n_gram_probs[3] += _prob_from_ngrams(n_ctx, 3) * W2
-            n_gram_probs[4] += _prob_from_ngrams(n_ctx, 4) * W1
+def parse_close_numbers(text: str) -> List[int]:
+    t = _normalize_keycaps(re.sub(r"\s+", " ", text))
+    groups = PAREN_GROUP_RX.findall(t)
+    if groups:
+        last = groups[-1]
+        nums = re.findall(r"[1-4]", _normalize_keycaps(last))
+        return [int(x) for x in nums][:3]
+    nums = ANY_14_RX.findall(t)
+    return [int(x) for x in nums][:3]
 
-    # Especialista 2: Frequência Curta
-    k_short_tail = tail[-K_SHORT:] if len(tail) >= 1 else [1]
-    short_freq_probs = {n: k_short_tail.count(n) / len(k_short_tail) for n in range(1, 5)}
+# ========= Pending helpers =========
+def get_open_pending() -> Optional[sqlite3.Row]:
+    con = _connect()
+    row = con.execute("SELECT * FROM pending WHERE open=1 ORDER BY id DESC LIMIT 1").fetchone()
+    con.close()
+    return row
 
-    # Especialista 3: Frequência Longa
-    k_long_tail = tail[-K_LONG:] if len(tail) >= 1 else [1]
-    long_freq_probs = {n: k_long_tail.count(n) / len(k_long_tail) for n in range(1, 5)}
-
-    # Especialista 4: Tendência simples (cíclica)
-    trend_probs = {1:0.25, 2:0.25, 3:0.25, 4:0.25}
-    if len(tail) >= 3 and tail[-3:] == [1,2,3]: trend_probs[4] += 0.5
-    if len(tail) >= 3 and tail[-3:] == [2,3,4]: trend_probs[1] += 0.5
-    if len(tail) >= 3 and tail[-3:] == [3,4,1]: trend_probs[2] += 0.5
-    if len(tail) >= 3 and tail[-3:] == [4,1,2]: trend_probs[3] += 0.5
-
-    # Hedge
-    w1, w2, w3, w4 = _get_expert_w()
-
-    final_probs = {
-        1: n_gram_probs[1]*w1 + short_freq_probs[1]*w2 + long_freq_probs[1]*w3 + trend_probs[1]*w4,
-        2: n_gram_probs[2]*w1 + short_freq_probs[2]*w2 + long_freq_probs[2]*w3 + trend_probs[2]*w4,
-        3: n_gram_probs[3]*w1 + short_freq_probs[3]*w2 + long_freq_probs[3]*w3 + trend_probs[3]*w4,
-        4: n_gram_probs[4]*w1 + short_freq_probs[4]*w2 + long_freq_probs[4]*w3 + trend_probs[4]*w4,
-    }
-
-    # Normaliza
-    s = sum(final_probs.values())
-    if s > 0:
-        for k in final_probs:
-            final_probs[k] /= s
-    else:
-        final_probs = {1:0.25, 2:0.25, 3:0.25, 4:0.25}
-
-    suggested = max(final_probs, key=lambda x: final_probs[x])
-
-    experts = {
-        "e1": max(n_gram_probs, key=n_gram_probs.get),
-        "e2": max(short_freq_probs, key=short_freq_probs.get),
-        "e3": max(long_freq_probs, key=long_freq_probs.get),
-        "e4": max(trend_probs, key=trend_probs.get),
-        "e_winner": suggested
-    }
-    return suggested, final_probs, experts
-
-async def _process_incoming(msg: Dict, update_id: str):
-    # dedupe na entrada
-    if _is_processed(update_id):
-        print("update_id já processado, ignorando.")
-        return
-
-    # valida estrutura
-    if "chat" not in msg or "id" not in msg["chat"]:
-        _mark_processed(update_id); return
-
-    chat_id = str(msg["chat"]["id"])
-    text = (msg.get("text") or "").strip()
-
-    # filtra canal-fonte (se configurado)
-    if SOURCE_CHANNEL and chat_id != SOURCE_CHANNEL:
-        print(f"Ignorando mensagem de canal não-fonte: {chat_id}")
-        _mark_processed(update_id); return
-
-    last_signal = _get_last_open_signal()
-
-    # tenta extrair número 1..4
-    m = re.search(r"\b(1|2|3|4)\b", text)
-    if not m:
-        # Se não há número e existe sinal ABERTO, avalia timeout
-        if last_signal and last_signal["open"] and (now_ts() - int(last_signal["opened_at"])) > OBS_TIMEOUT_SEC:
-            await _send_telegram(f"Sinal `X` fechado por tempo. [ID:{last_signal['id']}]")
-            # fecha como LOSS por tempo (penaliza apenas o sugerido)
-            ctx, experts = _reconstruct_ctx_experts(last_signal)
-            s = int(last_signal["suggested"])
-            _close_signal(last_signal["id"], "LOSS", 0, int(last_signal["stage"]), ctx, experts, s)
-        _mark_processed(update_id)
-        return
-
-    # há número na mensagem
-    number_played = int(m.group(1))
-
-    # ========= Se há sinal aberto, processa fechamento / avanço de stage =========
-    if last_signal and last_signal["open"]:
-        suggested = int(last_signal["suggested"])
-        stage = int(last_signal["stage"])
-        seen = [int(s) for s in (last_signal["seen"].split(",") if last_signal["seen"] else [])]
-        if number_played in seen:
-            print(f"Número {number_played} já visto no sinal {last_signal['id']}, ignorando.")
-            _mark_processed(update_id); return
-
-        seen = sorted(set(seen + [number_played]))
-        _exec_write("UPDATE pending SET seen=? WHERE id=?", (",".join(str(s) for s in seen), last_signal["id"]))
-
-        ctx, experts = _reconstruct_ctx_experts(last_signal)
-
-        if number_played == suggested:
-            outcome = "GREEN"
-            msg_text = (
-                f"Sinal `VERDE` no {stage+1}º stage. 🎉\n\n"
-                f"Número: {suggested}\nObservado: {number_played}\n\n[ID:{last_signal['id']}]"
-            )
-            await _send_telegram(msg_text)
-            _close_signal(last_signal["id"], outcome, number_played, stage, ctx, experts, suggested)
-
-        elif stage == 0:
-            outcome = "G1"
-            _exec_write("UPDATE pending SET stage=1 WHERE id=?", (last_signal["id"],))
-            await _send_telegram(f"Sinal `G1` para {suggested}...\n\nÚltimo: {number_played}\n\n[ID:{last_signal['id']}]")
-
-        elif stage == 1:
-            outcome = "G2"
-            _exec_write("UPDATE pending SET stage=2 WHERE id=?", (last_signal["id"],))
-            await _send_telegram(f"Sinal `G2` para {suggested}...\n\nÚltimo: {number_played}\n\n[ID:{last_signal['id']}]")
-
-        else:  # stage >= 2
-            outcome = "LOSS"
-            await _send_telegram(
-                f"Sinal `LOSS`. 💔\n\nNúmero: {suggested}\nÚltimo: {number_played}\n\n[ID:{last_signal['id']}]"
-            )
-            _close_signal(last_signal["id"], outcome, number_played, stage, ctx, experts, suggested)
-
-        # registra observação na timeline e encerra
-        append_seq([number_played])
-        _mark_processed(update_id)
-        return
-
-    # ========= Não há sinal aberto: considera abrir um novo =========
-    append_seq([number_played])   # registramos o observado atual
-    tail = get_tail()
-
-    if len(tail) < 20:
-        if DEBUG_MSG:
-            await _send_telegram("Sequência muito curta, aguardando mais dados...")
-        _mark_processed(update_id); return
-
-    # cooldown
-    if _get_cooldown() > 0:
-        cd = _get_cooldown()
-        _dec_cooldown()
-        if DEBUG_MSG:
-            await _send_telegram(f"Em cooldown... faltam {cd} sinais.")
-        _mark_processed(update_id); return
-
-    # anti-tilt
-    if ANTI_TILT_ON and _get_loss_streak() >= ANTI_TILT_MAXRED and not ALWAYS_ENTER:
-        if DEBUG_MSG:
-            await _send_telegram(f"Sinal bloqueado por anti-tilt (streak RED={_get_loss_streak()}).")
-        _mark_processed(update_id); return
-
-    # predição
-    suggested, probs, experts = _get_prediction(tail)
-
-    # gates
-    conf = float(probs[suggested])
-    sorted_probs = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)
-    gap = (sorted_probs[0][1] - sorted_probs[1][1]) if len(sorted_probs) > 1 else 0.0
-    ent = _entropy_norm(probs)
-
-    is_low_conf = conf < CONF_MIN
-    is_low_gap = gap < GAP_MIN
-    is_high_entropy = ent > H_MAX
-
-    if not ALWAYS_ENTER and (is_low_conf or is_low_gap or is_high_entropy):
-        if DEBUG_MSG:
-            reason = "LOW_CONF" if is_low_conf else "LOW_GAP" if is_low_gap else "HIGH_ENTROPY"
-            info_msg = (
-                f"Sinal ignorado.\n"
-                f"Motivo: {reason}\n"
-                f"Conf: {conf*100:.2f}% | Gap: {gap*100:.1f}pp | H: {ent:.3f}\n"
-                f"Cooldown: {_get_cooldown()} | Streak RED: {_get_loss_streak()}"
-            )
-            await _send_telegram(info_msg)
-        _mark_processed(update_id)
-        return
-
-    # abrir sinal
+def set_stage(stage:int):
     with _tx() as con:
-        cur = con.execute("""
-            INSERT INTO pending (created_at, suggested, opened_at, stage, open, seen, ctx1, ctx2, ctx3, ctx4)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
-        """, (now_ts(), suggested, now_ts(), 0, 1, str(number_played),  # já marca o primeiro "visto"
-              experts["e1"], experts["e2"], experts["e3"], experts["e4"]))
-        signal_id = cur.lastrowid
+        con.execute("UPDATE pending SET stage=? WHERE open=1", (int(stage),))
 
-    msg_text = (
-        f"Sinal `NOVO` - `{suggested}`\n\n"
-        f"Conf: {conf*100:.2f}% | Gap: {gap*100:.1f}pp | H: {ent:.3f}\n"
-        f"Cooldown: {_get_cooldown()} | Streak RED: {_get_loss_streak()}\n"
-        f"Score: {score_text()}\n"
-        f"ID: {signal_id}"
+def _seen_list(row: sqlite3.Row) -> List[str]:
+    seen = (row["seen"] or "").strip()
+    return [s for s in seen.split("-") if s]
+
+def _seen_append(row: sqlite3.Row, new_items: List[str]):
+    cur_seen = _seen_list(row)
+    for it in new_items:
+        if len(cur_seen) >= 3: break
+        if it not in cur_seen:
+            cur_seen.append(it)
+    seen_txt = "-".join(cur_seen[:3])
+    with _tx() as con:
+        con.execute("UPDATE pending SET seen=? WHERE id=?", (seen_txt, int(row["id"])))
+
+def _stage_from_observed(suggested: int, obs: List[int]) -> Tuple[str, str]:
+    if not obs:
+        return ("LOSS", "G2")
+    if len(obs) >= 1 and obs[0] == suggested: return ("GREEN", "G0")
+    if len(obs) >= 2 and obs[1] == suggested: return ("GREEN", "G1")
+    if len(obs) >= 3 and obs[2] == suggested: return ("GREEN", "G2")
+    return ("LOSS", "G2")
+
+def _ngram_snapshot_text(suggested: int) -> str:
+    tail = get_tail(400)
+    post = _post_from_tail(tail, after=None)
+    def pct(x: float) -> str:
+        try: return f"{x*100:.1f}%"
+        except Exception: return "0.0%"
+    p1 = pct(post.get(1, 0.0)); p2 = pct(post.get(2, 0.0))
+    p3 = pct(post.get(3, 0.0)); p4 = pct(post.get(4, 0.0))
+    conf = pct(post.get(int(suggested), 0.0))
+    amostra = timeline_size()
+    line1 = f"📈 Amostra: {amostra} • Conf: {conf}"
+    line2 = f"🔎 E1(n-gram+fb): 1 {p1} | 2 {p2} | 3 {p3} | 4 {p4}"
+    return line1 + "\n\n" + line2
+
+def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_lbl: str, suggested: int):
+    our_num_display = suggested if outcome.upper()=="GREEN" else "X"
+
+    with _tx() as con:
+        con.execute("UPDATE pending SET open=0, seen=? WHERE id=?", (final_seen, int(row["id"])))
+
+    bump_score(outcome.upper())
+
+    try:
+        if outcome.upper() == "LOSS":
+            _set_cooldown(COOLDOWN_N)
+            _bump_loss_streak(reset=False)
+        else:
+            _dec_cooldown()
+            _bump_loss_streak(reset=True)
+    except Exception:
+        pass
+
+    try:
+        ctxs = []
+        for ncol in ("ctx1","ctx2","ctx3","ctx4"):
+            v = (row[ncol] or "").strip()
+            ctx = [int(x) for x in v.split(",") if x.strip().isdigit()]
+            ctxs.append(ctx)
+        ctx1, ctx2, ctx3, ctx4 = ctxs
+
+        if outcome.upper() == "GREEN":
+            stage_weight = {"G0": 1.00, "G1": 0.65, "G2": 0.40}.get(stage_lbl, 0.50)
+            delta = FEED_POS * stage_weight
+            for (n,ctx) in [(1,ctx1),(2,ctx2),(3,ctx3),(4,ctx4)]:
+                if len(ctx)>=1:
+                    _feedback_upsert(n, _ctx_to_key(ctx[:-1]), suggested, delta)
+        else:
+            true_first = None
+            try:
+                true_first = next(int(x) for x in final_seen.split("-") if x.isdigit())
+            except StopIteration:
+                pass
+            for (n,ctx) in [(1,ctx1),(2,ctx2),(3,ctx3),(4,ctx4)]:
+                if len(ctx)>=1:
+                    _feedback_upsert(n, _ctx_to_key(ctx[:-1]), suggested, -1.5*FEED_NEG)
+                    if true_first is not None:
+                        _feedback_upsert(n, _ctx_to_key(ctx[:-1]), true_first, +1.2*FEED_POS)
+    except Exception:
+        pass
+
+    try:
+        obs_add = [int(x) for x in final_seen.split("-") if x.isdigit()]
+        append_seq(obs_add)
+    except Exception:
+        pass
+
+    try:
+        true_first = None
+        try:
+            true_first = next(int(x) for x in final_seen.split("-") if x.isdigit())
+        except StopIteration:
+            pass
+        if true_first is not None:
+            tail_now = get_tail(400)
+            post_e1 = _post_from_tail(tail_now, after=None)
+            post_e2 = _post_freq_k(tail_now, K_SHORT)
+            post_e3 = _post_freq_k(tail_now, K_LONG)
+            _hedge_update(true_first, post_e1, post_e2, post_e3)
+    except Exception:
+        pass
+
+    snapshot = _ngram_snapshot_text(int(suggested))
+    msg = (
+        f"{'🟢' if outcome.upper()=='GREEN' else '🔴'} "
+        f"<b>{outcome.upper()}</b> — finalizado "
+        f"(<b>{stage_lbl}</b>, nosso={our_num_display}, observados={final_seen}).\n"
+        f"📊 Geral: {score_text()}\n\n"
+        f"{snapshot}"
     )
-    await _send_telegram(msg_text)
+    return msg
 
-    _mark_processed(update_id)
+def _maybe_close_by_timeout():
+    """Se passou muito tempo e temos EXATAMENTE 2 observados, completa com X e fecha."""
+    row = get_open_pending()
+    if not row: return None
+    opened_at = int(row["opened_at"] or row["created_at"] or now_ts())
+    if now_ts() - opened_at < OBS_TIMEOUT_SEC:
+        return None
+    seen_list = _seen_list(row)
+    if len(seen_list) == 2:
+        seen_list.append("X")
+        final_seen = "-".join(seen_list[:3])
+        suggested = int(row["suggested"] or 0)
+        obs_nums = [int(x) for x in seen_list if x.isdigit()]
+        outcome, stage_lbl = _stage_from_observed(suggested, obs_nums)
+        return _close_with_outcome(row, outcome, final_seen, stage_lbl, suggested)
+    return None
 
-# ========= Webhook =========
-@app.post("/webhook/{webhook_token}")
-async def handle_webhook(webhook_token: str, request: Request):
-    if webhook_token != WEBHOOK_TOKEN:
-        raise HTTPException(status_code=403, detail="Token de webhook inválido.")
+def close_pending(outcome:str):
+    """Compat: força fechar preenchendo X até 3 observados (não usada no fluxo normal)."""
+    row = get_open_pending()
+    if not row: return
+    seen_list = _seen_list(row)
+    while len(seen_list) < 3:
+        seen_list.append("X")
+    final_seen = "-".join(seen_list[:3])
+    suggested = int(row["suggested"] or 0)
+    obs_nums = [int(x) for x in seen_list if x.isdigit()]
+    outcome2, stage_lbl = _stage_from_observed(suggested, obs_nums)
+    return _close_with_outcome(row, outcome2, final_seen, stage_lbl, suggested)
 
-    body = await request.json()
-    update_id = body.get("update_id", "")
+def _open_pending_with_ctx(suggested:int, after:Optional[int], ctx1,ctx2,ctx3,ctx4) -> bool:
+    """Abertura transacional: só abre se não existir pendência aberta."""
+    with _tx() as con:
+        row = con.execute("SELECT 1 FROM pending WHERE open=1 LIMIT 1").fetchone()
+        if row:
+            return False
+        con.execute("""INSERT INTO pending (created_at, suggested, stage, open, seen, opened_at, after, ctx1, ctx2, ctx3, ctx4)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    (now_ts(), int(suggested), 0, 1, "", now_ts(), after,
+                     _ctx_to_key(ctx1), _ctx_to_key(ctx2), _ctx_to_key(ctx3), _ctx_to_key(ctx4)))
+        return True
 
-    # Telegram pode mandar "message" (DM/grupo) ou "channel_post" (canal).
-    message = body.get("message") or body.get("channel_post") or {}
+# ========= Telegram =========
+async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
+    if not TG_BOT_TOKEN: return
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            await client.post(f"{TELEGRAM_API}/sendMessage",
+                              json={"chat_id": chat_id, "text": text, "parse_mode": parse,
+                                    "disable_web_page_preview": True})
+    except Exception:
+        pass
 
-    if not update_id:
-        return {"ok": True, "message": "Sem update_id."}
+# ========= Rotas =========
+@app.get("/")
+async def root():
+    return {"ok": True, "service": "guardiao-auto-bot (GEN webhook)"}
 
-    if message:
-        await _process_incoming(message, update_id)
-    else:
-        # mesmo sem mensagem, marca e segue (evita retry loop)
-        _mark_processed(update_id)
+@app.post("/webhook/{token}")
+async def webhook(token: str, request: Request):
+    if token != WEBHOOK_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
 
-    # Decaimento suave do feedback (lazy)
-    _decay_feedback()
+    data = await request.json()
 
-    return {"ok": True}
+    # DEDUPE por update_id (marca SEMPRE pra não reprocessar)
+    upd_id = str(data.get("update_id", "")) if isinstance(data, dict) else ""
+    if _is_processed(upd_id):
+        return {"ok": True, "skipped": "duplicate_update"}
+    _mark_processed(upd_id)
+
+    # timeout pode fechar pendência antiga (apenas se já houver 2 observados)
+    timeout_msg = _maybe_close_by_timeout()
+    if timeout_msg:
+        await tg_send_text(TARGET_CHANNEL, timeout_msg)
+
+    # Suporte a canais e mensagens
+    msg = data.get("channel_post") or data.get("message") \
+        or data.get("edited_channel_post") or data.get("edited_message") or {}
+
+    text = (msg.get("text") or msg.get("caption") or "").strip()
+    chat = msg.get("chat") or {}
+    chat_id = str(chat.get("id") or "")
+
+    # Filtro de fonte (bypass para diagnóstico)
+    if SOURCE_CHANNEL and not BYPASS_SOURCE and chat_id != str(SOURCE_CHANNEL):
+        if DEBUG_MSG:
+            await tg_send_text(TARGET_CHANNEL, f"DEBUG: Ignorando chat {chat_id}. Fonte esperada: {SOURCE_CHANNEL}")
+        return {"ok": True, "skipped": "outro_chat"}
+    if not text:
+        return {"ok": True, "skipped": "sem_texto"}
+
+    # 1) Gales (informativo)
+    if GALE1_RX.search(text):
+        if get_open_pending():
+            set_stage(1)
+            await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>1° gale (G1)</b>")
+        return {"ok": True, "noted": "g1"}
+    if GALE2_RX.search(text):
+        if get_open_pending():
+            set_stage(2)
+            await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>2° gale (G2)</b>")
+        return {"ok": True, "noted": "g2"}
+
+    # 2) Fechamentos do fonte (GREEN/LOSS)
+    if GREEN_RX.search(text) or LOSS_RX.search(text):
+        pend = get_open_pending()
+        if pend:
+            nums = parse_close_numbers(text)  # pode ter 1, 2 ou 3
+            if nums:
+                _seen_append(pend, [str(n) for n in nums])
+                pend = get_open_pending()
+
+            seen_list = _seen_list(pend) if pend else []
+            if pend and len(seen_list) >= 3:
+                suggested = int(pend["suggested"] or 0)
+                obs_nums = [int(x) for x in seen_list if x.isdigit()]
+                outcome, stage_lbl = _stage_from_observed(suggested, obs_nums)
+                final_seen = "-".join(seen_list[:3])
+                out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
+                await tg_send_text(TARGET_CHANNEL, out_msg)
+                return {"ok": True, "closed": outcome.lower(), "seen": final_seen}
+        return {"ok": True, "noted_close": True}
+
+    # 3) Nova ENTRADA CONFIRMADA (Fluxo estrito)
+    parsed = parse_entry_text(text)
+    if not parsed:
+        if DEBUG_MSG:
+            await tg_send_text(TARGET_CHANNEL, "DEBUG: Mensagem não reconhecida como ENTRADA/FECHAMENTO.")
+        return {"ok": True, "skipped": "nao_eh_entrada_confirmada"}
+
+    pend = get_open_pending()
+    if pend:
+        # Se já houver 3 observados, fecha agora (fechamento real)
+        seen_list = _seen_list(pend)
+        if len(seen_list) >= 3:
+            suggested = int(pend["suggested"] or 0)
+            obs_nums = [int(x) for x in seen_list if x.isdigit()]
+            outcome, stage_lbl = _stage_from_observed(suggested, obs_nums)
+            final_seen = "-".join(seen_list[:3])
+            out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
+            await tg_send_text(TARGET_CHANNEL, out_msg)
+            pend = get_open_pending()
+
+        # FLUXO ESTRITO: se ainda existir pendente (só 1 ou 2 observados), NÃO abre novo.
+        if pend:
+            await tg_send_text(TARGET_CHANNEL, "⏳ Aguardando fechamento do sinal anterior…")
+            return {"ok": True, "kept_open_waiting_close": True}
+
+    # Alimenta memória com a sequência (se houver)
+    seq = parsed["seq"] or []
+    if seq: append_seq(seq)
+
+    after = parsed["after"]
+    best, conf, samples, post, gap, reason = choose_single_number(after)
+
+    # (Gates desligados por ALWAYS_ENTER=True — não reduzimos sinais)
+    ctx1, ctx2, ctx3, ctx4 = _decision_context(after)
+    opened = _open_pending_with_ctx(best, after, ctx1, ctx2, ctx3, ctx4)
+    if not opened:
+        if DEBUG_MSG:
+            await tg_send_text(TARGET_CHANNEL, "DEBUG: Já existe pending open — não abri novo.")
+        return {"ok": True, "skipped": "pending_already_open"}
+
+    aft_txt = f" após {after}" if after else ""
+    ls = _get_loss_streak()
+    txt = (
+        f"🎯 <b>Número seco (G0):</b> <b>{best}</b>\n"
+        f"🧩 <b>Padrão:</b> GEN{aft_txt}\n"
+        f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples} | <b>gap≈</b>{gap*100:.1f}pp\n"
+        f"🧠 <b>Modo:</b> {reason} | <b>streak RED:</b> {ls}"
+    )
+    await tg_send_text(TARGET_CHANNEL, txt)
+    return {"ok": True, "posted": True, "best": best, "conf": conf, "gap": gap, "samples": samples}
+
+# ===== Debug/help endpoint =====
+@app.get("/health")
+async def health():
+    pend = get_open_pending()
+    pend_open = bool(pend)
+    seen = (pend["seen"] if pend else "")
+    return {"ok": True, "db": DB_PATH, "pending_open": pend_open, "pending_seen": seen, "time": ts_str()}
