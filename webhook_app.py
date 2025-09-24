@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-webhook_app.py — v4.2.0 (Fluxo estrito + Anti-tilt sem reduzir sinais)
+webhook_app.py — v4.2.1 (Fluxo estrito + Anti-tilt com filtros otimizados)
 ----------------------------------------------------------------------
 FastAPI + Telegram webhook que:
 - Lê mensagens do canal-fonte e publica um "número seco" (1..4) no canal-alvo.
@@ -9,7 +9,7 @@ FastAPI + Telegram webhook que:
 - Acompanha gales (G1/G2) e fecha robusto (GREEN/LOSS) por observados.
 - Aprende online com feedback: penaliza erro e REFORÇA o número vencedor real.
 - Usa ENSEMBLE (Hedge) de 3 especialistas (n-grama+feedback, freq curta, freq longa).
-- Consciência de sequência (loss_streak) e jogada anti-tilt (sem reduzir volume).
+- Consciência de sequência (loss_streak) e jogada anti-tilt.
 - Dedupe por update_id, abertura transacional, timeout (fecha com "X" só por tempo quando já há 2 observados).
 
 ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
@@ -38,31 +38,31 @@ if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
 # ========= App =========
-app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="4.2.0")
+app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="4.2.1")
 
 # ========= Parâmetros =========
 DECAY = 0.980
-W4, W3, W2, W1 = 0.42, 0.30, 0.18, 0.10
+W4, W3, W2, W1 = 0.35, 0.35, 0.20, 0.10 # Ajustado para focar em memória mais curta
 OBS_TIMEOUT_SEC = 240  # tempo para fechar por timeout só se já houver 2 observados
 
-# ======== Gates (DESLIGADOS para não reduzir sinais) ========
-CONF_MIN    = 0.55
+# ======== Gates (LIGADOS para diminuir o LOSS) ========
+CONF_MIN    = 0.60
 GAP_MIN     = 0.08
 H_MAX       = 0.80
 FREQ_WINDOW = 120
 
-# ======== Cooldown após RED (mantemos estado, mas gates desligados) ========
-COOLDOWN_N     = 2
+# ======== Cooldown após RED ========
+COOLDOWN_N     = 3 # Aumentado para dar um tempo maior
 CD_CONF_BOOST  = 0.04
 CD_GAP_BOOST   = 0.03
 
-# ======== Modo "sempre entrar" (NÃO reduzir volume de sinais) ========
-ALWAYS_ENTER = True  # <<<<<<<<<<<<<<<<<<<<<<
+# ======== Modo "sempre entrar" (DESLIGADO para filtrar sinais) ========
+ALWAYS_ENTER = False  # <<<<<<<<<<<<<<<<<<<<<<
 
 # ======== Online Learning (feedback) ========
-FEED_BETA   = 0.45
-FEED_POS    = 1.0
-FEED_NEG    = 1.0
+FEED_BETA   = 0.55 # Aumentado para aprender mais rápido
+FEED_POS    = 1.1  # Aumentado
+FEED_NEG    = 1.2  # Aumentado
 FEED_DECAY  = 0.995
 WF4, WF3, WF2, WF1 = W4, W3, W2, W1
 
@@ -70,7 +70,7 @@ WF4, WF3, WF2, WF1 = W4, W3, W2, W1
 GAP_SOFT = 0.010
 
 # ======== Ensemble Hedge ========
-HEDGE_ETA = 0.6
+HEDGE_ETA = 0.8 # Aumentado para se adaptar mais rápido
 K_SHORT   = 60
 K_LONG    = 300
 
@@ -437,7 +437,7 @@ def _hedge_update(true_c:int, p1:Dict[int,float], p2:Dict[int,float], p3:Dict[in
     s = (w1n + w2n + w3n) or 1e-9
     _set_expert_w(w1n/s, w2n/s, w3n/s)
 
-# ========= Escolha (streak-aware, sem reduzir sinais) =========
+# ========= Escolha (streak-aware, com filtros) =========
 def _streak_adjust_choice(post:Dict[int,float], gap:float, ls:int) -> Tuple[int,str,Dict[int,float]]:
     """
     Ajusta a jogada quando há sequência de LOSS (anti-tilt), sem reduzir sinais.
@@ -462,7 +462,7 @@ def _streak_adjust_choice(post:Dict[int,float], gap:float, ls:int) -> Tuple[int,
         top2 = ranking[:2]
         if len(top2) == 2:
             # se gap pequeno, pega o segundo para quebrar sequência
-            if gap < 0.07:  # 5pp
+            if gap < 0.07:  # Ajustado
                 best = top2[1][0]
                 reason = "IA_runnerup_ls2"
     return best, reason, post
@@ -484,14 +484,31 @@ def choose_single_number(after: Optional[int]):
     gap = (top2[0][1] - top2[1][1]) if len(top2) >= 2 else ranking[0][1]
     base_best = ranking[0][0]
     conf = float(post[base_best])
+    H = _entropy_norm(post)
 
-    # ajuste anti-tilt sem reduzir sinais
+    # Cooldown
+    cooldown = _get_cooldown()
+    conf_min = CONF_MIN + CD_CONF_BOOST if cooldown > 0 else CONF_MIN
+    gap_min  = GAP_MIN + CD_GAP_BOOST if cooldown > 0 else GAP_MIN
+
+    # Filtros de entrada
+    if not ALWAYS_ENTER:
+        if conf < conf_min:
+            return None, conf, timeline_size(), post, gap, "LOW_CONF"
+        if gap < gap_min:
+            return None, conf, timeline_size(), post, gap, "LOW_GAP"
+        if H > H_MAX:
+            return None, conf, timeline_size(), post, gap, "HIGH_ENTROPY"
+        if cooldown > 0:
+            return None, conf, timeline_size(), post, gap, f"COOLDOWN_{cooldown}"
+
+    # ajuste anti-tilt
     ls = _get_loss_streak()
     best, reason, post_adj = _streak_adjust_choice(post, gap, ls)
     conf = float(post_adj[best])
-    # recalcula gap após ajuste
     r2 = sorted(post_adj.items(), key=lambda kv: kv[1], reverse=True)[:2]
     gap2 = (r2[0][1] - r2[1][1]) if len(r2) == 2 else r2[0][1]
+    
     return best, conf, timeline_size(), post_adj, gap2, reason
 
 # ========= Parse =========
@@ -751,12 +768,12 @@ async def webhook(token: str, request: Request):
     if GALE1_RX.search(text):
         if get_open_pending():
             set_stage(1)
-            await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>1° gale (G1)</b>")
+            await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>1° gale</b>")
         return {"ok": True, "noted": "g1"}
     if GALE2_RX.search(text):
         if get_open_pending():
             set_stage(2)
-            await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>2° gale (G2)</b>")
+            await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>2° gale</b>")
         return {"ok": True, "noted": "g2"}
 
     # 2) Fechamentos do fonte (GREEN/LOSS)
@@ -786,7 +803,6 @@ async def webhook(token: str, request: Request):
 
     pend = get_open_pending()
     if pend:
-        # Se já houver 3 observados, fecha agora (fechamento real)
         seen_list = _seen_list(pend)
         if len(seen_list) >= 3:
             suggested = int(pend["suggested"] or 0)
@@ -796,20 +812,28 @@ async def webhook(token: str, request: Request):
             out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
             await tg_send_text(TARGET_CHANNEL, out_msg)
             pend = get_open_pending()
-
-        # FLUXO ESTRITO: se ainda existir pendente (só 1 ou 2 observados), NÃO abre novo.
         if pend:
             await tg_send_text(TARGET_CHANNEL, "⏳ Aguardando fechamento do sinal anterior…")
             return {"ok": True, "kept_open_waiting_close": True}
 
-    # Alimenta memória com a sequência (se houver)
     seq = parsed["seq"] or []
     if seq: append_seq(seq)
 
     after = parsed["after"]
     best, conf, samples, post, gap, reason = choose_single_number(after)
 
-    # (Gates desligados por ALWAYS_ENTER=True — não reduzimos sinais)
+    if best is None:
+        ls = _get_loss_streak()
+        cooldown = _get_cooldown()
+        msg = (
+            f"🚫 <b>Sinal ignorado.</b>\n"
+            f"Motivo: <b>{reason}</b>\n"
+            f"📊 Conf: {conf*100:.2f}% | Gap: {gap*100:.1f}pp\n"
+            f"🧠 Cooldown: {cooldown} | Streak RED: {ls}"
+        )
+        await tg_send_text(TARGET_CHANNEL, msg)
+        return {"ok": True, "skipped": reason, "conf": conf, "gap": gap}
+    
     ctx1, ctx2, ctx3, ctx4 = _decision_context(after)
     opened = _open_pending_with_ctx(best, after, ctx1, ctx2, ctx3, ctx4)
     if not opened:
@@ -833,3 +857,4 @@ async def health():
     pend_open = bool(pend)
     seen = (pend["seen"] if pend else "")
     return {"ok": True, "db": DB_PATH, "pending_open": pend_open, "pending_seen": seen, "time": ts_str()}
+
