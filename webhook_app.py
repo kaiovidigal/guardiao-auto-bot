@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-webhook_app.py — v4.0.0 (ALWAYS_ENTER + Hedge Ensemble)
--------------------------------------------------------
+webhook_app.py — v4.1.0 (Tags BIG/SMALL/ODD/EVEN -> Número Seco + Hedge + Fluxo Estrito)
+----------------------------------------------------------------------------------------
 FastAPI + Telegram webhook que:
 - Lê mensagens do canal-fonte e publica um "número seco" (1..4) no canal-alvo.
+- Entende tags do canal-fonte (BIG/SMALL/ODD/EVEN) e converte para **1 número**.
 - Acompanha gales (G1/G2) e fecha robusto (GREEN/LOSS) por observados.
 - Aprende online com feedback (reforça acertos, pune erros).
-- Usa ENSEMBLE (Hedge) de 3 especialistas e, opcionalmente, SEMPRE entra (ALWAYS_ENTER=True).
-- Dedupe por update_id, abertura transacional (sem duplicar pendência), timeout com "X".
+- Usa ENSEMBLE (Hedge) de 3 especialistas (ngram+feedback, freq curta, freq longa).
+- Fluxo estrito: não atropela sinal (só abre novo após fechamento real).
+- Dedupe por update_id, abertura transacional, timeout com "X".
 
 ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
 ENV opcionais: TARGET_CHANNEL, SOURCE_CHANNEL, DB_PATH
+
 Webhook: POST /webhook/{WEBHOOK_TOKEN}
 """
-
 import os, re, time, sqlite3, math
 from contextlib import contextmanager
 from typing import List, Optional, Tuple, Dict
@@ -28,7 +30,6 @@ TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
 WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1002796105884").strip()
 SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "").strip()  # se vazio, não filtra
-
 DB_PATH        = os.getenv("DB_PATH", "/var/data/data.db").strip() or "/var/data/data.db"
 TELEGRAM_API   = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
@@ -38,41 +39,44 @@ if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
 # ========= App =========
-app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="4.0.0")
+app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="4.1.0")
 
 # ========= Parâmetros =========
 DECAY = 0.980
 W4, W3, W2, W1 = 0.42, 0.30, 0.18, 0.10
-OBS_TIMEOUT_SEC = 180
+OBS_TIMEOUT_SEC = 240            # mais tempo p/ fechamento real
 
-# ======== Gates de assertividade (usados só se ALWAYS_ENTER=False) ========
-CONF_MIN    = 0.42
-GAP_MIN     = 0.04
-H_MAX       = 0.90
-FREQ_WINDOW = 120  # usado no fallback clássico (mantido se precisar)
+# Gates (ativos quando ALWAYS_ENTER=False)
+CONF_MIN    = 0.50               # conf mínima (50%)
+GAP_MIN     = 0.06               # gap mínimo 6pp
+H_MAX       = 0.86               # barra distribuições difusas
+FREQ_WINDOW = 120
 
-# ======== Cooldown após RED (usado só se ALWAYS_ENTER=False) ========
-COOLDOWN_N     = 1
-CD_CONF_BOOST  = 0.03
-CD_GAP_BOOST   = 0.02
+# Cooldown pós-RED (usado apenas se gates estiverem ativos)
+COOLDOWN_N     = 2
+CD_CONF_BOOST  = 0.04
+CD_GAP_BOOST   = 0.03
 
-# ======== Modo "sempre entrar" (sem neutro) ========
-ALWAYS_ENTER = True  # True => nunca envia "Neutro": sempre publica 1 número
+# Modo "sempre entrar" (sem neutro)
+ALWAYS_ENTER = False             # deixe False para não entrar fraco
 
-# ======== Online Learning (feedback) ========
-FEED_BETA   = 0.45
+# Feedback (aprendizado online)
+FEED_BETA   = 0.40               # peso do feedback
 FEED_POS    = 1.0
 FEED_NEG    = 1.0
-FEED_DECAY  = 0.995
+FEED_DECAY  = 0.990              # esquece mais rápido passado ruim
 WF4, WF3, WF2, WF1 = W4, W3, W2, W1
 
-# ======== Empate técnico (usado no modo clássico; Hedge costuma dispensar) ========
+# Empate técnico (modo clássico; Hedge dispensa, mas mantemos)
 GAP_SOFT = 0.010
 
-# ======== Ensemble Hedge ========
-HEDGE_ETA = 0.6   # 0.3–0.8
-K_SHORT   = 60    # janela curta (freq. micro)
-K_LONG    = 300   # janela longa (freq. macro)
+# Ensemble Hedge
+HEDGE_ETA = 0.5
+K_SHORT   = 60
+K_LONG    = 300
+
+# Fluxo estrito: nunca fechar com X por chegada de nova ENTRADA; espera fechamento real
+STRICT_SOURCE_FLOW = True
 
 # ========= Utils =========
 def now_ts() -> int:
@@ -136,25 +140,10 @@ def migrate_db():
         stage INTEGER DEFAULT 0,
         open INTEGER DEFAULT 1,
         seen TEXT,
-        opened_at INTEGER
+        opened_at INTEGER,
+        "after" INTEGER,
+        ctx1 TEXT, ctx2 TEXT, ctx3 TEXT, ctx4 TEXT
     )""")
-    for col, ddl in [
-        ("created_at", "ALTER TABLE pending ADD COLUMN created_at INTEGER"),
-        ("suggested",  "ALTER TABLE pending ADD COLUMN suggested INTEGER"),
-        ("stage",      "ALTER TABLE pending ADD COLUMN stage INTEGER DEFAULT 0"),
-        ("open",       "ALTER TABLE pending ADD COLUMN open INTEGER DEFAULT 1"),
-        ("seen",       "ALTER TABLE pending ADD COLUMN seen TEXT"),
-        ("opened_at",  "ALTER TABLE pending ADD COLUMN opened_at INTEGER"),
-        ("after",      "ALTER TABLE pending ADD COLUMN after INTEGER"),
-        ("ctx1",       "ALTER TABLE pending ADD COLUMN ctx1 TEXT"),
-        ("ctx2",       "ALTER TABLE pending ADD COLUMN ctx2 TEXT"),
-        ("ctx3",       "ALTER TABLE pending ADD COLUMN ctx3 TEXT"),
-        ("ctx4",       "ALTER TABLE pending ADD COLUMN ctx4 TEXT"),
-    ]:
-        if not _column_exists(con, "pending", col):
-            try: cur.execute(ddl)
-            except sqlite3.OperationalError: pass
-
     # score
     cur.execute("""CREATE TABLE IF NOT EXISTS score (
         id INTEGER PRIMARY KEY CHECK (id=1),
@@ -164,19 +153,16 @@ def migrate_db():
     row = con.execute("SELECT 1 FROM score WHERE id=1").fetchone()
     if not row:
         cur.execute("INSERT INTO score (id, green, loss) VALUES (1,0,0)")
-
-    # feedback (para aprendizado online)
+    # feedback
     cur.execute("""CREATE TABLE IF NOT EXISTS feedback (
         n INTEGER NOT NULL, ctx TEXT NOT NULL, nxt INTEGER NOT NULL, w REAL NOT NULL,
         PRIMARY KEY (n, ctx, nxt)
     )""")
-
-    # processed (dedupe de Telegram update_id)
+    # processed (dedupe)
     cur.execute("""CREATE TABLE IF NOT EXISTS processed (
         update_id TEXT PRIMARY KEY,
         seen_at   INTEGER NOT NULL
     )""")
-
     # state (cooldown)
     cur.execute("""CREATE TABLE IF NOT EXISTS state (
         id INTEGER PRIMARY KEY CHECK (id=1),
@@ -185,7 +171,6 @@ def migrate_db():
     row = con.execute("SELECT 1 FROM state WHERE id=1").fetchone()
     if not row:
         cur.execute("INSERT INTO state (id, cooldown_left) VALUES (1,0)")
-
     # expert weights (Hedge)
     cur.execute("""CREATE TABLE IF NOT EXISTS expert_w (
         id INTEGER PRIMARY KEY CHECK (id=1),
@@ -196,7 +181,6 @@ def migrate_db():
     row = con.execute("SELECT 1 FROM expert_w WHERE id=1").fetchone()
     if not row:
         cur.execute("INSERT INTO expert_w (id, w1, w2, w3) VALUES (1, 1.0, 1.0, 1.0)")
-
     con.commit(); con.close()
 migrate_db()
 
@@ -372,7 +356,7 @@ def _post_from_tail(tail: List[int], after: Optional[int]) -> Dict[int, float]:
         if len(ctx3)==3: s += W3 * _prob_from_ngrams(ctx3[:-1], c)
         if len(ctx2)==2: s += W2 * _prob_from_ngrams(ctx2[:-1], c)
         if len(ctx1)==1: s += W1 * _prob_from_ngrams(ctx1[:-1], c)
-        # feedback (online learning)
+        # feedback
         if len(ctx4)==4: s += FEED_BETA * WF4 * _feedback_prob(4, ctx4[:-1], c)
         if len(ctx3)==3: s += FEED_BETA * WF3 * _feedback_prob(3, ctx3[:-1], c)
         if len(ctx2)==2: s += FEED_BETA * WF2 * _feedback_prob(2, ctx2[:-1], c)
@@ -425,19 +409,13 @@ def _hedge_update(true_c:int, p1:Dict[int,float], p2:Dict[int,float], p3:Dict[in
 # ========= Escolha do número (com Hedge) =========
 def choose_single_number(after: Optional[int]):
     """
-    Retorna:
-      best(int), conf(float), samples(int), post(dict), gap(float), ranking(list)
+    Retorna: best(int), conf(float), samples(int), post(dict), gap(float), ranking(list)
     """
     tail = get_tail(400)
-
-    # Especialistas:
-    post_e1 = _post_from_tail(tail, after)      # n-gram + feedback
-    post_e2 = _post_freq_k(tail, K_SHORT)       # frequência curta
-    post_e3 = _post_freq_k(tail, K_LONG)        # frequência longa
-
-    # Hedge blend
+    post_e1 = _post_from_tail(tail, after)   # n-gram + feedback
+    post_e2 = _post_freq_k(tail, K_SHORT)    # freq curta
+    post_e3 = _post_freq_k(tail, K_LONG)     # freq longa
     post, (w1,w2,w3) = _hedge_blend(post_e1, post_e2, post_e3)
-
     ranking = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
     top2 = ranking[:2]
     gap = (top2[0][1] - top2[1][1]) if len(top2) >= 2 else ranking[0][1]
@@ -458,6 +436,12 @@ LOSS_RX  = re.compile(r"(?:\blo+s+s?\b|\bred\b|❌|\bperdemos\b)", re.I)
 
 PAREN_GROUP_RX = re.compile(r"\(([^)]*)\)")
 ANY_14_RX      = re.compile(r"[1-4]")
+
+# ====== NOVO: tags do canal-fonte ======
+BIG_RX   = re.compile(r"\bBIG\b", re.I)
+SMALL_RX = re.compile(r"\bSMALL\b|\bPEQUEN[OA]\b", re.I)
+ODD_RX   = re.compile(r"\bODD\b|\b[IÍ]MPAR\b", re.I)
+EVEN_RX  = re.compile(r"\bEVEN\b|\bPAR\b", re.I)
 
 def parse_entry_text(text: str) -> Optional[Dict]:
     t = re.sub(r"\s+", " ", text).strip()
@@ -549,14 +533,11 @@ def _dec_cooldown():
 
 def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_lbl: str, suggested: int):
     our_num_display = suggested if outcome.upper()=="GREEN" else "X"
-
-    # fecha a pendência
+    # fecha pendência
     with _tx() as con:
         con.execute("UPDATE pending SET open=0, seen=? WHERE id=?", (final_seen, int(row["id"])))
-
     bump_score(outcome.upper())
-
-    # cooldown adaptativo (só usado se gates estiverem ativos, mas manter estado é ok)
+    # cooldown adaptativo (mantemos estado)
     try:
         if outcome.upper() == "LOSS":
             _set_cooldown(COOLDOWN_N)
@@ -564,18 +545,14 @@ def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_l
             _dec_cooldown()
     except Exception:
         pass
-
-    # ===== Aprendizado online (feedback) =====
+    # Aprendizado online (feedback)
     try:
-        after_val = int(row["after"] or 0) if row["after"] is not None else None
-        # reconstroi ctxs a partir das cols salvas
         ctxs = []
         for ncol in ("ctx1","ctx2","ctx3","ctx4"):
             v = (row[ncol] or "").strip()
             ctx = [int(x) for x in v.split(",") if x.strip().isdigit()]
             ctxs.append(ctx)
         ctx1, ctx2, ctx3, ctx4 = ctxs
-
         if outcome.upper() == "GREEN":
             stage_weight = {"G0": 1.00, "G1": 0.65, "G2": 0.40}.get(stage_lbl, 0.50)
             delta = FEED_POS * stage_weight
@@ -596,15 +573,13 @@ def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_l
                         _feedback_upsert(n, _ctx_to_key(ctx[:-1]), first_obs, +1.0*FEED_POS)
     except Exception:
         pass
-
     # alimenta timeline com observados do fechamento
     try:
         obs_add = [int(x) for x in final_seen.split("-") if x.isdigit()]
         append_seq(obs_add)
     except Exception:
         pass
-
-    # ===== Hedge update (reforça especialistas que estavam certos) =====
+    # Hedge update (reforça especialistas que acertaram)
     try:
         true_first = None
         try:
@@ -619,10 +594,7 @@ def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_l
             _hedge_update(true_first, post_e1, post_e2, post_e3)
     except Exception:
         pass
-
-    # Snapshot (informativo)
     snapshot = _ngram_snapshot_text(int(suggested))
-
     msg = (
         f"{'🟢' if outcome.upper()=='GREEN' else '🔴'} "
         f"<b>{outcome.upper()}</b> — finalizado "
@@ -650,7 +622,7 @@ def _maybe_close_by_timeout():
     return None
 
 def close_pending_force_fill_third_with_X_if_two():
-    """Fecha imediatamente com X na 3ª posição se já houver 2 observados."""
+    """Fecha imediatamente com X na 3ª posição se já houver 2 observados (modo legado)."""
     row = get_open_pending()
     if not row: return None
     seen_list = _seen_list(row)
@@ -698,6 +670,91 @@ async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
                                     "disable_web_page_preview": True})
     except Exception:
         pass
+
+# ========= Helpers de TAGS -> número seco =========
+def _last_num(tail: List[int]) -> Optional[int]:
+    return tail[-1] if tail else None
+
+def _freq(tail: List[int], k: int = 60) -> Dict[int, float]:
+    win = tail[-k:] if len(tail) >= k else tail
+    if not win:
+        return {1:0.25,2:0.25,3:0.25,4:0.25}
+    tot = len(win)
+    return {c: win.count(c)/tot for c in [1,2,3,4]}
+
+def _ngram_score_within(cands: List[int], after: Optional[int]) -> Dict[int, float]:
+    tail = get_tail(400)
+    post = _post_from_tail(tail, after)
+    s = sum(post.get(c,0.0) for c in cands) or 1e-9
+    return {c: post.get(c,0.0)/s for c in cands}
+
+def _choose_from_candidates(cands: List[int], after: Optional[int]) -> Tuple[int, str]:
+    """
+    Escolhe 1 número entre candidatos usando:
+    1) n-gram+feedback (E1)
+    2) frequência curta (60)
+    3) paridade do último número (se útil)
+    """
+    tail = get_tail(400)
+    # 1) prioridade: E1 dentro do conjunto
+    p_e1 = _ngram_score_within(cands, after)
+    best = max(p_e1.items(), key=lambda kv: kv[1])[0]
+    reason = f"E1>{best}"
+    # 2) se estiver muito empatado (gap < 3pp), usa freq curta como voto
+    ranked = sorted(p_e1.items(), key=lambda kv: kv[1], reverse=True)
+    if len(ranked) >= 2 and (ranked[0][1] - ranked[1][1]) < 0.03:
+        fr = _freq(tail, 60)
+        best = max(cands, key=lambda c: fr.get(c,0.0))
+        reason = f"freq60>{best}"
+    # 3) ainda empatado? usa paridade do último número pra decidir
+    if len(cands) == 2 and abs(ranked[0][1] - ranked[1][1]) < 0.01:
+        last = _last_num(tail)
+        if last is not None:
+            if last % 2 == 1 and 3 in cands:  # último ímpar favorece 3
+                best = 3
+                reason = "last_odd"
+            elif last % 2 == 0 and 4 in cands:
+                best = 4
+                reason = "last_even"
+    return best, reason
+
+def pick_num_from_tags(text: str, after: Optional[int]) -> Tuple[Optional[int], str]:
+    """
+    Converte tags do canal (BIG/SMALL/ODD/EVEN) em 1 número seco.
+    Retorna (numero|None, justificativa).
+    """
+    tags = []
+    if BIG_RX.search(text):   tags.append("BIG")
+    if SMALL_RX.search(text): tags.append("SMALL")
+    if ODD_RX.search(text):   tags.append("ODD")
+    if EVEN_RX.search(text):  tags.append("EVEN")
+
+    if not tags:
+        return None, "sem_tags"
+
+    # Mapear conjuntos
+    sets = {
+        "BIG":   {3,4},
+        "SMALL": {1,2},
+        "ODD":   {1,3},
+        "EVEN":  {2,4},
+    }
+    # Interseção progressiva
+    S = None
+    for t in tags:
+        S = sets[t] if S is None else (S & sets[t])
+
+    if not S:
+        return None, "tags_conflitantes"
+
+    if len(S) == 1:
+        n = list(S)[0]
+        return n, f"intersecao:{','.join(tags)}"
+
+    # 2 candidatos → decide com _choose_from_candidates
+    cands = sorted(list(S))
+    n, why = _choose_from_candidates(cands, after)
+    return n, f"{','.join(tags)}|{why}"
 
 # ========= Rotas =========
 @app.get("/")
@@ -753,7 +810,6 @@ async def webhook(token: str, request: Request):
             if nums:
                 _seen_append(pend, [str(n) for n in nums])
                 pend = get_open_pending()
-
             seen_list = _seen_list(pend) if pend else []
             if pend and len(seen_list) >= 3:
                 suggested = int(pend["suggested"] or 0)
@@ -772,7 +828,7 @@ async def webhook(token: str, request: Request):
 
     pend = get_open_pending()
     if pend:
-        # se já houver 3, força fechar agora
+        # se já houver 3 observados, fecha agora (fechamento real)
         seen_list = _seen_list(pend)
         if len(seen_list) >= 3:
             suggested = int(pend["suggested"] or 0)
@@ -782,26 +838,33 @@ async def webhook(token: str, request: Request):
             out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
             await tg_send_text(TARGET_CHANNEL, out_msg)
             pend = get_open_pending()
-
-        # se ficou com 2 observados, fecha com X na 3ª posição AGORA
+        # se ainda existir pendente, NÃO abre novo sinal (fluxo estrito)
         if pend:
-            msgx = close_pending_force_fill_third_with_X_if_two()
-            if msgx:
-                await tg_send_text(TARGET_CHANNEL, msgx)
-                pend = get_open_pending()
-
-        # se ainda existir pendente (ex.: só 1 observado), NÃO abre novo
-        if pend:
-            return {"ok": True, "kept_open_waiting_more_observed": True}
+            await tg_send_text(TARGET_CHANNEL, "⏳ Aguardando fechamento do sinal anterior…")
+            return {"ok": True, "kept_open_waiting_close": True}
 
     # Alimenta memória com a sequência (se houver)
     seq = parsed["seq"] or []
     if seq: append_seq(seq)
 
     after = parsed["after"]
-    best, conf, samples, post, gap, ranking = choose_single_number(after)
 
-    # GATES (só se ALWAYS_ENTER=False)
+    # >>> TAGS -> número seco (se existir no texto)
+    num_from_tags, why_tags = pick_num_from_tags(text, after)
+
+    if num_from_tags is not None:
+        best = int(num_from_tags)
+        conf = 0.50  # confiança nominal quando vem de regra de tags
+        samples = timeline_size()
+        post = {1:0,2:0,3:0,4:0}; post[best] = 1.0
+        gap = 0.50
+        reason = f"tags:{why_tags}"
+    else:
+        # fallback: IA tradicional
+        best, conf, samples, post, gap, ranking = choose_single_number(after)
+        reason = "IA"
+
+    # GATES (apenas se ALWAYS_ENTER=False)
     if not ALWAYS_ENTER:
         H = _entropy_norm(post)
         cd = _get_cooldown()
@@ -825,7 +888,8 @@ async def webhook(token: str, request: Request):
     txt = (
         f"🎯 <b>Número seco (G0):</b> <b>{best}</b>\n"
         f"🧩 <b>Padrão:</b> GEN{aft_txt}\n"
-        f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples}"
+        f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples}\n"
+        f"🔎 <b>Origem:</b> {reason}"
     )
     await tg_send_text(TARGET_CHANNEL, txt)
     return {"ok": True, "posted": True, "best": best, "conf": conf, "gap": gap, "samples": samples}
