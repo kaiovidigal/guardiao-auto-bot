@@ -1,33 +1,18 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-webhook_app.py
---------------
+webhook_app.py — v3.0.0 (patched)
+---------------------------------
 FastAPI + Telegram webhook para refletir sinais do canal-fonte e publicar
 um "número seco" (modo GEN = sem restrição de paridade/tamanho) no canal-alvo.
-Também acompanha os gales (G1/G2) com base nas mensagens do canal-fonte.
+Acompanha gales (G1/G2), fecha robusto e APRENDE online a cada GREEN/LOSS.
 
-Fechamento robusto (mantido):
-- Fecha SEMPRE comparando pelo(s) número(s) observados do canal-fonte:
-  • GREEN se nosso número aparecer em 1º, 2º ou 3º -> G0/G1/G2.
-  • LOSS se, após 3 observados, nosso número não aparece.
-  • Se vierem apenas 2 observados, o 3º vira "X" (no próximo ENTRADA CONFIRMADA
-    ou por timeout), e fecha. Se só houver 1 observado, mantém aberto.
-Mensagens finais:
-  🟢 GREEN — finalizado (G1, nosso=3, observados=1-3-4).
-  🔴 LOSS  — finalizado (G2, nosso=X, observados=1-4-X).
-  + Snapshot n-gram no fechamento:
-    📈 Amostra: N • Conf: XX.X%
-    🔎 N-gram context (última análise): 1 → a% | 2 → b% | 3 → c% | 4 → d%
-Sempre adiciona "📊 Geral: <greens> GREEN × <loss> LOSS — <acc>%".
-
-Qualidade (aproveita todos os sinais; filtros leves apenas no empate técnico):
-- decay = 0.980
-- W4=0.42, W3=0.30, W2=0.18, W1=0.10
-- GAP_SOFT (empate técnico) = 0.015 → fallback leve por frequência
-- SEM bloqueio por MIN_SAMPLES/CONF_MIN/GAP_MIN
-- Timeout para completar com X (apenas se já houver 2 observados): 180s
+Melhorias desta versão:
+- Dedupe por update_id (evita processar 2x a mesma mensagem).
+- Porta corta-fogo transacional (não abre nova pendência se já existir uma aberta).
+- Política de abstenção (mais assertivo): só publica se conf ≥ CONF_MIN e gap ≥ GAP_MIN.
+- Aprendizado online com feedback positivo/negativo por contexto (n-gram + feedback).
+- Timeout: se houver 2 observados, completa 3º com "X" e fecha.
 
 ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
 ENV opcionais: TARGET_CHANNEL, SOURCE_CHANNEL, DB_PATH
@@ -35,7 +20,8 @@ Webhook: POST /webhook/{WEBHOOK_TOKEN}
 """
 
 import os, re, time, sqlite3
-from typing import List, Optional, Tuple, Dict, Union
+from contextlib import contextmanager
+from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timezone
 
 import httpx
@@ -56,13 +42,25 @@ if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
 # ========= App =========
-app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="2.3.4")
+app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="3.0.0")
 
-# ========= Parâmetros =========
+# ========= Parâmetros (modelo base) =========
 DECAY = 0.980
 W4, W3, W2, W1 = 0.42, 0.30, 0.18, 0.10
 GAP_SOFT       = 0.015         # anti-empate técnico (fallback leve)
 OBS_TIMEOUT_SEC= 180           # completa com X (apenas se já houver 2 observados)
+
+# ========= Política de abstenção (mais assertivo) =========
+CONF_MIN      = float(os.getenv("CONF_MIN", "0.46"))   # 46% de posterior
+GAP_MIN       = float(os.getenv("GAP_MIN",  "0.05"))   # 5pp de margem mínima
+FREQ_WINDOW   = int(os.getenv("FREQ_WINDOW","120"))    # janela p/ fallback
+
+# ========= Online Learning (feedback) =========
+FEED_BETA   = float(os.getenv("FEED_BETA",  "0.35"))   # peso do feedback no score final
+FEED_POS    = float(os.getenv("FEED_POS",   "1.00"))   # reforço se GREEN
+FEED_NEG    = float(os.getenv("FEED_NEG",   "1.00"))   # punição se LOSS
+FEED_DECAY  = float(os.getenv("FEED_DECAY", "0.995"))  # esquecimento gradual
+WF4, WF3, WF2, WF1 = W4, W3, W2, W1                    # pesos de feedback espelhando n-gram
 
 # ========= Utils =========
 def now_ts() -> int:
@@ -85,6 +83,19 @@ def _connect() -> sqlite3.Connection:
 def _column_exists(con: sqlite3.Connection, table: str, col: str) -> bool:
     r = con.execute(f"PRAGMA table_info({table})").fetchall()
     return any((row["name"] if isinstance(row, sqlite3.Row) else row[1]) == col for row in r)
+
+@contextmanager
+def _tx():
+    con = _connect()
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        yield con
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
 
 def migrate_db():
     con = _connect(); cur = con.cursor()
@@ -116,6 +127,11 @@ def migrate_db():
         ("open",       "ALTER TABLE pending ADD COLUMN open INTEGER DEFAULT 1"),
         ("seen",       "ALTER TABLE pending ADD COLUMN seen TEXT"),
         ("opened_at",  "ALTER TABLE pending ADD COLUMN opened_at INTEGER"),
+        ("after",      "ALTER TABLE pending ADD COLUMN after INTEGER"),
+        ("ctx1",       "ALTER TABLE pending ADD COLUMN ctx1 TEXT"),
+        ("ctx2",       "ALTER TABLE pending ADD COLUMN ctx2 TEXT"),
+        ("ctx3",       "ALTER TABLE pending ADD COLUMN ctx3 TEXT"),
+        ("ctx4",       "ALTER TABLE pending ADD COLUMN ctx4 TEXT"),
     ]:
         if not _column_exists(con, "pending", col):
             try: cur.execute(ddl)
@@ -131,17 +147,26 @@ def migrate_db():
     if not row:
         cur.execute("INSERT INTO score (id, green, loss) VALUES (1,0,0)")
 
+    # feedback
+    cur.execute("""CREATE TABLE IF NOT EXISTS feedback (
+        n INTEGER NOT NULL, ctx TEXT NOT NULL, nxt INTEGER NOT NULL, w REAL NOT NULL,
+        PRIMARY KEY (n, ctx, nxt)
+    )""")
+
+    # processed (dedupe de Telegram update_id)
+    cur.execute("""CREATE TABLE IF NOT EXISTS processed (
+        update_id TEXT PRIMARY KEY,
+        seen_at   INTEGER NOT NULL
+    )""")
+
     con.commit(); con.close()
 migrate_db()
 
 def _exec_write(sql: str, params: tuple=()):
     for attempt in range(6):
         try:
-            con = _connect()
-            cur = con.cursor()
-            cur.execute(sql, params)
-            con.commit()
-            con.close()
+            with _tx() as con:
+                con.execute(sql, params)
             return
         except sqlite3.OperationalError as e:
             emsg = str(e).lower()
@@ -150,18 +175,30 @@ def _exec_write(sql: str, params: tuple=()):
                 continue
             raise
 
+# ========= Dedupe =========
+def _is_processed(update_id: str) -> bool:
+    if not update_id: return False
+    con = _connect()
+    row = con.execute("SELECT 1 FROM processed WHERE update_id=?", (update_id,)).fetchone()
+    con.close()
+    return bool(row)
+
+def _mark_processed(update_id: str):
+    if not update_id: return
+    _exec_write("INSERT OR IGNORE INTO processed (update_id, seen_at) VALUES (?,?)",
+                (str(update_id), now_ts()))
+
 # ========= Score helpers =========
 def bump_score(outcome: str) -> Tuple[int, int]:
-    con = _connect(); cur = con.cursor()
-    row = cur.execute("SELECT green, loss FROM score WHERE id=1").fetchone()
-    g, l = (row["green"], row["loss"]) if row else (0, 0)
-    if outcome.upper() == "GREEN":
-        g += 1
-    elif outcome.upper() == "LOSS":
-        l += 1
-    cur.execute("INSERT OR REPLACE INTO score (id, green, loss) VALUES (1,?,?)", (g, l))
-    con.commit(); con.close()
-    return g, l
+    with _tx() as con:
+        row = con.execute("SELECT green, loss FROM score WHERE id=1").fetchone()
+        g, l = (row["green"], row["loss"]) if row else (0, 0)
+        if outcome.upper() == "GREEN":
+            g += 1
+        elif outcome.upper() == "LOSS":
+            l += 1
+        con.execute("INSERT OR REPLACE INTO score (id, green, loss) VALUES (1,?,?)", (g, l))
+        return g, l
 
 def score_text() -> str:
     con = _connect()
@@ -174,7 +211,7 @@ def score_text() -> str:
     acc = (g/total*100.0) if total > 0 else 0.0
     return f"{g} GREEN × {l} LOSS — {acc:.1f}%"
 
-# ========= N-gram =========
+# ========= N-gram & Feedback =========
 def timeline_size() -> int:
     con = _connect()
     row = con.execute("SELECT COUNT(*) AS c FROM timeline").fetchone()
@@ -189,29 +226,29 @@ def get_tail(limit:int=400) -> List[int]:
 
 def append_seq(seq: List[int]):
     if not seq: return
-    for n in seq:
-        _exec_write("INSERT INTO timeline (created_at, number) VALUES (?,?)",
-                    (now_ts(), int(n)))
+    with _tx() as con:
+        for n in seq:
+            con.execute("INSERT INTO timeline (created_at, number) VALUES (?,?)",
+                        (now_ts(), int(n)))
     _update_ngrams()
 
 def _update_ngrams(decay: float=DECAY, max_n:int=5, window:int=400):
     tail = get_tail(window)
     if len(tail) < 2: return
-    con = _connect(); cur = con.cursor()
-    for t in range(1, len(tail)):
-        nxt = int(tail[t])
-        dist = (len(tail)-1) - t
-        w = decay ** dist
-        for n in range(2, max_n+1):
-            if t-(n-1) < 0: break
-            ctx = tail[t-(n-1):t]
-            ctx_key = ",".join(str(x) for x in ctx)
-            cur.execute("""
-              INSERT INTO ngram (n, ctx, nxt, w)
-              VALUES (?,?,?,?)
-              ON CONFLICT(n, ctx, nxt) DO UPDATE SET w = w + excluded.w
-            """, (n, ctx_key, nxt, float(w)))
-    con.commit(); con.close()
+    with _tx() as con:
+        for t in range(1, len(tail)):
+            nxt = int(tail[t])
+            dist = (len(tail)-1) - t
+            w = decay ** dist
+            for n in range(2, max_n+1):
+                if t-(n-1) < 0: break
+                ctx = tail[t-(n-1):t]
+                ctx_key = ",".join(str(x) for x in ctx)
+                con.execute("""
+                  INSERT INTO ngram (n, ctx, nxt, w)
+                  VALUES (?,?,?,?)
+                  ON CONFLICT(n, ctx, nxt) DO UPDATE SET w = w + excluded.w
+                """, (n, ctx_key, nxt, float(w)))
 
 def _prob_from_ngrams(ctx: List[int], cand: int) -> float:
     n = len(ctx) + 1
@@ -228,6 +265,48 @@ def _prob_from_ngrams(ctx: List[int], cand: int) -> float:
     w = (row_c["w"] or 0.0) if row_c else 0.0
     con.close()
     return w / tot
+
+def _ctx_to_key(ctx: List[int]) -> str:
+    return ",".join(str(x) for x in ctx) if ctx else ""
+
+def _feedback_upsert(n:int, ctx_key:str, nxt:int, delta:float):
+    with _tx() as con:
+        con.execute("UPDATE feedback SET w = w * ?", (FEED_DECAY,))
+        con.execute("""
+          INSERT INTO feedback (n, ctx, nxt, w)
+          VALUES (?,?,?,?)
+          ON CONFLICT(n, ctx, nxt) DO UPDATE SET w = w + excluded.w
+        """, (n, ctx_key, int(nxt), float(delta)))
+
+def _feedback_prob(n:int, ctx: List[int], cand:int) -> float:
+    if not ctx: return 0.0
+    ctx_key = _ctx_to_key(ctx)
+    con = _connect()
+    row_tot = con.execute("SELECT SUM(w) AS s FROM feedback WHERE n=? AND ctx=?", (n, ctx_key)).fetchone()
+    tot = (row_tot["s"] or 0.0) if row_tot else 0.0
+    if tot <= 0:
+        con.close(); return 0.0
+    row_c = con.execute("SELECT w FROM feedback WHERE n=? AND ctx=? AND nxt=?", (n, ctx_key, int(cand))).fetchone()
+    w = (row_c["w"] or 0.0) if row_c else 0.0
+    con.close()
+    tot = abs(tot)
+    return max(0.0, w) / (tot if tot > 0 else 1e-9)
+
+def _decision_context(after: Optional[int]) -> Tuple[List[int], List[int], List[int], List[int]]:
+    tail = get_tail(400)
+    if tail and after is not None and after in tail:
+        idxs = [i for i,v in enumerate(tail) if v == after]
+        i = idxs[-1]
+        ctx1 = tail[max(0,i):i+1]
+        ctx2 = tail[max(0,i-1):i+1] if i-1>=0 else []
+        ctx3 = tail[max(0,i-2):i+1] if i-2>=0 else []
+        ctx4 = tail[max(0,i-3):i+1] if i-3>=0 else []
+    else:
+        ctx4 = tail[-4:] if len(tail)>=4 else []
+        ctx3 = tail[-3:] if len(tail)>=3 else []
+        ctx2 = tail[-2:] if len(tail)>=2 else []
+        ctx1 = tail[-1:] if len(tail)>=1 else []
+    return ctx1, ctx2, ctx3, ctx4
 
 def _post_from_tail(tail: List[int], after: Optional[int]) -> Dict[int, float]:
     cands = [1,2,3,4]
@@ -249,29 +328,43 @@ def _post_from_tail(tail: List[int], after: Optional[int]) -> Dict[int, float]:
         ctx1 = tail[-1:] if len(tail)>=1 else []
     for c in cands:
         s = 0.0
+        # n-gram base
         if len(ctx4)==4: s += W4 * _prob_from_ngrams(ctx4[:-1], c)
         if len(ctx3)==3: s += W3 * _prob_from_ngrams(ctx3[:-1], c)
         if len(ctx2)==2: s += W2 * _prob_from_ngrams(ctx2[:-1], c)
         if len(ctx1)==1: s += W1 * _prob_from_ngrams(ctx1[:-1], c)
+        # feedback (online learning)
+        if len(ctx4)==4: s += FEED_BETA * WF4 * _feedback_prob(4, ctx4[:-1], c)
+        if len(ctx3)==3: s += FEED_BETA * WF3 * _feedback_prob(3, ctx3[:-1], c)
+        if len(ctx2)==2: s += FEED_BETA * WF2 * _feedback_prob(2, ctx2[:-1], c)
+        if len(ctx1)==1: s += FEED_BETA * WF1 * _feedback_prob(1, ctx1[:-1], c)
         scores[c] = s
     tot = sum(scores.values()) or 1e-9
     return {k: v/tot for k,v in scores.items()}
 
-def choose_single_number(after: Optional[int]) -> Tuple[int, float, int, Dict[int,float]]:
+def choose_single_number(after: Optional[int]):
+    """
+    Retorna:
+      best(int), conf(float), samples(int), post(dict), gap(float), ranking(list[(num,prob)])
+    """
     tail = get_tail(400)
     post = _post_from_tail(tail, after)
-    # empate técnico → fallback leve por frequência nos últimos 50
-    top2 = sorted(post.items(), key=lambda kv: kv[1], reverse=True)[:2]
-    if len(top2) == 2 and (top2[0][1] - top2[1][1]) < GAP_SOFT:
-        last = tail[-50:] if len(tail) >= 50 else tail
+    ranking = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
+    top2 = ranking[:2]
+    gap = (top2[0][1] - top2[1][1]) if len(top2) >= 2 else ranking[0][1]
+
+    # empate técnico → fallback leve por frequência
+    if len(top2) == 2 and gap < GAP_SOFT:
+        last = tail[-FREQ_WINDOW:] if len(tail) >= FREQ_WINDOW else tail
         if last:
             freq = {c: last.count(c) for c in [1,2,3,4]}
-            best = sorted([1,2,3,4], key=lambda x: (freq.get(x,0), x))[0]
+            best = sorted([1,2,3,4], key=lambda x: (-freq.get(x,0), x))[0]
             conf = 0.50
-            return best, conf, timeline_size(), post
-    best = max(post.items(), key=lambda kv: kv[1])[0]
+            return best, conf, timeline_size(), post, gap, ranking
+
+    best = ranking[0][0]
     conf = float(post[best])
-    return best, conf, timeline_size(), post
+    return best, conf, timeline_size(), post, gap, ranking
 
 # ========= Parse =========
 ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
@@ -280,11 +373,10 @@ AFTER_RX = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
 GALE1_RX = re.compile(r"Estamos\s+no\s*1[ºo]\s*gale", re.I)
 GALE2_RX = re.compile(r"Estamos\s+no\s*2[ºo]\s*gale", re.I)
 
-# >>> Regex TOLERANTE para fechamento:
-GREEN_RX = re.compile(r"(?:\bgr+e+e?n\b|\bwin\b|✅)", re.I)   # GREEN/GREEM/GREN, WIN, ✅
-LOSS_RX  = re.compile(r"(?:\blo+s+s?\b|\bred\b|❌|\bperdemos\b)", re.I)  # LOSS/LOS, RED, ❌, PERDEMOS
+# Regex tolerantes para fechamento:
+GREEN_RX = re.compile(r"(?:\bgr+e+e?n\b|\bwin\b|✅)", re.I)   # GREEN/GREEM/...
+LOSS_RX  = re.compile(r"(?:\blo+s+s?\b|\bred\b|❌|\bperdemos\b)", re.I)
 
-# Fecha: números dentro de parênteses; se não houver, tenta ler números soltos 1..4
 PAREN_GROUP_RX = re.compile(r"\(([^)]*)\)")
 ANY_14_RX      = re.compile(r"[1-4]")
 
@@ -304,8 +396,7 @@ def parse_entry_text(text: str) -> Optional[Dict]:
 def parse_close_numbers(text: str) -> List[int]:
     """
     1) Tenta extrair o último grupo entre parênteses: (1 | 4 | 4) -> [1,4,4]
-    2) Se não houver parênteses, captura até 3 dígitos válidos 1..4 no texto inteiro, na ordem em que aparecem.
-       Ex.: 'GREEM 2 4 1' -> [2,4,1]
+    2) Se não houver parênteses, captura até 3 dígitos válidos 1..4 no texto inteiro.
     """
     t = re.sub(r"\s+", " ", text)
     groups = PAREN_GROUP_RX.findall(t)
@@ -313,7 +404,6 @@ def parse_close_numbers(text: str) -> List[int]:
         last = groups[-1]
         nums = re.findall(r"[1-4]", last)
         return [int(x) for x in nums][:3]
-    # fallback sem parênteses
     nums = ANY_14_RX.findall(t)
     return [int(x) for x in nums][:3]
 
@@ -324,16 +414,9 @@ def get_open_pending() -> Optional[sqlite3.Row]:
     con.close()
     return row
 
-def open_pending(suggested: int):
-    _exec_write("""INSERT INTO pending (created_at, suggested, stage, open, seen, opened_at)
-                   VALUES (?,?,?,?,?,?)""",
-                (now_ts(), int(suggested), 0, 1, "", now_ts()))
-
 def set_stage(stage:int):
-    # apenas informativo
-    con = _connect(); cur = con.cursor()
-    cur.execute("UPDATE pending SET stage=? WHERE open=1", (int(stage),))
-    con.commit(); con.close()
+    with _tx() as con:
+        con.execute("UPDATE pending SET stage=? WHERE open=1", (int(stage),))
 
 def _seen_list(row: sqlite3.Row) -> List[str]:
     seen = (row["seen"] or "").strip()
@@ -345,9 +428,8 @@ def _seen_append(row: sqlite3.Row, new_items: List[str]):
         if len(cur_seen) >= 3: break
         cur_seen.append(it)
     seen_txt = "-".join(cur_seen[:3])
-    con = _connect(); cur = con.cursor()
-    cur.execute("UPDATE pending SET seen=? WHERE id=?", (seen_txt, int(row["id"])))
-    con.commit(); con.close()
+    with _tx() as con:
+        con.execute("UPDATE pending SET seen=? WHERE id=?", (seen_txt, int(row["id"])))
 
 def _stage_from_observed(suggested: int, obs: List[int]) -> Tuple[str, str]:
     if not obs:
@@ -358,15 +440,11 @@ def _stage_from_observed(suggested: int, obs: List[int]) -> Tuple[str, str]:
     return ("LOSS", "G2")
 
 def _ngram_snapshot_text(suggested: int) -> str:
-    """Monta as duas linhas de snapshot do n-gram para imprimir no fechamento."""
     tail = get_tail(400)
     post = _post_from_tail(tail, after=None)
-    # prob em % com 1 casa
     def pct(x: float) -> str:
-        try:
-            return f"{x*100:.1f}%"
-        except Exception:
-            return "0.0%"
+        try: return f"{x*100:.1f}%"
+        except Exception: return "0.0%"
     p1 = pct(post.get(1, 0.0))
     p2 = pct(post.get(2, 0.0))
     p3 = pct(post.get(3, 0.0))
@@ -374,20 +452,58 @@ def _ngram_snapshot_text(suggested: int) -> str:
     conf = pct(post.get(int(suggested), 0.0))
     amostra = timeline_size()
     line1 = f"📈 Amostra: {amostra} • Conf: {conf}"
-    line2 = f"🔎 N-gram context (última análise): 1 → {p1} | 2 → {p2} | 3 → {p3} | 4 → {p4}"
+    line2 = f"🔎 N-gram+FB (última análise): 1 → {p1} | 2 → {p2} | 3 → {p3} | 4 → {p4}"
     return line1 + "\n\n" + line2
 
 def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_lbl: str, suggested: int):
-    # LOSS deve mostrar "número X" para não confundir
     our_num_display = suggested if outcome.upper()=="GREEN" else "X"
 
-    con = _connect(); cur = con.cursor()
-    cur.execute("UPDATE pending SET open=0, seen=? WHERE id=?", (final_seen, int(row["id"])))
-    con.commit(); con.close()
+    # fecha a pendência
+    with _tx() as con:
+        con.execute("UPDATE pending SET open=0, seen=? WHERE id=?", (final_seen, int(row["id"])))
 
     bump_score(outcome.upper())
 
-    # Snapshot n-gram (não altera o fluxo; apenas imprime)
+    # ===== Aprendizado online =====
+    try:
+        after_val = int(row["after"] or 0) if row["after"] is not None else None
+        # reconstroi ctxs a partir das cols salvas
+        ctxs = []
+        for ncol in ("ctx1","ctx2","ctx3","ctx4"):
+            v = (row[ncol] or "").strip()
+            ctx = [int(x) for x in v.split(",") if x.strip().isdigit()]
+            ctxs.append(ctx)
+        ctx1, ctx2, ctx3, ctx4 = ctxs
+
+        if outcome.upper() == "GREEN":
+            stage_weight = {"G0": 1.00, "G1": 0.65, "G2": 0.40}.get(stage_lbl, 0.50)
+            delta = FEED_POS * stage_weight
+            for (n,ctx) in [(1,ctx1),(2,ctx2),(3,ctx3),(4,ctx4)]:
+                if len(ctx)>=1:
+                    _feedback_upsert(n, _ctx_to_key(ctx[:-1]), suggested, delta)
+        else:
+            delta_neg = FEED_NEG
+            first_obs = None
+            try:
+                first_obs = next(int(x) for x in final_seen.split("-") if x.isdigit())
+            except StopIteration:
+                pass
+            for (n,ctx) in [(1,ctx1),(2,ctx2),(3,ctx3),(4,ctx4)]:
+                if len(ctx)>=1:
+                    _feedback_upsert(n, _ctx_to_key(ctx[:-1]), suggested, -delta_neg)
+                    if first_obs is not None:
+                        _feedback_upsert(n, _ctx_to_key(ctx[:-1]), first_obs, +0.35*FEED_POS)
+    except Exception:
+        pass
+
+    # alimenta timeline com observados do fechamento
+    try:
+        obs_add = [int(x) for x in final_seen.split("-") if x.isdigit()]
+        append_seq(obs_add)
+    except Exception:
+        pass
+
+    # Snapshot n-gram + feedback (informativo)
     snapshot = _ngram_snapshot_text(int(suggested))
 
     msg = (
@@ -402,7 +518,7 @@ def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_l
 def _maybe_close_by_timeout():
     """
     Se passou muito tempo e temos EXATAMENTE 2 observados, completa com X e fecha.
-    Se só houver 1 observado, mantém aberto (não coloca X na 2ª posição).
+    Se só houver 1 observado, mantém aberto.
     """
     row = get_open_pending()
     if not row: return None
@@ -449,13 +565,29 @@ def close_pending(outcome:str):
     outcome2, stage_lbl = _stage_from_observed(suggested, obs_nums)
     return _close_with_outcome(row, outcome2, final_seen, stage_lbl, suggested)
 
+def _open_pending_with_ctx(suggested:int, after:Optional[int], ctx1,ctx2,ctx3,ctx4) -> bool:
+    """Abertura transacional: só abre se não existir pendência aberta."""
+    with _tx() as con:
+        row = con.execute("SELECT 1 FROM pending WHERE open=1 LIMIT 1").fetchone()
+        if row:
+            return False
+        con.execute("""INSERT INTO pending (created_at, suggested, stage, open, seen, opened_at, after, ctx1, ctx2, ctx3, ctx4)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    (now_ts(), int(suggested), 0, 1, "", now_ts(), after,
+                     _ctx_to_key(ctx1), _ctx_to_key(ctx2), _ctx_to_key(ctx3), _ctx_to_key(ctx4)))
+        return True
+
 # ========= Telegram =========
 async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
     if not TG_BOT_TOKEN: return
-    async with httpx.AsyncClient(timeout=15) as client:
-        await client.post(f"{TELEGRAM_API}/sendMessage",
-                          json={"chat_id": chat_id, "text": text, "parse_mode": parse,
-                                "disable_web_page_preview": True})
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            await client.post(f"{TELEGRAM_API}/sendMessage",
+                              json={"chat_id": chat_id, "text": text, "parse_mode": parse,
+                                    "disable_web_page_preview": True})
+    except Exception:
+        # silencia erros transitórios
+        pass
 
 # ========= Rotas =========
 @app.get("/")
@@ -467,12 +599,19 @@ async def webhook(token: str, request: Request):
     if token != WEBHOOK_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
 
+    data = await request.json()
+
+    # DEDUPE por update_id
+    upd_id = str(data.get("update_id", "")) if isinstance(data, dict) else ""
+    if _is_processed(upd_id):
+        return {"ok": True, "skipped": "duplicate_update"}
+    _mark_processed(upd_id)
+
     # timeout pode fechar pendência antiga (apenas se já houver 2 observados)
     timeout_msg = _maybe_close_by_timeout()
     if timeout_msg:
         await tg_send_text(TARGET_CHANNEL, timeout_msg)
 
-    data = await request.json()
     msg = data.get("channel_post") or data.get("message") \
         or data.get("edited_channel_post") or data.get("edited_message") or {}
 
@@ -496,7 +635,7 @@ async def webhook(token: str, request: Request):
             await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>2° gale (G2)</b>")
         return {"ok": True, "noted": "g2"}
 
-    # 2) Fechamentos do fonte (GREEN/LOSS, com 1, 2 ou 3 números; variações greem/los/red)
+    # 2) Fechamentos do fonte (GREEN/LOSS)
     if GREEN_RX.search(text) or LOSS_RX.search(text):
         pend = get_open_pending()
         if pend:
@@ -516,15 +655,14 @@ async def webhook(token: str, request: Request):
                 return {"ok": True, "closed": outcome.lower(), "seen": final_seen}
         return {"ok": True, "noted_close": True}
 
-    # 3) Nova ENTRADA: NÃO usa a nova sequência para completar;
-    #    se houver 2 observados no sinal anterior, fecha agora com X no 3º.
+    # 3) Nova ENTRADA CONFIRMADA
     parsed = parse_entry_text(text)
     if not parsed:
         return {"ok": True, "skipped": "nao_eh_entrada_confirmada"}
 
     pend = get_open_pending()
     if pend:
-        # se já houver 3, força fechar antes de qualquer coisa
+        # se já houver 3, força fechar agora
         seen_list = _seen_list(pend)
         if len(seen_list) >= 3:
             suggested = int(pend["suggested"] or 0)
@@ -535,7 +673,7 @@ async def webhook(token: str, request: Request):
             await tg_send_text(TARGET_CHANNEL, out_msg)
             pend = get_open_pending()
 
-        # se ficou com 2 observados, fecha com X no 3º AGORA
+        # se ficou com 2 observados, fecha com X na 3ª posição AGORA
         if pend:
             msgx = close_pending_force_fill_third_with_X_if_two()
             if msgx:
@@ -546,15 +684,28 @@ async def webhook(token: str, request: Request):
         if pend:
             return {"ok": True, "kept_open_waiting_more_observed": True}
 
-    # Alimenta memória e decide novo tiro (sem travas por min/conf/gap)
+    # Alimenta memória com a sequência (se houver)
     seq = parsed["seq"] or []
     if seq: append_seq(seq)
 
     after = parsed["after"]
-    best, conf, samples, post = choose_single_number(after)
+    best, conf, samples, post, gap, ranking = choose_single_number(after)
+
+    # Política de abstenção (mais assertivo)
+    if not (conf >= CONF_MIN and gap >= GAP_MIN):
+        await tg_send_text(TARGET_CHANNEL,
+            f"🤝 <b>Neutro</b> — conf {conf*100:.1f}% | gap {gap*100:.1f}pp | amostra≈{samples}")
+        return {"ok": True, "neutral": True, "conf": conf, "gap": gap, "samples": samples}
+
+    # calcula e salva contexto usado na decisão
+    ctx1, ctx2, ctx3, ctx4 = _decision_context(after)
+
+    # Abre pendência transacional (se alguém abriu no meio do caminho, não duplica)
+    opened = _open_pending_with_ctx(best, after, ctx1, ctx2, ctx3, ctx4)
+    if not opened:
+        return {"ok": True, "skipped": "pending_already_open"}
 
     # Publica novo tiro
-    open_pending(best)
     aft_txt = f" após {after}" if after else ""
     txt = (
         f"🎯 <b>Número seco (G0):</b> <b>{best}</b>\n"
@@ -562,7 +713,7 @@ async def webhook(token: str, request: Request):
         f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples}"
     )
     await tg_send_text(TARGET_CHANNEL, txt)
-    return {"ok": True, "posted": True, "best": best, "conf": conf, "samples": samples}
+    return {"ok": True, "posted": True, "best": best, "conf": conf, "gap": gap, "samples": samples}
 
 # ===== Debug/help endpoint =====
 @app.get("/health")
