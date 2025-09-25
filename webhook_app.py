@@ -604,17 +604,6 @@ KEYCAP_MAP = {"1️⃣":"1","2️⃣":"2","3️⃣":"3","4️⃣":"4"}
 def _normalize_keycaps(s: str) -> str:
     return "".join(KEYCAP_MAP.get(ch, ch) for ch in (s or ""))
 
-# Mensagens informativas do fonte que não devem alterar estado / nem atrasar fechamento
-# Exemplos: "analisando", "avaliando", "verificando", "aguarde", "a gente avisa", etc.
-ANALYSIS_NOISE_RX = re.compile(
-    r"\b("
-    r"analisa(?:ndo)?|avaliando|verificando|checando|processando|"
-    r"aguard[ae]|aguarde|espera[er]?|observando|vendo|"
-    r"avis(a|aremos|aremos\s+quando|o)\b|a\s+gente\s+avisa"
-    r")\b",
-    re.I
-)
-
 def parse_entry_text(text: str) -> Optional[Dict]:
     t = _normalize_keycaps(re.sub(r"\s+", " ", text).strip())
     if not ENTRY_RX.search(t):
@@ -796,7 +785,7 @@ def close_pending(outcome:str):
         seen_list.append("X")
     final_seen = "-".join(seen_list[:3])
     suggested = int(row["suggested"] or 0)
-    obs_nums = [int(x) for x in final_seen.split("-") if x.isdigit()]
+    obs_nums = [int(x) for x in seen_list if x.isdigit()]
     outcome2, stage_lbl = _stage_from_observed(suggested, obs_nums)
     return _close_with_outcome(row, outcome2, final_seen, stage_lbl, suggested)
 
@@ -875,12 +864,6 @@ async def webhook(token: str, request: Request):
     if not text:
         return {"ok": True, "skipped": "sem_texto"}
 
-    # 0) Ruídos de análise/aviso do canal fonte — ignorar para não atrasar resultado
-    if ANALYSIS_NOISE_RX.search(text):
-        if DEBUG_MSG:
-            await tg_send_text(TARGET_CHANNEL, "DEBUG: Mensagem informativa do fonte ignorada (analisando/avisa/aguarde).")
-        return {"ok": True, "skipped": "analysis_noise"}
-
     # 1) Gales (informativo)
     if GALE1_RX.search(text):
         if get_open_pending():
@@ -893,7 +876,7 @@ async def webhook(token: str, request: Request):
             await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>2° gale (G2)</b>")
         return {"ok": True, "noted": "g2"}
 
-    # 2) Fechamentos do fonte (GREEN/LOSS) — FECHAMENTO IMEDIATO
+    # 2) Fechamentos do fonte (GREEN/LOSS)
     if GREEN_RX.search(text) or LOSS_RX.search(text):
         pend = get_open_pending()
         if pend:
@@ -902,34 +885,9 @@ async def webhook(token: str, request: Request):
                 _seen_append(pend, [str(n) for n in nums])
                 pend = get_open_pending()
             seen_list = _seen_list(pend) if pend else []
-            if not pend:
-                return {"ok": True, "skipped": "no_pending_on_close"}
-
-            suggested = int(pend["suggested"] or 0)
-            obs_nums = [int(x) for x in seen_list if x.isdigit()]
-            is_green = bool(GREEN_RX.search(text))
-            is_loss  = bool(LOSS_RX.search(text))
-
-            # Fonte afirmou GREEN → fecha na hora (usa posição G0/G1/G2 conforme observados já vistos)
-            if is_green:
-                outcome, stage_lbl = _stage_from_observed(suggested, obs_nums)
-                final_seen = "-".join(seen_list[:3]) if seen_list else ""
-                out_msg = _close_with_outcome(pend, "GREEN", final_seen, stage_lbl, suggested)
-                await tg_send_text(TARGET_CHANNEL, out_msg)
-                return {"ok": True, "closed": "green", "seen": final_seen}
-
-            # Fonte afirmou LOSS → fecha na hora como LOSS (G2), completando com "X" até 3 observados
-            if is_loss:
-                s = seen_list[:]
-                while len(s) < 3:
-                    s.append("X")
-                final_seen = "-".join(s[:3])
-                out_msg = _close_with_outcome(pend, "LOSS", final_seen, "G2", suggested)
-                await tg_send_text(TARGET_CHANNEL, out_msg)
-                return {"ok": True, "closed": "loss", "seen": final_seen}
-
-            # Fallback (mantém comportamento anterior se não houver palavra-chave clara)
-            if len(seen_list) >= 3:
+            if pend and len(seen_list) >= 3:
+                suggested = int(pend["suggested"] or 0)
+                obs_nums = [int(x) for x in seen_list if x.isdigit()]
                 outcome, stage_lbl = _stage_from_observed(suggested, obs_nums)
                 final_seen = "-".join(seen_list[:3])
                 out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
