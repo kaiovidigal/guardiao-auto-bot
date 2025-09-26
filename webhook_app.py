@@ -62,9 +62,9 @@ W4, W3, W2, W1 = 0.42, 0.30, 0.18, 0.10
 OBS_TIMEOUT_SEC = 240  # fecha por timeout só se já houver 2 observados
 
 # ======== Gates (não bloqueiam abertura) ========
-CONF_MIN    = 0.65
+CONF_MIN    = 0.70
 GAP_MIN     = 0.08
-H_MAX       = 0.85
+H_MAX       = 0.90
 FREQ_WINDOW = 120
 
 # ======== Cooldown após RED (sem cortar fluxo) ========
