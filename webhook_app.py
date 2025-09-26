@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-webhook_app.py — v4.4.2
-- Corrige AttributeError: 'sqlite3.Row' não tem .get()
+webhook_app.py — v4.4.1
 - Fluxo estrito + Anti-tilt sem reduzir sinais + robustez de canal
 - IA local (LLM) como 4º especialista (opcional)
 - Aviso "⏳ Aguardando..." APENAS 1x por pendência
@@ -54,7 +53,7 @@ if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
 # ========= App =========
-app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="4.4.2")
+app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="4.4.1")
 
 # ========= Parâmetros =========
 DECAY = 0.980
@@ -186,6 +185,17 @@ def migrate_db():
     row = con.execute("SELECT 1 FROM state WHERE id=1").fetchone()
     if not row:
         cur.execute("INSERT INTO state (id, cooldown_left, loss_streak, last_reset_ymd) VALUES (1,0,0,'')")
+    # --- migrações leves (idempotentes) ---
+    # pending.wait_notice_sent
+    try:
+        cur.execute("ALTER TABLE pending ADD COLUMN wait_notice_sent INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    # state.last_reset_ymd
+    try:
+        cur.execute("ALTER TABLE state ADD COLUMN last_reset_ymd TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
     # expert weights (4 especialistas p/ LLM)
     cur.execute("""CREATE TABLE IF NOT EXISTS expert_w (
         id INTEGER PRIMARY KEY CHECK (id=1),
@@ -217,15 +227,6 @@ def _exec_write(sql: str, params: tuple=()):
                 time.sleep(0.25*(attempt+1))
                 continue
             raise
-
-# ========= Helper seguro para sqlite3.Row =========
-def row_get(row: sqlite3.Row, key: str, default=None):
-    """Acesso seguro a colunas de sqlite3.Row (sem .get())."""
-    try:
-        val = row[key]
-        return default if val is None else val
-    except Exception:
-        return default
 
 # ========= Dedupe =========
 def _is_processed(update_id: str) -> bool:
@@ -267,10 +268,6 @@ def score_text() -> str:
     return f"{g} GREEN × {l} LOSS — {acc:.1f}%"
 
 # ========= Daily reset =========
-def tz_today_ymd() -> str:
-    dt = datetime.now(_TZ)
-    return dt.strftime("%Y-%m-%d")
-
 def _get_last_reset_ymd() -> str:
     con = _connect()
     row = con.execute("SELECT last_reset_ymd FROM state WHERE id=1").fetchone()
@@ -607,6 +604,9 @@ KEYCAP_MAP = {"1️⃣":"1","2️⃣":"2","3️⃣":"3","4️⃣":"4"}
 def _normalize_keycaps(s: str) -> str:
     return "".join(KEYCAP_MAP.get(ch, ch) for ch in (s or ""))
 
+# --- NOVO: detectar "ANALISANDO" para aprender sequência (sem mexer no fluxo)
+ANALISANDO_RX = re.compile(r"\bANALISANDO\b", re.I)
+
 def parse_entry_text(text: str) -> Optional[Dict]:
     t = _normalize_keycaps(re.sub(r"\s+", " ", text).strip())
     if not ENTRY_RX.search(t):
@@ -867,6 +867,16 @@ async def webhook(token: str, request: Request):
     if not text:
         return {"ok": True, "skipped": "sem_texto"}
 
+    # 0) NOVO — Mensagens "ANALISANDO": só aprender sequência (não interfere no fluxo)
+    if ANALISANDO_RX.search(_normalize_keycaps(text)):
+        mseq = SEQ_RX.search(_normalize_keycaps(text))
+        seq = []
+        if mseq:
+            seq = [int(x) for x in re.findall(r"[1-4]", mseq.group(1))]
+        if seq:
+            append_seq(seq)
+        return {"ok": True, "learned_from_analise": len(seq)}
+
     # 1) Gales (informativo)
     if GALE1_RX.search(text):
         if get_open_pending():
@@ -918,10 +928,9 @@ async def webhook(token: str, request: Request):
             await tg_send_text(TARGET_CHANNEL, out_msg)
             pend = get_open_pending()
 
-        # Se ainda existir pendente (1 ou 2 observados), NÃO abre novo — aviso só 1x
+        # Se ainda existir pendente (1 ou 2 observados), NÃO abre novo — e envia aviso só 1x
         if pend:
-            sent = int(row_get(pend, "wait_notice_sent", 0) or 0)   # <— FIX aqui
-            if sent == 0:
+            if int((pend["wait_notice_sent"] or 0)) == 0:   # <- CORRIGIDO (.get -> [])
                 await tg_send_text(TARGET_CHANNEL, "⏳ Aguardando fechamento do sinal anterior…")
                 _mark_wait_notice_sent(int(pend["id"]))
             return {"ok": True, "kept_open_waiting_close": True}
