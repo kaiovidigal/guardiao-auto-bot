@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-webhook_app.py — v4.4.1 (com add-ons GREEN/LOSS cedo + ANALISANDO)
+webhook_app.py — v4.4.2
+- Corrige AttributeError: 'sqlite3.Row' não tem .get()
 - Fluxo estrito + Anti-tilt sem reduzir sinais + robustez de canal
 - IA local (LLM) como 4º especialista (opcional)
 - Aviso "⏳ Aguardando..." APENAS 1x por pendência
 - Placar zera todo dia às 00:00 (fuso TZ_NAME, default America/Sao_Paulo)
-- NOVO: Fecha cedo em GREEN/LOSS do canal-fonte e usa "ANALISANDO... Sequência: ..." para completar/fechar
 
 ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
 ENV opcionais:    TARGET_CHANNEL, SOURCE_CHANNEL, DB_PATH, DEBUG_MSG, BYPASS_SOURCE
@@ -54,7 +54,7 @@ if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
 # ========= App =========
-app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="4.4.1+addons")
+app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="4.4.2")
 
 # ========= Parâmetros =========
 DECAY = 0.980
@@ -218,6 +218,15 @@ def _exec_write(sql: str, params: tuple=()):
                 continue
             raise
 
+# ========= Helper seguro para sqlite3.Row =========
+def row_get(row: sqlite3.Row, key: str, default=None):
+    """Acesso seguro a colunas de sqlite3.Row (sem .get())."""
+    try:
+        val = row[key]
+        return default if val is None else val
+    except Exception:
+        return default
+
 # ========= Dedupe =========
 def _is_processed(update_id: str) -> bool:
     if not update_id: return False
@@ -258,6 +267,10 @@ def score_text() -> str:
     return f"{g} GREEN × {l} LOSS — {acc:.1f}%"
 
 # ========= Daily reset =========
+def tz_today_ymd() -> str:
+    dt = datetime.now(_TZ)
+    return dt.strftime("%Y-%m-%d")
+
 def _get_last_reset_ymd() -> str:
     con = _connect()
     row = con.execute("SELECT last_reset_ymd FROM state WHERE id=1").fetchone()
@@ -617,53 +630,6 @@ def parse_close_numbers(text: str) -> List[int]:
     nums = ANY_14_RX.findall(t)
     return [int(x) for x in nums][:3]
 
-# --- ANALISANDO (do canal-fonte) ---
-ANALYZE_RX = re.compile(r"\bANALISANDO\b", re.I)
-
-def _extend_seen_from_seq(seen_list: List[str], seq: List[int]) -> Optional[List[str]]:
-    """
-    Completa 'seen_list' (até 3 posições) usando a sequência do ANALISANDO do canal.
-    Heurística: tenta alinhar 'seen_list' como prefixo dos últimos 3 ou 4 números da sequência.
-    Ex.: seen=['4'], seq=[4,3,4,1] -> tenta ['3','4','1'] e ['4','3','4','1'].
-    Se houver alinhamento, retorna a lista completada até 3; senão, None.
-    """
-    if not seq:
-        return None
-
-    cur = list(seen_list)
-
-    def as_strs(xs): return [str(x) for x in xs]
-
-    tails = []
-    if len(seq) >= 3:
-        tails.append(seq[-3:])
-    if len(seq) >= 4:
-        tails.append(seq[-4:])
-
-    for tail in tails:
-        t = as_strs(tail)
-        # Caso 1: seen é prefixo da janela
-        if cur == t[:len(cur)]:
-            need = t[len(cur):]
-            return (cur + need)[:3]
-
-        # Caso 2: tentar alinhar início de 'cur' dentro da janela de 4
-        if len(tail) == 4 and len(cur) < 3:
-            full = as_strs(tail)
-            i = 0
-            ok = True
-            for s in cur:
-                if i < len(full) and s == full[i]:
-                    i += 1
-                else:
-                    ok = False
-                    break
-            if ok:
-                need = full[i:i+(3-len(cur))]
-                return (cur + need)[:3]
-
-    return None
-
 # ========= Pending helpers =========
 def get_open_pending() -> Optional[sqlite3.Row]:
     con = _connect()
@@ -913,101 +879,23 @@ async def webhook(token: str, request: Request):
             await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>2° gale (G2)</b>")
         return {"ok": True, "noted": "g2"}
 
-    # 1.5) Mensagens "ANALISANDO" — usar a Sequência para alimentar e (se possível) completar o seen
-    if ANALYZE_RX.search(text):
-        parsed_seq = []
-        mseq = SEQ_RX.search(_normalize_keycaps(text))
-        if mseq:
-            parts = re.findall(r"[1-4]", _normalize_keycaps(mseq.group(1)))
-            parsed_seq = [int(x) for x in parts]
-
-        # Alimenta timeline (melhora n-gram e especialistas)
-        if parsed_seq:
-            append_seq(parsed_seq)
-
-        # Se existe pendência aberta, tentar completar os observados
-        pend = get_open_pending()
-        if pend:
-            seen_list = _seen_list(pend)
-            if len(seen_list) < 3 and parsed_seq:
-                new_seen = _extend_seen_from_seq(seen_list, parsed_seq)
-                if new_seen and len(new_seen) >= len(seen_list):
-                    # atualiza apenas o que faltava
-                    _seen_append(pend, [x for x in new_seen[len(seen_list):]])
-                    pend = get_open_pending()
-                    seen_list = _seen_list(pend)
-
-                    # Se completou 3, fecha agora pelo critério observado (G0/G1/G2)
-                    if len(seen_list) >= 3:
-                        suggested = int(pend["suggested"] or 0)
-                        obs_nums = [int(x) for x in seen_list if x.isdigit()]
-                        outcome, stage_lbl = _stage_from_observed(suggested, obs_nums)
-                        final_seen = "-".join(seen_list[:3])
-                        out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
-                        await tg_send_text(TARGET_CHANNEL, out_msg)
-                        return {"ok": True, "closed_from_analisando": True, "seen": final_seen}
-
-        # Mesmo sem fechar, a sequência já alimentou a IA.
-        return {"ok": True, "noted_analisando": True}
-
-    # 2) Fechamentos do fonte (GREEN/LOSS) — fecha cedo quando possível
+    # 2) Fechamentos do fonte (GREEN/LOSS)
     if GREEN_RX.search(text) or LOSS_RX.search(text):
         pend = get_open_pending()
-        if not pend:
-            return {"ok": True, "noted_close_no_pending": True}
-
-        # Atualiza observados (se vieram números)
-        nums = parse_close_numbers(text)  # pode ter 0, 1, 2 ou 3
-        if nums:
-            _seen_append(pend, [str(n) for n in nums])
-            pend = get_open_pending()  # recarrega
-
-        def _pad_seen_to3(seen_list: List[str]) -> str:
-            sl = list(seen_list)
-            while len(sl) < 3:
-                sl.append("X")
-            return "-".join(sl[:3])
-
-        seen_list = _seen_list(pend)
-        suggested = int(pend["suggested"] or 0)
-        obs_nums = [int(x) for x in seen_list if x.isdigit()]
-
-        # 2.1) GREEN explícito — fechar assim que der para inferir G0/G1/G2
-        if GREEN_RX.search(text):
-            hit_stage = None
-            if len(obs_nums) >= 1 and obs_nums[0] == suggested:
-                hit_stage = "G0"
-            elif len(obs_nums) >= 2 and obs_nums[1] == suggested:
-                hit_stage = "G1"
-            elif len(obs_nums) >= 3 and obs_nums[2] == suggested:
-                hit_stage = "G2"
-
-            if hit_stage:
-                final_seen = _pad_seen_to3(seen_list)
-                out_msg = _close_with_outcome(pend, "GREEN", final_seen, hit_stage, suggested)
+        if pend:
+            nums = parse_close_numbers(text)  # pode ter 1, 2 ou 3
+            if nums:
+                _seen_append(pend, [str(n) for n in nums])
+                pend = get_open_pending()
+            seen_list = _seen_list(pend) if pend else []
+            if pend and len(seen_list) >= 3:
+                suggested = int(pend["suggested"] or 0)
+                obs_nums = [int(x) for x in seen_list if x.isdigit()]
+                outcome, stage_lbl = _stage_from_observed(suggested, obs_nums)
+                final_seen = "-".join(seen_list[:3])
+                out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
                 await tg_send_text(TARGET_CHANNEL, out_msg)
-                return {"ok": True, "closed": "green_early", "seen": final_seen}
-
-            # Se veio GREEN mas ainda não temos nenhum número para confirmar, aguardamos
-            if not obs_nums:
-                return {"ok": True, "noted_green_waiting_numbers": True}
-
-        # 2.2) LOSS explícito — fecha na hora (preenche X)
-        if LOSS_RX.search(text):
-            final_seen = _pad_seen_to3(seen_list)
-            out_msg = _close_with_outcome(pend, "LOSS", final_seen, "G2", suggested)
-            await tg_send_text(TARGET_CHANNEL, out_msg)
-            return {"ok": True, "closed": "loss_explicit", "seen": final_seen}
-
-        # 2.3) Fechamento normal quando já temos 3 observados
-        if len(seen_list) >= 3:
-            outcome, stage_lbl = _stage_from_observed(suggested, obs_nums)
-            final_seen = "-".join(seen_list[:3])
-            out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
-            await tg_send_text(TARGET_CHANNEL, out_msg)
-            return {"ok": True, "closed": outcome.lower(), "seen": final_seen}
-
-        # Caso contrário, apenas anota e segue aguardando
+                return {"ok": True, "closed": outcome.lower(), "seen": final_seen}
         return {"ok": True, "noted_close": True}
 
     # 3) Nova ENTRADA CONFIRMADA (Fluxo estrito)
@@ -1030,9 +918,10 @@ async def webhook(token: str, request: Request):
             await tg_send_text(TARGET_CHANNEL, out_msg)
             pend = get_open_pending()
 
-        # Se ainda existir pendente (1 ou 2 observados), NÃO abre novo — e envia aviso só 1x
+        # Se ainda existir pendente (1 ou 2 observados), NÃO abre novo — aviso só 1x
         if pend:
-            if int(pend.get("wait_notice_sent") or 0) == 0:
+            sent = int(row_get(pend, "wait_notice_sent", 0) or 0)   # <— FIX aqui
+            if sent == 0:
                 await tg_send_text(TARGET_CHANNEL, "⏳ Aguardando fechamento do sinal anterior…")
                 _mark_wait_notice_sent(int(pend["id"]))
             return {"ok": True, "kept_open_waiting_close": True}
