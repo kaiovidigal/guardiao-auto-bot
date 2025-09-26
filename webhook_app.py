@@ -4,7 +4,8 @@
 webhook_app.py — v4.4.1
 - Fluxo estrito + Anti-tilt sem reduzir sinais + robustez de canal
 - IA local (LLM) como 4º especialista (opcional)
-- Aviso "⏳ Aguardando..." APENAS 1x por pendência
+- (NOVO) "ANALISANDO": aprende sequência e pode adiantar fechamento
+- (REMOVIDO) aviso "⏳ Aguardando..."
 - Placar zera todo dia às 00:00 (fuso TZ_NAME, default America/Sao_Paulo)
 
 ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
@@ -185,17 +186,6 @@ def migrate_db():
     row = con.execute("SELECT 1 FROM state WHERE id=1").fetchone()
     if not row:
         cur.execute("INSERT INTO state (id, cooldown_left, loss_streak, last_reset_ymd) VALUES (1,0,0,'')")
-    # --- migrações leves (idempotentes) ---
-    # pending.wait_notice_sent
-    try:
-        cur.execute("ALTER TABLE pending ADD COLUMN wait_notice_sent INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass
-    # state.last_reset_ymd
-    try:
-        cur.execute("ALTER TABLE state ADD COLUMN last_reset_ymd TEXT DEFAULT ''")
-    except sqlite3.OperationalError:
-        pass
     # expert weights (4 especialistas p/ LLM)
     cur.execute("""CREATE TABLE IF NOT EXISTS expert_w (
         id INTEGER PRIMARY KEY CHECK (id=1),
@@ -405,7 +395,7 @@ def _decision_context(after: Optional[int]) -> Tuple[List[int], List[int], List[
         i = idxs[-1]
         ctx1 = tail[max(0,i):i+1]
         ctx2 = tail[max(0,i-1):i+1] if i-1>=0 else []
-        ctx3 = tail[max(0,i-2):i+1] if i-2>=0 else []
+                ctx3 = tail[max(0,i-2):i+1] if i-2>=0 else []
         ctx4 = tail[max(0,i-3):i+1] if i-3>=0 else []
     else:
         ctx4 = tail[-4:] if len(tail)>=4 else []
@@ -587,12 +577,13 @@ def choose_single_number(after: Optional[int]):
     gap2 = (r2[0][1] - r2[1][1]) if len(r2) == 2 else r2[0][1]
     return best, conf, timeline_size(), post_adj, gap2, reason
 
-# ========= Parse (tolerante com keycaps) =========
+# ========= Parse (com keycaps e ANALISANDO) =========
 ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
 SEQ_RX   = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
 AFTER_RX = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
 GALE1_RX = re.compile(r"Estamos\s+no\s*1[ºo]\s*gale", re.I)
 GALE2_RX = re.compile(r"Estamos\s+no\s*2[ºo]\s*gale", re.I)
+ANALISANDO_RX = re.compile(r"\bANALISANDO\b", re.I)
 
 GREEN_RX = re.compile(r"(?:\bgr+e+e?n\b|\bwin\b|✅)", re.I)
 LOSS_RX  = re.compile(r"(?:\blo+s+s?\b|\bred\b|❌|\bperdemos\b)", re.I)
@@ -603,9 +594,6 @@ ANY_14_RX      = re.compile(r"[1-4]")
 KEYCAP_MAP = {"1️⃣":"1","2️⃣":"2","3️⃣":"3","4️⃣":"4"}
 def _normalize_keycaps(s: str) -> str:
     return "".join(KEYCAP_MAP.get(ch, ch) for ch in (s or ""))
-
-# --- NOVO: detectar "ANALISANDO" para aprender sequência (sem mexer no fluxo)
-ANALISANDO_RX = re.compile(r"\bANALISANDO\b", re.I)
 
 def parse_entry_text(text: str) -> Optional[Dict]:
     t = _normalize_keycaps(re.sub(r"\s+", " ", text).strip())
@@ -629,6 +617,15 @@ def parse_close_numbers(text: str) -> List[int]:
         return [int(x) for x in nums][:3]
     nums = ANY_14_RX.findall(t)
     return [int(x) for x in nums][:3]
+
+def parse_analise_seq(text: str) -> List[int]:
+    """Extrai sequência 1..4 de mensagens 'ANALISANDO'."""
+    if not ANALISANDO_RX.search(_normalize_keycaps(text or "")):
+        return []
+    mseq = SEQ_RX.search(_normalize_keycaps(text or ""))
+    if not mseq:
+        return []
+    return [int(x) for x in re.findall(r"[1-4]", mseq.group(1))]
 
 # ========= Pending helpers =========
 def get_open_pending() -> Optional[sqlite3.Row]:
@@ -654,10 +651,6 @@ def _seen_append(row: sqlite3.Row, new_items: List[str]):
     seen_txt = "-".join(cur_seen[:3])
     with _tx() as con:
         con.execute("UPDATE pending SET seen=? WHERE id=?", (seen_txt, int(row["id"])))
-
-def _mark_wait_notice_sent(row_id: int):
-    with _tx() as con:
-        con.execute("UPDATE pending SET wait_notice_sent=1 WHERE id=?", (int(row_id),))
 
 def _stage_from_observed(suggested: int, obs: List[int]) -> Tuple[str, str]:
     if not obs:
@@ -699,7 +692,7 @@ def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_l
     except Exception:
         pass
 
-    # Feedback
+    # Feedback e timeline
     try:
         ctxs = []
         for ncol in ("ctx1","ctx2","ctx3","ctx4"):
@@ -725,17 +718,14 @@ def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_l
                     _feedback_upsert(n, _ctx_to_key(ctx[:-1]), suggested, -1.5*FEED_NEG)
                     if true_first is not None:
                         _feedback_upsert(n, _ctx_to_key(ctx[:-1]), true_first, +1.2*FEED_POS)
-    except Exception:
-        pass
 
-    # Timeline
-    try:
+        # timeline a partir do fechamento
         obs_add = [int(x) for x in final_seen.split("-") if x.isdigit()]
         append_seq(obs_add)
     except Exception:
         pass
 
-    # Hedge update — 4 especialistas (inclui IA local)
+    # Hedge update — 4 especialistas
     try:
         true_first = None
         try:
@@ -818,13 +808,11 @@ async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
 # ========= Rotas =========
 @app.get("/")
 async def root():
-    # reset diário lazy
     check_and_maybe_reset_score()
     return {"ok": True, "service": "guardiao-auto-bot (GEN webhook)"}
 
 @app.get("/health")
 async def health():
-    # reset diário lazy
     check_and_maybe_reset_score()
     pend = get_open_pending()
     pend_open = bool(pend)
@@ -836,7 +824,6 @@ async def webhook(token: str, request: Request):
     if token != WEBHOOK_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    # reset diário lazy no início de qualquer evento
     check_and_maybe_reset_score()
 
     data = await request.json()
@@ -867,15 +854,32 @@ async def webhook(token: str, request: Request):
     if not text:
         return {"ok": True, "skipped": "sem_texto"}
 
-    # 0) NOVO — Mensagens "ANALISANDO": só aprender sequência (não interfere no fluxo)
+    # 0) ANALISANDO — aprender e ADIANTAR FECHAMENTO (sem abrir/fechar por si só)
     if ANALISANDO_RX.search(_normalize_keycaps(text)):
-        mseq = SEQ_RX.search(_normalize_keycaps(text))
-        seq = []
-        if mseq:
-            seq = [int(x) for x in re.findall(r"[1-4]", mseq.group(1))]
+        seq = parse_analise_seq(text)
         if seq:
-            append_seq(seq)
-        return {"ok": True, "learned_from_analise": len(seq)}
+            append_seq(seq)  # aprende padrão
+            pend = get_open_pending()
+            if pend:
+                # usar até completar 3 observados
+                to_add = []
+                cur_seen = _seen_list(pend)
+                need = 3 - len(cur_seen)
+                if need > 0:
+                    to_add = [str(n) for n in seq[:need]]
+                    if to_add:
+                        _seen_append(pend, to_add)
+                        pend = get_open_pending()
+                        cur_seen = _seen_list(pend)
+                        if len(cur_seen) >= 3:
+                            suggested = int(pend["suggested"] or 0)
+                            obs_nums = [int(x) for x in cur_seen if x.isdigit()]
+                            outcome, stage_lbl = _stage_from_observed(suggested, obs_nums)
+                            final_seen = "-".join(cur_seen[:3])
+                            out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
+                            await tg_send_text(TARGET_CHANNEL, out_msg)
+                            return {"ok": True, "closed_from_analise": True, "seen": final_seen}
+        return {"ok": True, "analise_seen": len(seq)}
 
     # 1) Gales (informativo)
     if GALE1_RX.search(text):
@@ -912,12 +916,12 @@ async def webhook(token: str, request: Request):
     parsed = parse_entry_text(text)
     if not parsed:
         if DEBUG_MSG:
-            await tg_send_text(TARGET_CHANNEL, "DEBUG: Mensagem não reconhecida como ENTRADA/FECHAMENTO.")
+            await tg_send_text(TARGET_CHANNEL, "DEBUG: Mensagem não reconhecida como ENTRADA/FECHAMENTO/ANALISANDO.")
         return {"ok": True, "skipped": "nao_eh_entrada_confirmada"}
 
+    # se existir pendência e estiver incompleta, NÃO abre novo (sem avisos)
     pend = get_open_pending()
     if pend:
-        # Se já houver 3 observados, fecha agora
         seen_list = _seen_list(pend)
         if len(seen_list) >= 3:
             suggested = int(pend["suggested"] or 0)
@@ -926,13 +930,7 @@ async def webhook(token: str, request: Request):
             final_seen = "-".join(seen_list[:3])
             out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
             await tg_send_text(TARGET_CHANNEL, out_msg)
-            pend = get_open_pending()
-
-        # Se ainda existir pendente (1 ou 2 observados), NÃO abre novo — e envia aviso só 1x
-        if pend:
-            if int((pend["wait_notice_sent"] or 0)) == 0:   # <- CORRIGIDO (.get -> [])
-                await tg_send_text(TARGET_CHANNEL, "⏳ Aguardando fechamento do sinal anterior…")
-                _mark_wait_notice_sent(int(pend["id"]))
+        else:
             return {"ok": True, "kept_open_waiting_close": True}
 
     # Alimenta memória com a sequência (se houver)
