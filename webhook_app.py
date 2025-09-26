@@ -68,7 +68,7 @@ H_MAX       = 0.80
 FREQ_WINDOW = 120
 
 # ======== Cooldown após RED (sem cortar fluxo) ========
-COOLDOWN_N     = 2
+COOLDOWN_N     = 3
 CD_CONF_BOOST  = 0.04
 CD_GAP_BOOST   = 0.03
 
