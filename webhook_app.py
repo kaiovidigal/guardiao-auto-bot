@@ -65,7 +65,7 @@ OBS_TIMEOUT_SEC = 240  # fecha por timeout só se já houver 2 observados
 CONF_MIN    = 0.14
 GAP_MIN     = 0.12
 H_MAX       = 0.78
-FREQ_WINDOW = 120
+FREQ_WINDOW = 100
 
 # ======== Cooldown após RED (sem cortar fluxo) ========
 COOLDOWN_N     = 3
