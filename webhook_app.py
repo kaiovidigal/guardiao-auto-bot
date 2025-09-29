@@ -45,8 +45,8 @@ LLM_ENABLED    = os.getenv("LLM_ENABLED", "1").strip() in ("1","true","True","ye
 LLM_MODEL_PATH = os.getenv("LLM_MODEL_PATH", "models/phi-3-mini.gguf").strip()
 LLM_CTX_TOKENS = int(os.getenv("LLM_CTX_TOKENS", "2048"))
 LLM_N_THREADS  = int(os.getenv("LLM_N_THREADS", "4"))
-LLM_TEMP       = float(os.getenv("LLM_TEMP", "0.2"))
-LLM_TOP_P      = float(os.getenv("LLM_TOP_P", "0.95"))
+LLM_TEMP       = float(os.getenv("LLM_TEMP", "0.10"))
+LLM_TOP_P      = float(os.getenv("LLM_TOP_P", "0.90"))
 
 if not TG_BOT_TOKEN:
     raise RuntimeError("Defina TG_BOT_TOKEN no ambiente.")
@@ -62,8 +62,8 @@ W4, W3, W2, W1 = 0.42, 0.30, 0.18, 0.10
 OBS_TIMEOUT_SEC = 240  # fecha por timeout só se já houver 2 observados
 
 # ======== Gates (não bloqueiam abertura) ========
-CONF_MIN    = 0.95
-GAP_MIN     = 0.20
+CONF_MIN    = 0.62
+GAP_MIN     = 0.06
 H_MAX       = 0.95
 FREQ_WINDOW = 80
 
@@ -77,13 +77,13 @@ ALWAYS_ENTER = True
 
 # ======== Online Learning (feedback) ========
 FEED_BETA   = 0.40
-FEED_POS    = 0.75
-FEED_NEG    = 1.40
-FEED_DECAY  = 0.997
+FEED_POS    = 0.85
+FEED_NEG    = 1.20
+FEED_DECAY  = 0.995
 WF4, WF3, WF2, WF1 = W4, W3, W2, W1
 
 # ======== Ensemble Hedge ========
-HEDGE_ETA = 0.6
+HEDGE_ETA = 0.75
 K_SHORT   = 60
 K_LONG    = 300
 
