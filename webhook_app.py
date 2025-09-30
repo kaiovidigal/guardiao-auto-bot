@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-webhook_app.py — v4.4.1
+webhook_app.py — v4.4.2
 - Fluxo estrito + Anti-tilt sem reduzir sinais + robustez de canal
 - IA local (LLM) como 4º especialista (opcional)
-- (NOVO) "ANALISANDO": aprende sequência e pode adiantar fechamento
+- "ANALISANDO": aprende sequência e pode adiantar fechamento
 - (REMOVIDO) aviso "⏳ Aguardando..."
 - Placar zera todo dia às 00:00 (fuso TZ_NAME, default America/Sao_Paulo)
+- (NOVO) 'Print do Crupiê': snapshot leve (KL curto||longo, dominância e entropia) em sugestões e fechamentos
+  * Não altera decisões. Apenas telemetria/diagnóstico textual.
 
 ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
 ENV opcionais:    TARGET_CHANNEL, SOURCE_CHANNEL, DB_PATH, DEBUG_MSG, BYPASS_SOURCE
@@ -15,7 +17,7 @@ ENV opcionais:    TARGET_CHANNEL, SOURCE_CHANNEL, DB_PATH, DEBUG_MSG, BYPASS_SOU
 Webhook:          POST /webhook/{WEBHOOK_TOKEN}
 """
 import os, re, time, sqlite3, math, json
-from contextlib import contextmanager
+from contextmanager import contextmanager
 from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timezone
 
@@ -54,7 +56,7 @@ if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
 # ========= App =========
-app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="4.4.1")
+app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="4.4.2")
 
 # ========= Parâmetros =========
 DECAY = 0.980
@@ -395,7 +397,7 @@ def _decision_context(after: Optional[int]) -> Tuple[List[int], List[int], List[
         i = idxs[-1]
         ctx1 = tail[max(0,i):i+1]
         ctx2 = tail[max(0,i-1):i+1] if i-1>=0 else []
-                ctx3 = tail[max(0,i-2):i+1] if i-2>=0 else []
+        ctx3 = tail[max(0,i-2):i+1] if i-2>=0 else []
         ctx4 = tail[max(0,i-3):i+1] if i-3>=0 else []
     else:
         ctx4 = tail[-4:] if len(tail)>=4 else []
@@ -539,6 +541,55 @@ def _hedge_update4(true_c:int, p1:Dict[int,float], p2:Dict[int,float], p3:Dict[i
     w4n = w4 * exp(-HEDGE_ETA * (1.0 - l(p4)))
     S = (w1n + w2n + w3n + w4n) or 1e-9
     _set_expert_w(w1n/S, w2n/S, w3n/S, w4n/S)
+
+# ========= (NOVO) Print do Crupiê (snapshot leve, SEM side effects) =========
+def _kl_divergence(p: Dict[int, float], q: Dict[int, float]) -> float:
+    """KL discreto p||q nas classes {1..4} (estável com eps)."""
+    eps = 1e-12
+    s = 0.0
+    for c in (1, 2, 3, 4):
+        pc = max(eps, float(p.get(c, 0.0)))
+        qc = max(eps, float(q.get(c, 0.0)))
+        s += pc * math.log(pc / qc)
+    return s
+
+def _dealer_snapshot() -> Dict[str, float]:
+    """
+    Snapshot 'crupiê': compara frequência curta vs longa,
+    mede KL e reporta dominantes e entropia normalizada.
+    NÃO altera nenhum estado/decisão.
+    """
+    tail = get_tail(400)
+    p_short = _post_freq_k(tail, K_SHORT)  # janela curta
+    p_long  = _post_freq_k(tail, K_LONG)   # janela longa
+    kl  = _kl_divergence(p_short, p_long)
+    dom_s = max(p_short, key=p_short.get)
+    dom_l = max(p_long,  key=p_long.get)
+    ent_s = _entropy_norm(p_short)
+    ent_l = _entropy_norm(p_long)
+    drift = kl > float(os.getenv("DEALER_KL_THRESH", "0.22"))
+    return {
+        "kl": kl, "drift": drift,
+        "dom_s": dom_s, "dom_l": dom_l,
+        "ent_s": ent_s, "ent_l": ent_l
+    }
+
+def _dealer_print_line() -> str:
+    """
+    Linha compacta para anexar nas mensagens publicadas.
+    Sem efeitos colaterais.
+    """
+    snap = _dealer_snapshot()
+    try:
+        thr = float(os.getenv("DEALER_KL_THRESH", "0.22"))
+    except Exception:
+        thr = 0.22
+    alpha = os.getenv("DEALER_ALPHA", "0.0")
+    status = "DRIFT ALTO" if snap["drift"] else "OK"
+    return (
+        f"🧑‍💼 <b>Crupiê</b>: KL={snap['kl']:.3f} (thr {thr}) • {status} • "
+        f"curto→{snap['dom_s']} | longo→{snap['dom_l']} • Hs={snap['ent_s']:.2f} Hl={snap['ent_l']:.2f} • α={alpha}"
+    )
 
 # ========= Anti-tilt (sem reduzir sinais) =========
 def _streak_adjust_choice(post:Dict[int,float], gap:float, ls:int) -> Tuple[int,str,Dict[int,float]]:
@@ -748,7 +799,8 @@ def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_l
         f"<b>{outcome.upper()}</b> — finalizado "
         f"(<b>{stage_lbl}</b>, nosso={our_num_display}, observados={final_seen}).\n"
         f"📊 Geral: {score_text()}\n\n"
-        f"{snapshot}"
+        f"{snapshot}\n\n"
+        f"{_dealer_print_line()}"
     )
     return msg
 
@@ -954,7 +1006,8 @@ async def webhook(token: str, request: Request):
         f"🤖 <b>IA SUGERE</b> — <b>{best}</b>\n"
         f"🧩 <b>Padrão:</b> GEN{aft_txt}\n"
         f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples} | <b>gap≈</b>{gap*100:.1f}pp\n"
-        f"🧠 <b>Modo:</b> {reason} | <b>streak RED:</b> {ls}"
+        f"🧠 <b>Modo:</b> {reason} | <b>streak RED:</b> {ls}\n"
+        f"{_dealer_print_line()}"
     )
     await tg_send_text(TARGET_CHANNEL, txt)
     return {"ok": True, "posted": True, "best": best, "conf": conf, "gap": gap, "samples": samples}
