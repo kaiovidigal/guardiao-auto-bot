@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-webhook_app.py — v4.4.2 (modo conservador, com flags Fibonacci por ENV)
+webhook_app.py — v4.4.2 (modo conservador, com flags Fibonacci + SEQ3 por ENV)
 - Fluxo estrito + Anti-tilt sem reduzir sinais + robustez de canal
 - IA local (LLM) como 4º especialista (opcional)
 - "ANALISANDO": aprende sequência e pode adiantar fechamento
@@ -14,15 +14,21 @@ webhook_app.py — v4.4.2 (modo conservador, com flags Fibonacci por ENV)
   * FIB_FREQ_ENABLED=1       -> ativa especialista curto multi-janela (janelas conservadoras)
   * FIB_ANTITILT_ENABLED=1   -> ativa anti-tilt progressivo guiado por Fibonacci (suave)
   * HEDGE_FIB_SEED=1         -> inicializa prior do hedge em [1,1,2,3] uma única vez
+  * SEQ3_ENABLED=1           -> ativa reforço por padrão "últimos 3 ⇒ próximo"
+    - SEQ3_MIN_SUPPORT=10
+    - SEQ3_MIN_CONF=0.72
+    - SEQ3_GAP_MIN=0.05
+    - SEQ3_ALPHA=0.18
 
 ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
 ENV opcionais:    TARGET_CHANNEL, SOURCE_CHANNEL, DB_PATH, DEBUG_MSG, BYPASS_SOURCE
                   LLM_ENABLED, LLM_MODEL_PATH, LLM_CTX_TOKENS, LLM_N_THREADS, LLM_TEMP, LLM_TOP_P
-                  TZ_NAME, FIB_FREQ_ENABLED, FIB_ANTITILT_ENABLED, HEDGE_FIB_SEED
+                  TZ_NAME, FIB_FREQ_ENABLED, FIB_ANTITILT_ENABLED, HEDGE_FIB_SEED,
+                  SEQ3_ENABLED, SEQ3_MIN_SUPPORT, SEQ3_MIN_CONF, SEQ3_GAP_MIN, SEQ3_ALPHA
 Webhook:          POST /webhook/{WEBHOOK_TOKEN}
 """
 import os, re, time, sqlite3, math, json
-from contextmanager import contextmanager
+from contextlib import contextmanager
 from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timezone
 
@@ -48,13 +54,16 @@ BYPASS_SOURCE  = os.getenv("BYPASS_SOURCE", "0").strip() in ("1","true","True","
 TELEGRAM_API   = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 # ===== Flags (safe by default: OFF) =====
-# Ligue via ENV sem redeploy de código:
-#   FIB_FREQ_ENABLED=1       -> ativa especialista curto multi-janela (conservador)
-#   FIB_ANTITILT_ENABLED=1   -> ativa anti-tilt guiado por Fibonacci (conservador)
-#   HEDGE_FIB_SEED=1         -> inicializa prior do hedge em [1,1,2,3] (uma vez)
+# Fibonacci
 FIB_FREQ_ENABLED     = os.getenv("FIB_FREQ_ENABLED", "0").lower() in ("1","true","yes")
 FIB_ANTITILT_ENABLED = os.getenv("FIB_ANTITILT_ENABLED", "0").lower() in ("1","true","yes")
 HEDGE_FIB_SEED       = os.getenv("HEDGE_FIB_SEED", "0").lower() in ("1","true","yes")
+# SEQ3 (padrão de 3 → próximo)
+SEQ3_ENABLED         = os.getenv("SEQ3_ENABLED", "0").lower() in ("1","true","yes")
+SEQ3_MIN_SUPPORT     = float(os.getenv("SEQ3_MIN_SUPPORT", "10"))
+SEQ3_MIN_CONF        = float(os.getenv("SEQ3_MIN_CONF", "0.72"))
+SEQ3_GAP_MIN         = float(os.getenv("SEQ3_GAP_MIN", "0.05"))
+SEQ3_ALPHA           = float(os.getenv("SEQ3_ALPHA", "0.18"))
 
 # ===== LLM (IA local tipo ChatGPT) =====
 LLM_ENABLED    = os.getenv("LLM_ENABLED", "1").strip() in ("1","true","True","yes","YES")
@@ -403,6 +412,16 @@ def _prob_from_ngrams(ctx: List[int], cand: int) -> float:
     con.close()
     return w / tot
 
+def _seq_support(ctx: List[int]) -> float:
+    """Retorna o peso total acumulado (SUM(w)) em ngram para esse contexto."""
+    n = len(ctx) + 1
+    if n < 2 or n > 5: return 0.0
+    ctx_key = ",".join(str(x) for x in ctx)
+    con = _connect()
+    row_tot = con.execute("SELECT SUM(w) AS s FROM ngram WHERE n=? AND ctx=?", (n, ctx_key)).fetchone()
+    con.close()
+    return float((row_tot["s"] or 0.0) if row_tot else 0.0)
+
 def _ctx_to_key(ctx: List[int]) -> str:
     return ",".join(str(x) for x in ctx) if ctx else ""
 
@@ -547,16 +566,11 @@ def _norm_dict(d: Dict[int,float]) -> Dict[int,float]:
 
 # --- (2) Frequência multi-janela com janelas de Fibonacci (conservador) ---
 # Mantém especialista "longo" (K_LONG) como está; o "curto" SÓ usa fib se FIB_FREQ_ENABLED=1.
-# Janelas mais estáveis e pesos mais planos para reduzir ruído:
 FIB_WINS = [21, 34, 55, 89]
 _FIB_WIN_WEIGHTS = [1, 1, 1, 2]
 _FIB_WIN_WEIGHTS = [w/sum(_FIB_WIN_WEIGHTS) for w in _FIB_WIN_WEIGHTS]
 
 def _post_freq_fib(tail: List[int]) -> Dict[int, float]:
-    """
-    Especialista curto 'fib' (conservador): mistura frequências em janelas {21,34,55,89}
-    com pesos proporcionais a [1,1,1,2].
-    """
     if not tail:
         return {1:0.25, 2:0.25, 3:0.25, 4:0.25}
     acc = {1:0.0, 2:0.0, 3:0.0, 4:0.0}
@@ -605,7 +619,6 @@ def _hedge_update4(true_c:int, p1:Dict[int,float], p2:Dict[int,float], p3:Dict[i
 
 # ========= (NOVO) Print do Crupiê (snapshot leve, SEM side effects) =========
 def _kl_divergence(p: Dict[int, float], q: Dict[int, float]) -> float:
-    """KL discreto p||q nas classes {1..4} (estável com eps)."""
     eps = 1e-12
     s = 0.0
     for c in (1, 2, 3, 4):
@@ -615,11 +628,6 @@ def _kl_divergence(p: Dict[int, float], q: Dict[int, float]) -> float:
     return s
 
 def _dealer_snapshot() -> Dict[str, float]:
-    """
-    Snapshot 'crupiê': compara frequência curta vs longa,
-    mede KL e reporta dominantes e entropia normalizada.
-    NÃO altera nenhum estado/decisão.
-    """
     tail = get_tail(400)
     p_short = _post_freq_k(tail, K_SHORT)  # janela curta
     p_long  = _post_freq_k(tail, K_LONG)   # janela longa
@@ -636,10 +644,6 @@ def _dealer_snapshot() -> Dict[str, float]:
     }
 
 def _dealer_print_line() -> str:
-    """
-    Linha compacta para anexar nas mensagens publicadas.
-    Sem efeitos colaterais.
-    """
     snap = _dealer_snapshot()
     try:
         thr = float(os.getenv("DEALER_KL_THRESH", "0.22"))
@@ -654,13 +658,28 @@ def _dealer_print_line() -> str:
 
 # --- (3) Anti-tilt com intensidade guiada por Fibonacci (conservador) ---
 def _fib(n: int) -> int:
-    """Fibonacci 1,1,2,3,5,... (n>=1)"""
     if n <= 1:
         return 1
     a, b = 1, 1
     for _ in range(n-1):
         a, b = b, a + b
     return a
+
+# --- (4) SEQ3 — reforço por padrão "trio recente ⇒ próximo" ---
+def _post_seq3(tail: List[int]) -> Tuple[Dict[int,float], float]:
+    """
+    Usa o n-grama n=4 (ctx de 3) para obter distribuição do próximo número.
+    Retorna (post, support_total).
+    """
+    if len(tail) < 3:
+        return ({1:0.25,2:0.25,3:0.25,4:0.25}, 0.0)
+    ctx3 = tail[-3:]
+    support = _seq_support(ctx3)  # SUM(w) nesse contexto
+    post = {c: _prob_from_ngrams(ctx3, c) for c in (1,2,3,4)}
+    # normalização defensiva
+    s = sum(post.values()) or 1e-9
+    post = {k: v/s for k,v in post.items()}
+    return post, support
 
 # ========= Anti-tilt (sem reduzir sinais) =========
 def _streak_adjust_choice(post:Dict[int,float], gap:float, ls:int) -> Tuple[int,str,Dict[int,float]]:
@@ -671,7 +690,7 @@ def _streak_adjust_choice(post:Dict[int,float], gap:float, ls:int) -> Tuple[int,
     # Conservador: só aplica se habilitado, ls>=4 e gap pequeno (<0.04), cap no mix=0.30
     if FIB_ANTITILT_ENABLED and ls >= 4 and gap < 0.04:
         k = min(3, _fib(ls))                  # 1,1,2,3 -> limita intensidade
-        mix = min(0.30, 0.20 + 0.04 * k)      # 0.24..0.30 aprox
+        mix = min(0.30, 0.20 + 0.04 * k)      # ~0.24..0.30
         comp = _norm_dict({c: max(1e-9, 1.0 - post[c]) for c in [1,2,3,4]})
         post = _norm_dict({c: (1.0 - mix)*post[c] + mix*comp[c] for c in [1,2,3,4]})
         ranking = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
@@ -687,12 +706,32 @@ def _streak_adjust_choice(post:Dict[int,float], gap:float, ls:int) -> Tuple[int,
 
 def choose_single_number(after: Optional[int]):
     tail = get_tail(400)
+
+    # --- (A) Especialistas padrão
     post_e1 = _post_from_tail(tail, after)         # n-grama + feedback
-    # curto: usa fib SÓ quando FIB_FREQ_ENABLED=1; caso contrário, mantém K_SHORT original
     post_e2 = _post_freq_fib(tail) if FIB_FREQ_ENABLED else _post_freq_k(tail, K_SHORT)
     post_e3 = _post_freq_k(tail, K_LONG)           # freq longa (300)
     post_e4 = _llm_probs_from_tail(tail) or {1:0.25,2:0.25,3:0.25,4:0.25}  # IA local
+
     post, (w1,w2,w3,w4) = _hedge_blend4(post_e1, post_e2, post_e3, post_e4)
+
+    # --- (B) SEQ3 (reforço opcional e conservador)
+    seq3_reason = ""
+    if SEQ3_ENABLED:
+        seq_post, seq_sup = _post_seq3(tail)
+        # métricas do padrão
+        r = sorted(seq_post.items(), key=lambda kv: kv[1], reverse=True)
+        top = r[0]; ru = r[1] if len(r) > 1 else (top[0], 0.0)
+        top_c, top_p = int(top[0]), float(top[1])
+        gap_seq = top_p - float(ru[1])
+
+        if seq_sup >= SEQ3_MIN_SUPPORT and top_p >= SEQ3_MIN_CONF and gap_seq >= SEQ3_GAP_MIN:
+            # blend suave
+            alpha = max(0.0, min(0.5, SEQ3_ALPHA))
+            post = _norm_dict({c: (1.0 - alpha)*post.get(c,0.0) + alpha*seq_post.get(c,0.0) for c in [1,2,3,4]})
+            seq3_reason = f"+SEQ3(ctx={','.join(map(str, tail[-3:]))}, sup={seq_sup:.1f}, p*={top_p:.2f}, gap={gap_seq:.2f}, α={alpha:.2f},→{top_c})"
+
+    # --- (C) Decisão + anti-tilt
     ranking = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
     top2 = ranking[:2]
     gap = (top2[0][1] - top2[1][1]) if len(top2) >= 2 else ranking[0][1]
@@ -703,6 +742,10 @@ def choose_single_number(after: Optional[int]):
     conf = float(post_adj[best])
     r2 = sorted(post_adj.items(), key=lambda kv: kv[1], reverse=True)[:2]
     gap2 = (r2[0][1] - r2[1][1]) if len(r2) == 2 else r2[0][1]
+
+    if seq3_reason:
+        reason = f"{reason} {seq3_reason}".strip()
+
     return best, conf, timeline_size(), post_adj, gap2, reason
 
 # ========= Parse (com keycaps e ANALISANDO) =========
@@ -882,7 +925,6 @@ def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_l
     return msg
 
 def _maybe_close_by_timeout():
-    """Se passou muito tempo e temos EXATAMENTE 2 observados, completa com X e fecha."""
     row = get_open_pending()
     if not row: return None
     opened_at = int(row["opened_at"] or row["created_at"] or now_ts())
@@ -899,7 +941,6 @@ def _maybe_close_by_timeout():
     return None
 
 def close_pending(outcome:str):
-    """Força fechar preenchendo X até 3 observados (não usada no fluxo normal)."""
     row = get_open_pending()
     if not row: return
     seen_list = _seen_list(row)
@@ -912,7 +953,6 @@ def close_pending(outcome:str):
     return _close_with_outcome(row, outcome2, final_seen, stage_lbl, suggested)
 
 def _open_pending_with_ctx(suggested:int, after:Optional[int], ctx1,ctx2,ctx3,ctx4) -> bool:
-    """Abertura transacional: só abre se não existir pendência aberta."""
     with _tx() as con:
         row = con.execute("SELECT 1 FROM pending WHERE open=1 LIMIT 1").fetchone()
         if row:
@@ -990,7 +1030,6 @@ async def webhook(token: str, request: Request):
             append_seq(seq)  # aprende padrão
             pend = get_open_pending()
             if pend:
-                # usar até completar 3 observados
                 to_add = []
                 cur_seen = _seen_list(pend)
                 need = 3 - len(cur_seen)
