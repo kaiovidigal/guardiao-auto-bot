@@ -1,31 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-webhook_app.py — v4.4.2 (modo conservador, com flags Fibonacci + SEQ3 por ENV)
-- Fluxo estrito + Anti-tilt sem reduzir sinais + robustez de canal
-- IA local (LLM) como 4º especialista (opcional)
-- "ANALISANDO": aprende sequência e pode adiantar fechamento
-- (REMOVIDO) aviso "⏳ Aguardando..."
-- Placar zera todo dia às 00:00 (fuso TZ_NAME, default America/Sao_Paulo)
-- (NOVO) 'Print do Crupiê': snapshot leve (KL curto||longo, dominância e entropia) em sugestões e fechamentos
-  * Não altera decisões. Apenas telemetria/diagnóstico textual.
+webhook_app.py — v4.5.0 (Fibonacci + SEQ3 + ConfFloor 30%)
 
-- (FLAGS OFF por padrão; ligue por ENV quando quiser)
-  * FIB_FREQ_ENABLED=1       -> ativa especialista curto multi-janela (janelas conservadoras)
-  * FIB_ANTITILT_ENABLED=1   -> ativa anti-tilt progressivo guiado por Fibonacci (suave)
-  * HEDGE_FIB_SEED=1         -> inicializa prior do hedge em [1,1,2,3] uma única vez
-  * SEQ3_ENABLED=1           -> ativa reforço por padrão "últimos 3 ⇒ próximo"
-    - SEQ3_MIN_SUPPORT=10
-    - SEQ3_MIN_CONF=0.72
-    - SEQ3_GAP_MIN=0.05
-    - SEQ3_ALPHA=0.18
+- Fluxo estrito + anti-tilt conservador (opcional, via ENV)
+- Especialista curto multi-janela em Fibonacci (opcional, via ENV)
+- Regra de sequência de 3 números (trio -> próximo) com support/conf/boost/force (opcional, via ENV)
+- IA local (LLM) como 4º especialista (opcional)
+- Pós-ajuste com piso de confiança (min 30%) sem quebrar o fluxo
+- "ANALISANDO": aprende sequência e pode adiantar fechamento
+- Placar zera todo dia às 00:00 (fuso TZ_NAME)
 
 ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
 ENV opcionais:    TARGET_CHANNEL, SOURCE_CHANNEL, DB_PATH, DEBUG_MSG, BYPASS_SOURCE
                   LLM_ENABLED, LLM_MODEL_PATH, LLM_CTX_TOKENS, LLM_N_THREADS, LLM_TEMP, LLM_TOP_P
-                  TZ_NAME, FIB_FREQ_ENABLED, FIB_ANTITILT_ENABLED, HEDGE_FIB_SEED,
-                  SEQ3_ENABLED, SEQ3_MIN_SUPPORT, SEQ3_MIN_CONF, SEQ3_GAP_MIN, SEQ3_ALPHA
-Webhook:          POST /webhook/{WEBHOOK_TOKEN}
+                  TZ_NAME, FIB_FREQ_ENABLED, FIB_ANTITILT_ENABLED, HEDGE_FIB_SEED
+                  SEQ3_ENABLED, SEQ3_MIN_SUPPORT, SEQ3_MIN_CONF, SEQ3_BOOST, SEQ3_FORCE
+                  DEALER_KL_THRESH, DEALER_ALPHA
 """
 import os, re, time, sqlite3, math, json
 from contextlib import contextmanager
@@ -49,24 +40,27 @@ WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1002796105884").strip()
 SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "").strip()  # se vazio, não filtra
 DB_PATH        = os.getenv("DB_PATH", "/var/data/data.db").strip() or "/var/data/data.db"
-DEBUG_MSG      = os.getenv("DEBUG_MSG", "0").strip() in ("1","true","True","yes","YES")
-BYPASS_SOURCE  = os.getenv("BYPASS_SOURCE", "0").strip() in ("1","true","True","yes","YES")
+DEBUG_MSG      = os.getenv("DEBUG_MSG", "0").lower() in ("1","true","yes")
+BYPASS_SOURCE  = os.getenv("BYPASS_SOURCE", "0").lower() in ("1","true","yes")
 TELEGRAM_API   = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 # ===== Flags (safe by default: OFF) =====
-# Fibonacci
 FIB_FREQ_ENABLED     = os.getenv("FIB_FREQ_ENABLED", "0").lower() in ("1","true","yes")
 FIB_ANTITILT_ENABLED = os.getenv("FIB_ANTITILT_ENABLED", "0").lower() in ("1","true","yes")
 HEDGE_FIB_SEED       = os.getenv("HEDGE_FIB_SEED", "0").lower() in ("1","true","yes")
-# SEQ3 (padrão de 3 → próximo)
-SEQ3_ENABLED         = os.getenv("SEQ3_ENABLED", "0").lower() in ("1","true","yes")
-SEQ3_MIN_SUPPORT     = float(os.getenv("SEQ3_MIN_SUPPORT", "10"))
-SEQ3_MIN_CONF        = float(os.getenv("SEQ3_MIN_CONF", "0.72"))
-SEQ3_GAP_MIN         = float(os.getenv("SEQ3_GAP_MIN", "0.05"))
-SEQ3_ALPHA           = float(os.getenv("SEQ3_ALPHA", "0.18"))
+
+# ===== SEQ3 (trio->próximo) =====
+SEQ3_ENABLED      = os.getenv("SEQ3_ENABLED", "0").lower() in ("1","true","yes")
+SEQ3_MIN_SUPPORT  = int(os.getenv("SEQ3_MIN_SUPPORT", "12"))
+SEQ3_MIN_CONF     = float(os.getenv("SEQ3_MIN_CONF", "0.78"))
+SEQ3_BOOST        = float(os.getenv("SEQ3_BOOST", "0.18"))
+SEQ3_FORCE        = os.getenv("SEQ3_FORCE", "0").lower() in ("1","true","yes")
+
+# ===== Pós-ajuste (piso de confiança) =====
+MIN_CONF_FLOOR = 0.30  # nunca exibir < 30% após ajustes
 
 # ===== LLM (IA local tipo ChatGPT) =====
-LLM_ENABLED    = os.getenv("LLM_ENABLED", "1").strip() in ("1","true","True","yes","YES")
+LLM_ENABLED    = os.getenv("LLM_ENABLED", "1").lower() in ("1","true","yes")
 LLM_MODEL_PATH = os.getenv("LLM_MODEL_PATH", "models/phi-3-mini.gguf").strip()
 LLM_CTX_TOKENS = int(os.getenv("LLM_CTX_TOKENS", "2048"))
 LLM_N_THREADS  = int(os.getenv("LLM_N_THREADS", "4"))
@@ -79,14 +73,14 @@ if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
 # ========= App =========
-app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="4.4.2")
+app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="4.5.0")
 
 # ========= Parâmetros =========
 DECAY = 0.980
 W4, W3, W2, W1 = 0.42, 0.30, 0.18, 0.10
 OBS_TIMEOUT_SEC = 240  # fecha por timeout só se já houver 2 observados
 
-# ======== Gates (não bloqueiam abertura) ========
+# ======== Gates (diagnóstico; não bloqueiam abertura) ========
 CONF_MIN    = 0.62
 GAP_MIN     = 0.06
 H_MAX       = 0.95
@@ -113,16 +107,14 @@ K_SHORT   = 60
 K_LONG    = 300
 
 # ========= Utils =========
-def now_ts() -> int:
-    return int(time.time())
+def now_ts() -> int: return int(time.time())
 
 def ts_str(ts=None) -> str:
     if ts is None: ts = now_ts()
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def tz_today_ymd() -> str:
-    dt = datetime.now(_TZ)
-    return dt.strftime("%Y-%m-%d")
+    dt = datetime.now(_TZ); return dt.strftime("%Y-%m-%d")
 
 def _entropy_norm(post: Dict[int, float]) -> float:
     eps = 1e-12
@@ -151,8 +143,7 @@ def _tx():
         yield con
         con.commit()
     except Exception:
-        con.rollback()
-        raise
+        con.rollback(); raise
     finally:
         con.close()
 
@@ -239,123 +230,36 @@ def _exec_write(sql: str, params: tuple=()):
         except sqlite3.OperationalError as e:
             emsg = str(e).lower()
             if "locked" in emsg or "busy" in emsg:
-                time.sleep(0.25*(attempt+1))
-                continue
+                time.sleep(0.25*(attempt+1)); continue
             raise
 
 # --- (1) Prior do Hedge com pesos de Fibonacci [1,1,2,3] normalizados (opcional) ---
+def _get_expert_w():
+    con = _connect()
+    row = con.execute("SELECT w1,w2,w3,w4 FROM expert_w WHERE id=1").fetchone()
+    con.close()
+    if not row: return (1.0, 1.0, 1.0, 1.0)
+    return float(row["w1"]), float(row["w2"]), float(row["w3"]), float(row["w4"])
+
+def _set_expert_w(w1, w2, w3, w4):
+    _exec_write("UPDATE expert_w SET w1=?, w2=?, w3=?, w4=? WHERE id=1",
+                (float(w1), float(w2), float(w3), float(w4)))
+
 def _seed_expert_w_fib():
-    """
-    Inicializa os pesos dos 4 especialistas com proporção Fibonacci (1,1,2,3),
-    **apenas** se ainda estiver no padrão plano ~1.0 para todos (não sobrescreve
-    pesos já aprendidos).
-    """
     try:
         w1, w2, w3, w4 = _get_expert_w()
     except Exception:
         return
-    def _is_flat(ws, tol=1e-6):
-        return all(abs(x-1.0) < tol for x in ws)
+    def _is_flat(ws, tol=1e-6): return all(abs(x-1.0) < tol for x in ws)
     if _is_flat([w1, w2, w3, w4]):
-        base = [1, 1, 2, 3]
-        s = sum(base)
+        base = [1, 1, 2, 3]; s = sum(base)
         _set_expert_w(*(x/s for x in base))
 
-# chama após migrate_db; se já houver pesos aprendidos, não altera (controlado por ENV)
 try:
     if HEDGE_FIB_SEED:
         _seed_expert_w_fib()
 except Exception:
     pass
-
-# ========= Dedupe =========
-def _is_processed(update_id: str) -> bool:
-    if not update_id: return False
-    con = _connect()
-    row = con.execute("SELECT 1 FROM processed WHERE update_id=?", (update_id,)).fetchone()
-    con.close()
-    return bool(row)
-
-def _mark_processed(update_id: str):
-    if not update_id: return
-    _exec_write("INSERT OR IGNORE INTO processed (update_id, seen_at) VALUES (?,?)",
-                (str(update_id), now_ts()))
-
-# ========= Score helpers =========
-def bump_score(outcome: str) -> Tuple[int, int]:
-    with _tx() as con:
-        row = con.execute("SELECT green, loss FROM score WHERE id=1").fetchone()
-        g, l = (row["green"], row["loss"]) if row else (0, 0)
-        if outcome.upper() == "GREEN":
-            g += 1
-        elif outcome.upper() == "LOSS":
-            l += 1
-        con.execute("INSERT OR REPLACE INTO score (id, green, loss) VALUES (1,?,?)", (g, l))
-        return g, l
-
-def reset_score():
-    _exec_write("INSERT OR REPLACE INTO score (id, green, loss) VALUES (1,0,0)")
-
-def score_text() -> str:
-    con = _connect()
-    row = con.execute("SELECT green, loss FROM score WHERE id=1").fetchone()
-    con.close()
-    if not row:
-        return "0 GREEN × 0 LOSS — 0.0%"
-    g, l = int(row["green"]), int(row["loss"])
-    total = g + l
-    acc = (g/total*100.0) if total > 0 else 0.0
-    return f"{g} GREEN × {l} LOSS — {acc:.1f}%"
-
-# ========= Daily reset =========
-def _get_last_reset_ymd() -> str:
-    con = _connect()
-    row = con.execute("SELECT last_reset_ymd FROM state WHERE id=1").fetchone()
-    con.close()
-    return (row["last_reset_ymd"] or "") if row else ""
-
-def _set_last_reset_ymd(ymd: str):
-    _exec_write("UPDATE state SET last_reset_ymd=? WHERE id=1", (ymd,))
-
-def check_and_maybe_reset_score():
-    today = tz_today_ymd()
-    last = _get_last_reset_ymd()
-    if last != today:
-        reset_score()
-        _set_last_reset_ymd(today)
-
-# ========= State helpers =========
-def _get_cooldown() -> int:
-    con = _connect()
-    row = con.execute("SELECT cooldown_left FROM state WHERE id=1").fetchone()
-    con.close()
-    return int((row["cooldown_left"] if row else 0) or 0)
-
-def _set_cooldown(v:int):
-    _exec_write("UPDATE state SET cooldown_left=? WHERE id=1", (int(v),))
-
-def _dec_cooldown():
-    with _tx() as con:
-        row = con.execute("SELECT cooldown_left FROM state WHERE id=1").fetchone()
-        cur = int((row["cooldown_left"] if row else 0) or 0)
-        cur = max(0, cur-1)
-        con.execute("UPDATE state SET cooldown_left=? WHERE id=1", (cur,))
-
-def _get_loss_streak() -> int:
-    con = _connect()
-    row = con.execute("SELECT loss_streak FROM state WHERE id=1").fetchone()
-    con.close()
-    return int((row["loss_streak"] if row else 0) or 0)
-
-def _set_loss_streak(v:int):
-    _exec_write("UPDATE state SET loss_streak=? WHERE id=1", (int(v),))
-
-def _bump_loss_streak(reset: bool):
-    if reset:
-        _set_loss_streak(0)
-    else:
-        cur = _get_loss_streak()
-        _set_loss_streak(cur + 1)
 
 # ========= N-gram & Feedback =========
 def timeline_size() -> int:
@@ -411,16 +315,6 @@ def _prob_from_ngrams(ctx: List[int], cand: int) -> float:
     w = (row_c["w"] or 0.0) if row_c else 0.0
     con.close()
     return w / tot
-
-def _seq_support(ctx: List[int]) -> float:
-    """Retorna o peso total acumulado (SUM(w)) em ngram para esse contexto."""
-    n = len(ctx) + 1
-    if n < 2 or n > 5: return 0.0
-    ctx_key = ",".join(str(x) for x in ctx)
-    con = _connect()
-    row_tot = con.execute("SELECT SUM(w) AS s FROM ngram WHERE n=? AND ctx=?", (n, ctx_key)).fetchone()
-    con.close()
-    return float((row_tot["s"] or 0.0) if row_tot else 0.0)
 
 def _ctx_to_key(ctx: List[int]) -> str:
     return ",".join(str(x) for x in ctx) if ctx else ""
@@ -559,16 +453,21 @@ def _llm_probs_from_tail(tail: List[int]) -> Dict[int,float]:
     except Exception:
         return {}
 
-# ========= Ensemble (Hedge) — 4 especialistas =========
+# ========= Ensemble helpers =========
 def _norm_dict(d: Dict[int,float]) -> Dict[int,float]:
     s = sum(d.values()) or 1e-9
     return {k: v/s for k,v in d.items()}
 
 # --- (2) Frequência multi-janela com janelas de Fibonacci (conservador) ---
-# Mantém especialista "longo" (K_LONG) como está; o "curto" SÓ usa fib se FIB_FREQ_ENABLED=1.
 FIB_WINS = [21, 34, 55, 89]
 _FIB_WIN_WEIGHTS = [1, 1, 1, 2]
 _FIB_WIN_WEIGHTS = [w/sum(_FIB_WIN_WEIGHTS) for w in _FIB_WIN_WEIGHTS]
+
+def _post_freq_k(tail: List[int], k: int) -> Dict[int,float]:
+    if not tail: return {1:0.25,2:0.25,3:0.25,4:0.25}
+    win = tail[-k:] if len(tail) >= k else tail
+    tot = max(1, len(win))
+    return _norm_dict({c: win.count(c)/tot for c in [1,2,3,4]})
 
 def _post_freq_fib(tail: List[int]) -> Dict[int, float]:
     if not tail:
@@ -581,23 +480,143 @@ def _post_freq_fib(tail: List[int]) -> Dict[int, float]:
     tot = sum(acc.values()) or 1e-9
     return {c: acc[c]/tot for c in (1,2,3,4)}
 
-def _post_freq_k(tail: List[int], k: int) -> Dict[int,float]:
-    if not tail: return {1:0.25,2:0.25,3:0.25,4:0.25}
-    win = tail[-k:] if len(tail) >= k else tail
-    tot = max(1, len(win))
-    return _norm_dict({c: win.count(c)/tot for c in [1,2,3,4]})
+# --- (3) SEQ3: regra de trio -> próximo ---
+def _seq3_rule(tail: List[int]) -> Tuple[Optional[int], int, float]:
+    """
+    Retorna (melhor_next, support, conf) baseado no trio final do tail.
+    Se não houver trio suficiente, retorna (None,0,0.0).
+    """
+    if len(tail) < 4:
+        return (None, 0, 0.0)
+    a,b,c = tail[-3:]
+    support_counts = {1:0,2:0,3:0,4:0}
+    support_total = 0
+    for i in range(len(tail)-3):
+        t0,t1,t2, nxt = tail[i], tail[i+1], tail[i+2], tail[i+3]
+        if (t0,t1,t2) == (a,b,c):
+            support_counts[nxt] += 1
+            support_total += 1
+    if support_total == 0:
+        return (None, 0, 0.0)
+    # conf por classe e melhor
+    best = max(support_counts, key=support_counts.get)
+    conf = support_counts[best] / support_total
+    return (best, support_total, conf)
 
-def _get_expert_w():
-    con = _connect()
-    row = con.execute("SELECT w1,w2,w3,w4 FROM expert_w WHERE id=1").fetchone()
-    con.close()
-    if not row: return (1.0, 1.0, 1.0, 1.0)
-    return float(row["w1"]), float(row["w2"]), float(row["w3"]), float(row["w4"])
+def _apply_seq3_boost(post: Dict[int,float], tail: List[int]) -> Tuple[Dict[int,float], str]:
+    """
+    Aplica força/boost SEQ3 conforme thresholds. Devolve (post_ajustado, tag_reason_extra)
+    """
+    if not SEQ3_ENABLED:
+        return post, ""
+    nxt, support, conf = _seq3_rule(tail)
+    if nxt is None:
+        return post, ""
+    if support >= SEQ3_MIN_SUPPORT and conf >= SEQ3_MIN_CONF:
+        if SEQ3_FORCE:
+            forced = {1:0.0,2:0.0,3:0.0,4:0.0}; forced[int(nxt)] = 1.0
+            return forced, f"| SEQ3_FORCE s={support} c={conf:.2f}→{nxt}"
+        # boost suave
+        boosted = {c: (1.0-SEQ3_BOOST)*post.get(c,0.0) for c in (1,2,3,4)}
+        boosted[int(nxt)] += SEQ3_BOOST
+        return _norm_dict(boosted), f"| SEQ3_BOOST s={support} c={conf:.2f}→{nxt}"
+    return post, ""
 
-def _set_expert_w(w1, w2, w3, w4):
-    _exec_write("UPDATE expert_w SET w1=?, w2=?, w3=?, w4=? WHERE id=1",
-                (float(w1), float(w2), float(w3), float(w4)))
+# --- (4) Anti-tilt com intensidade guiada por Fibonacci (conservador) ---
+def _fib(n: int) -> int:
+    if n <= 1: return 1
+    a, b = 1, 1
+    for _ in range(n-1):
+        a, b = b, a + b
+    return a
 
+def _streak_adjust_choice(post:Dict[int,float], gap:float, ls:int) -> Tuple[int,str,Dict[int,float]]:
+    reason = "IA"
+    ranking = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
+    best = ranking[0][0]
+
+    # Conservador: só aplica se habilitado, ls>=4 e gap pequeno (<0.04), cap no mix=0.30
+    if FIB_ANTITILT_ENABLED and ls >= 4 and gap < 0.04:
+        k = min(3, _fib(ls))
+        mix = min(0.30, 0.20 + 0.04 * k)  # 0.24..0.30
+        comp = _norm_dict({c: max(1e-9, 1.0 - post[c]) for c in [1,2,3,4]})
+        post = _norm_dict({c: (1.0 - mix)*post[c] + mix*comp[c] for c in [1,2,3,4]})
+        ranking = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
+        best = ranking[0][0]
+        reason = f"IA_anti_tilt_fib_soft{k}"
+
+    if ls >= 2:
+        top2 = ranking[:2]
+        if len(top2) == 2 and gap < 0.05:
+            best = top2[1][0]
+            reason = "IA_runnerup_ls2"
+    return best, reason, post
+
+# --- (5) Pós-ajuste: garantir piso de confiança (30%) e cap no H_MAX ---
+def _apply_conf_floor(post: Dict[int,float], floor: float = MIN_CONF_FLOOR, cap: float = H_MAX) -> Tuple[Dict[int,float], str]:
+    if not post: return post, ""
+    # garante normalização
+    post = _norm_dict({c: float(post.get(c,0.0)) for c in (1,2,3,4)})
+    best = max(post, key=post.get)
+    mx = post[best]
+    tag = ""
+    if mx < floor:
+        others = [c for c in (1,2,3,4) if c != best]
+        sum_others = sum(post[c] for c in others)
+        need = floor - mx
+        take = min(need, sum_others)
+        if sum_others > 0:
+            scale = (sum_others - take) / sum_others
+            for c in others:
+                post[c] *= scale
+        post[best] = min(cap, mx + take)
+        post = _norm_dict(post)
+        tag = f"| conf_floor→{post[best]*100:.0f}%"
+    # cap superior por segurança
+    if post[best] > cap:
+        excess = post[best] - cap
+        others = [c for c in (1,2,3,4) if c != best]
+        add = excess / len(others)
+        post[best] = cap
+        for c in others:
+            post[c] += add
+        post = _norm_dict(post)
+        tag += f"| cap{int(cap*100)}"
+    return post, tag
+
+# ========= (NOVO) Print do Crupiê =========
+def _kl_divergence(p: Dict[int, float], q: Dict[int, float]) -> float:
+    eps = 1e-12; s = 0.0
+    for c in (1,2,3,4):
+        pc = max(eps, float(p.get(c, 0.0)))
+        qc = max(eps, float(q.get(c, 0.0)))
+        s += pc * math.log(pc / qc)
+    return s
+
+def _dealer_snapshot() -> Dict[str, float]:
+    tail = get_tail(400)
+    p_short = _post_freq_k(tail, K_SHORT)
+    p_long  = _post_freq_k(tail, K_LONG)
+    kl  = _kl_divergence(p_short, p_long)
+    dom_s = max(p_short, key=p_short.get)
+    dom_l = max(p_long,  key=p_long.get)
+    ent_s = _entropy_norm(p_short)
+    ent_l = _entropy_norm(p_long)
+    drift = kl > float(os.getenv("DEALER_KL_THRESH", "0.22"))
+    return {"kl": kl, "drift": drift, "dom_s": dom_s, "dom_l": dom_l, "ent_s": ent_s, "ent_l": ent_l}
+
+def _dealer_print_line() -> str:
+    snap = _dealer_snapshot()
+    try:
+        thr = float(os.getenv("DEALER_KL_THRESH", "0.22"))
+    except Exception:
+        thr = 0.22
+    alpha = os.getenv("DEALER_ALPHA", "0.0")
+    status = "DRIFT ALTO" if snap["drift"] else "OK"
+    return (f"🧑‍💼 <b>Crupiê</b>: KL={snap['kl']:.3f} (thr {thr}) • {status} • "
+            f"curto→{snap['dom_s']} | longo→{snap['dom_l']} • Hs={snap['ent_s']:.2f} Hl={snap['ent_l']:.2f} • α={alpha}")
+
+# ========= Hedge (blend/atualização) =========
 def _hedge_blend4(p1:Dict[int,float], p2:Dict[int,float], p3:Dict[int,float], p4:Dict[int,float]):
     w1, w2, w3, w4 = _get_expert_w()
     S = (w1 + w2 + w3 + w4) or 1e-9
@@ -617,121 +636,23 @@ def _hedge_update4(true_c:int, p1:Dict[int,float], p2:Dict[int,float], p3:Dict[i
     S = (w1n + w2n + w3n + w4n) or 1e-9
     _set_expert_w(w1n/S, w2n/S, w3n/S, w4n/S)
 
-# ========= (NOVO) Print do Crupiê (snapshot leve, SEM side effects) =========
-def _kl_divergence(p: Dict[int, float], q: Dict[int, float]) -> float:
-    eps = 1e-12
-    s = 0.0
-    for c in (1, 2, 3, 4):
-        pc = max(eps, float(p.get(c, 0.0)))
-        qc = max(eps, float(q.get(c, 0.0)))
-        s += pc * math.log(pc / qc)
-    return s
-
-def _dealer_snapshot() -> Dict[str, float]:
-    tail = get_tail(400)
-    p_short = _post_freq_k(tail, K_SHORT)  # janela curta
-    p_long  = _post_freq_k(tail, K_LONG)   # janela longa
-    kl  = _kl_divergence(p_short, p_long)
-    dom_s = max(p_short, key=p_short.get)
-    dom_l = max(p_long,  key=p_long.get)
-    ent_s = _entropy_norm(p_short)
-    ent_l = _entropy_norm(p_long)
-    drift = kl > float(os.getenv("DEALER_KL_THRESH", "0.22"))
-    return {
-        "kl": kl, "drift": drift,
-        "dom_s": dom_s, "dom_l": dom_l,
-        "ent_s": ent_s, "ent_l": ent_l
-    }
-
-def _dealer_print_line() -> str:
-    snap = _dealer_snapshot()
-    try:
-        thr = float(os.getenv("DEALER_KL_THRESH", "0.22"))
-    except Exception:
-        thr = 0.22
-    alpha = os.getenv("DEALER_ALPHA", "0.0")
-    status = "DRIFT ALTO" if snap["drift"] else "OK"
-    return (
-        f"🧑‍💼 <b>Crupiê</b>: KL={snap['kl']:.3f} (thr {thr}) • {status} • "
-        f"curto→{snap['dom_s']} | longo→{snap['dom_l']} • Hs={snap['ent_s']:.2f} Hl={snap['ent_l']:.2f} • α={alpha}"
-    )
-
-# --- (3) Anti-tilt com intensidade guiada por Fibonacci (conservador) ---
-def _fib(n: int) -> int:
-    if n <= 1:
-        return 1
-    a, b = 1, 1
-    for _ in range(n-1):
-        a, b = b, a + b
-    return a
-
-# --- (4) SEQ3 — reforço por padrão "trio recente ⇒ próximo" ---
-def _post_seq3(tail: List[int]) -> Tuple[Dict[int,float], float]:
-    """
-    Usa o n-grama n=4 (ctx de 3) para obter distribuição do próximo número.
-    Retorna (post, support_total).
-    """
-    if len(tail) < 3:
-        return ({1:0.25,2:0.25,3:0.25,4:0.25}, 0.0)
-    ctx3 = tail[-3:]
-    support = _seq_support(ctx3)  # SUM(w) nesse contexto
-    post = {c: _prob_from_ngrams(ctx3, c) for c in (1,2,3,4)}
-    # normalização defensiva
-    s = sum(post.values()) or 1e-9
-    post = {k: v/s for k,v in post.items()}
-    return post, support
-
-# ========= Anti-tilt (sem reduzir sinais) =========
-def _streak_adjust_choice(post:Dict[int,float], gap:float, ls:int) -> Tuple[int,str,Dict[int,float]]:
-    reason = "IA"
-    ranking = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
-    best = ranking[0][0]
-
-    # Conservador: só aplica se habilitado, ls>=4 e gap pequeno (<0.04), cap no mix=0.30
-    if FIB_ANTITILT_ENABLED and ls >= 4 and gap < 0.04:
-        k = min(3, _fib(ls))                  # 1,1,2,3 -> limita intensidade
-        mix = min(0.30, 0.20 + 0.04 * k)      # ~0.24..0.30
-        comp = _norm_dict({c: max(1e-9, 1.0 - post[c]) for c in [1,2,3,4]})
-        post = _norm_dict({c: (1.0 - mix)*post[c] + mix*comp[c] for c in [1,2,3,4]})
-        ranking = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
-        best = ranking[0][0]
-        reason = f"IA_anti_tilt_fib_soft{k}"
-
-    if ls >= 2:
-        top2 = ranking[:2]
-        if len(top2) == 2 and gap < 0.05:
-            best = top2[1][0]
-            reason = "IA_runnerup_ls2"
-    return best, reason, post
-
+# ========= Decisão principal =========
 def choose_single_number(after: Optional[int]):
     tail = get_tail(400)
 
-    # --- (A) Especialistas padrão
-    post_e1 = _post_from_tail(tail, after)         # n-grama + feedback
+    # Especialistas base
+    post_e1 = _post_from_tail(tail, after)                             # n-grama + feedback
     post_e2 = _post_freq_fib(tail) if FIB_FREQ_ENABLED else _post_freq_k(tail, K_SHORT)
-    post_e3 = _post_freq_k(tail, K_LONG)           # freq longa (300)
-    post_e4 = _llm_probs_from_tail(tail) or {1:0.25,2:0.25,3:0.25,4:0.25}  # IA local
+    post_e3 = _post_freq_k(tail, K_LONG)                               # freq longa (300)
+    post_e4 = _llm_probs_from_tail(tail) or {1:0.25,2:0.25,3:0.25,4:0.25}
 
+    # Blend (Hedge)
     post, (w1,w2,w3,w4) = _hedge_blend4(post_e1, post_e2, post_e3, post_e4)
 
-    # --- (B) SEQ3 (reforço opcional e conservador)
-    seq3_reason = ""
-    if SEQ3_ENABLED:
-        seq_post, seq_sup = _post_seq3(tail)
-        # métricas do padrão
-        r = sorted(seq_post.items(), key=lambda kv: kv[1], reverse=True)
-        top = r[0]; ru = r[1] if len(r) > 1 else (top[0], 0.0)
-        top_c, top_p = int(top[0]), float(top[1])
-        gap_seq = top_p - float(ru[1])
+    # SEQ3 (trio->próximo) como pós-mix opcional
+    post, seq3_tag = _apply_seq3_boost(post, tail)
 
-        if seq_sup >= SEQ3_MIN_SUPPORT and top_p >= SEQ3_MIN_CONF and gap_seq >= SEQ3_GAP_MIN:
-            # blend suave
-            alpha = max(0.0, min(0.5, SEQ3_ALPHA))
-            post = _norm_dict({c: (1.0 - alpha)*post.get(c,0.0) + alpha*seq_post.get(c,0.0) for c in [1,2,3,4]})
-            seq3_reason = f"+SEQ3(ctx={','.join(map(str, tail[-3:]))}, sup={seq_sup:.1f}, p*={top_p:.2f}, gap={gap_seq:.2f}, α={alpha:.2f},→{top_c})"
-
-    # --- (C) Decisão + anti-tilt
+    # Rank, gap e ajustes por streak
     ranking = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
     top2 = ranking[:2]
     gap = (top2[0][1] - top2[1][1]) if len(top2) >= 2 else ranking[0][1]
@@ -739,14 +660,22 @@ def choose_single_number(after: Optional[int]):
     conf = float(post[base_best])
     ls = _get_loss_streak()
     best, reason, post_adj = _streak_adjust_choice(post, gap, ls)
-    conf = float(post_adj[best])
-    r2 = sorted(post_adj.items(), key=lambda kv: kv[1], reverse=True)[:2]
+
+    # Pós-ajuste: piso de confiança 30% (sem travar fluxo)
+    post_final, floor_tag = _apply_conf_floor(post_adj, MIN_CONF_FLOOR, H_MAX)
+    best = max(post_final, key=post_final.get)
+    conf = float(post_final[best])
+
+    r2 = sorted(post_final.items(), key=lambda kv: kv[1], reverse=True)[:2]
     gap2 = (r2[0][1] - r2[1][1]) if len(r2) == 2 else r2[0][1]
 
-    if seq3_reason:
-        reason = f"{reason} {seq3_reason}".strip()
+    # agrega tags de motivo
+    if seq3_tag:
+        reason = f"{reason} {seq3_tag}".strip()
+    if floor_tag:
+        reason = f"{reason} {floor_tag}".strip()
 
-    return best, conf, timeline_size(), post_adj, gap2, reason
+    return best, conf, timeline_size(), post_final, gap2, reason
 
 # ========= Parse (com keycaps e ANALISANDO) =========
 ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
@@ -790,13 +719,82 @@ def parse_close_numbers(text: str) -> List[int]:
     return [int(x) for x in nums][:3]
 
 def parse_analise_seq(text: str) -> List[int]:
-    """Extrai sequência 1..4 de mensagens 'ANALISANDO'."""
     if not ANALISANDO_RX.search(_normalize_keycaps(text or "")):
         return []
     mseq = SEQ_RX.search(_normalize_keycaps(text or ""))
     if not mseq:
         return []
     return [int(x) for x in re.findall(r"[1-4]", mseq.group(1))]
+
+# ========= Score/State helpers =========
+def bump_score(outcome: str) -> Tuple[int, int]:
+    with _tx() as con:
+        row = con.execute("SELECT green, loss FROM score WHERE id=1").fetchone()
+        g, l = (row["green"], row["loss"]) if row else (0, 0)
+        if outcome.upper() == "GREEN":
+            g += 1
+        elif outcome.upper() == "LOSS":
+            l += 1
+        con.execute("INSERT OR REPLACE INTO score (id, green, loss) VALUES (1,?,?)", (g, l))
+        return g, l
+
+def reset_score():
+    _exec_write("INSERT OR REPLACE INTO score (id, green, loss) VALUES (1,0,0)")
+
+def score_text() -> str:
+    con = _connect()
+    row = con.execute("SELECT green, loss FROM score WHERE id=1").fetchone()
+    con.close()
+    if not row:
+        return "0 GREEN × 0 LOSS — 0.0%"
+    g, l = int(row["green"]), int(row["loss"])
+    total = g + l
+    acc = (g/total*100.0) if total > 0 else 0.0
+    return f"{g} GREEN × {l} LOSS — {acc:.1f}%"
+
+def _get_last_reset_ymd() -> str:
+    con = _connect()
+    row = con.execute("SELECT last_reset_ymd FROM state WHERE id=1").fetchone()
+    con.close()
+    return (row["last_reset_ymd"] or "") if row else ""
+
+def _set_last_reset_ymd(ymd: str):
+    _exec_write("UPDATE state SET last_reset_ymd=? WHERE id=1", (ymd,))
+
+def check_and_maybe_reset_score():
+    today = tz_today_ymd()
+    last = _get_last_reset_ymd()
+    if last != today:
+        reset_score(); _set_last_reset_ymd(today)
+
+def _get_cooldown() -> int:
+    con = _connect()
+    row = con.execute("SELECT cooldown_left FROM state WHERE id=1").fetchone()
+    con.close()
+    return int((row["cooldown_left"] if row else 0) or 0)
+
+def _set_cooldown(v:int):
+    _exec_write("UPDATE state SET cooldown_left=? WHERE id=1", (int(v),))
+
+def _dec_cooldown():
+    with _tx() as con:
+        row = con.execute("SELECT cooldown_left FROM state WHERE id=1").fetchone()
+        cur = int((row["cooldown_left"] if row else 0) or 0)
+        cur = max(0, cur-1)
+        con.execute("UPDATE state SET cooldown_left=? WHERE id=1", (cur,))
+
+def _get_loss_streak() -> int:
+    con = _connect()
+    row = con.execute("SELECT loss_streak FROM state WHERE id=1").fetchone()
+    con.close()
+    return int((row["loss_streak"] if row else 0) or 0)
+
+def _set_loss_streak(v:int):
+    _exec_write("UPDATE state SET loss_streak=? WHERE id=1", (int(v),))
+
+def _bump_loss_streak(reset: bool):
+    if reset: _set_loss_streak(0)
+    else:     _set_loss_streak(_get_loss_streak() + 1)
 
 # ========= Pending helpers =========
 def get_open_pending() -> Optional[sqlite3.Row]:
@@ -824,8 +822,7 @@ def _seen_append(row: sqlite3.Row, new_items: List[str]):
         con.execute("UPDATE pending SET seen=? WHERE id=?", (seen_txt, int(row["id"])))
 
 def _stage_from_observed(suggested: int, obs: List[int]) -> Tuple[str, str]:
-    if not obs:
-        return ("LOSS", "G2")
+    if not obs: return ("LOSS", "G2")
     if len(obs) >= 1 and obs[0] == suggested: return ("GREEN", "G0")
     if len(obs) >= 2 and obs[1] == suggested: return ("GREEN", "G1")
     if len(obs) >= 3 and obs[2] == suggested: return ("GREEN", "G2")
@@ -855,11 +852,9 @@ def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_l
 
     try:
         if outcome.upper() == "LOSS":
-            _set_cooldown(COOLDOWN_N)
-            _bump_loss_streak(reset=False)
+            _set_cooldown(COOLDOWN_N); _bump_loss_streak(reset=False)
         else:
-            _dec_cooldown()
-            _bump_loss_streak(reset=True)
+            _dec_cooldown(); _bump_loss_streak(reset=True)
     except Exception:
         pass
 
@@ -955,8 +950,7 @@ def close_pending(outcome:str):
 def _open_pending_with_ctx(suggested:int, after:Optional[int], ctx1,ctx2,ctx3,ctx4) -> bool:
     with _tx() as con:
         row = con.execute("SELECT 1 FROM pending WHERE open=1 LIMIT 1").fetchone()
-        if row:
-            return False
+        if row: return False
         con.execute("""INSERT INTO pending (created_at, suggested, stage, open, seen, opened_at, after, ctx1, ctx2, ctx3, ctx4, wait_notice_sent)
                        VALUES (?,?,?,?,?,?,?,?,?,?,?,0)""",
                     (now_ts(), int(suggested), 0, 1, "", now_ts(), after,
@@ -1027,7 +1021,7 @@ async def webhook(token: str, request: Request):
     if ANALISANDO_RX.search(_normalize_keycaps(text)):
         seq = parse_analise_seq(text)
         if seq:
-            append_seq(seq)  # aprende padrão
+            append_seq(seq)
             pend = get_open_pending()
             if pend:
                 to_add = []
@@ -1065,7 +1059,7 @@ async def webhook(token: str, request: Request):
     if GREEN_RX.search(text) or LOSS_RX.search(text):
         pend = get_open_pending()
         if pend:
-            nums = parse_close_numbers(text)  # pode ter 1, 2 ou 3
+            nums = parse_close_numbers(text)
             if nums:
                 _seen_append(pend, [str(n) for n in nums])
                 pend = get_open_pending()
