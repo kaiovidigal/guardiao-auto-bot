@@ -498,7 +498,6 @@ def _seq3_rule(tail: List[int]) -> Tuple[Optional[int], int, float]:
             support_total += 1
     if support_total == 0:
         return (None, 0, 0.0)
-    # conf por classe e melhor
     best = max(support_counts, key=support_counts.get)
     conf = support_counts[best] / support_total
     return (best, support_total, conf)
@@ -516,7 +515,6 @@ def _apply_seq3_boost(post: Dict[int,float], tail: List[int]) -> Tuple[Dict[int,
         if SEQ3_FORCE:
             forced = {1:0.0,2:0.0,3:0.0,4:0.0}; forced[int(nxt)] = 1.0
             return forced, f"| SEQ3_FORCE s={support} c={conf:.2f}→{nxt}"
-        # boost suave
         boosted = {c: (1.0-SEQ3_BOOST)*post.get(c,0.0) for c in (1,2,3,4)}
         boosted[int(nxt)] += SEQ3_BOOST
         return _norm_dict(boosted), f"| SEQ3_BOOST s={support} c={conf:.2f}→{nxt}"
@@ -535,7 +533,6 @@ def _streak_adjust_choice(post:Dict[int,float], gap:float, ls:int) -> Tuple[int,
     ranking = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
     best = ranking[0][0]
 
-    # Conservador: só aplica se habilitado, ls>=4 e gap pequeno (<0.04), cap no mix=0.30
     if FIB_ANTITILT_ENABLED and ls >= 4 and gap < 0.04:
         k = min(3, _fib(ls))
         mix = min(0.30, 0.20 + 0.04 * k)  # 0.24..0.30
@@ -555,7 +552,6 @@ def _streak_adjust_choice(post:Dict[int,float], gap:float, ls:int) -> Tuple[int,
 # --- (5) Pós-ajuste: garantir piso de confiança (30%) e cap no H_MAX ---
 def _apply_conf_floor(post: Dict[int,float], floor: float = MIN_CONF_FLOOR, cap: float = H_MAX) -> Tuple[Dict[int,float], str]:
     if not post: return post, ""
-    # garante normalização
     post = _norm_dict({c: float(post.get(c,0.0)) for c in (1,2,3,4)})
     best = max(post, key=post.get)
     mx = post[best]
@@ -572,7 +568,6 @@ def _apply_conf_floor(post: Dict[int,float], floor: float = MIN_CONF_FLOOR, cap:
         post[best] = min(cap, mx + take)
         post = _norm_dict(post)
         tag = f"| conf_floor→{post[best]*100:.0f}%"
-    # cap superior por segurança
     if post[best] > cap:
         excess = post[best] - cap
         others = [c for c in (1,2,3,4) if c != best]
@@ -669,7 +664,6 @@ def choose_single_number(after: Optional[int]):
     r2 = sorted(post_final.items(), key=lambda kv: kv[1], reverse=True)[:2]
     gap2 = (r2[0][1] - r2[1][1]) if len(r2) == 2 else r2[0][1]
 
-    # agrega tags de motivo
     if seq3_tag:
         reason = f"{reason} {seq3_tag}".strip()
     if floor_tag:
@@ -1056,7 +1050,8 @@ async def webhook(token: str, request: Request):
         return {"ok": True, "noted": "g2"}
 
     # 2) Fechamentos do fonte (GREEN/LOSS)
-    if GREEN_RX.search(text) or LOSS_RX.search(text):
+    if GREEN_RX.search(text) o
+r LOSS_RX.search(text):
         pend = get_open_pending()
         if pend:
             nums = parse_close_numbers(text)
