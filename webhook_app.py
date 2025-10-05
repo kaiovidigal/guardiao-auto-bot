@@ -54,7 +54,7 @@ LLM_TEMP       = 0.10
 LLM_TOP_P      = 0.90
 
 # ===== Fluxo/tempo =====
-MAX_GALE       = 1                     # G0/G1 (2 observações)
+MAX_GALE       = 1                     # G0/G1 (2 observações) — G2 desabilitado
 N_OBS_REQUIRED = max(1, min(3, MAX_GALE + 1))
 OBS_TIMEOUT_SEC = 420                  # 7min
 
@@ -240,8 +240,7 @@ def _update_ngrams(decay: float=DECAY, max_n:int=5, window:int=400):
     if len(tail) < 2: return
     with _tx() as con:
         for t in range(1, len(tail)):
-            nxt = int(tail[t])
-            dist = (len(tail)-1) - t
+            nxt = int(tail[t]); dist = (len(tail)-1) - t
             w = decay ** dist
             for n in range(2, max_n+1):
                 if t-(n-1) < 0: break
@@ -368,14 +367,6 @@ _LLM_SYSTEM = (
 def _llm_probs_from_tail(tail: List[int]) -> Dict[int,float]:
     llm = _llm_load()
     if llm is None or not LLM_ENABLED:
-        if DEBUG_MSG:
-            try:
-                import asyncio as _asyncio
-                _asyncio.create_task(
-                    tg_send_text(TARGET_CHANNEL, f"DEBUG LLM: enabled={LLM_ENABLED} path='{LLM_MODEL_PATH}' exists={os.path.exists(LLM_MODEL_PATH)} loaded=False")
-                )
-            except Exception:
-                pass
         return {}
     win60  = tail[-60:] if len(tail) >= 60 else tail
     win300 = tail[-300:] if len(tail) >= 300 else tail
