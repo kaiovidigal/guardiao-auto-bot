@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-webhook_app.py — v4.5.0 (Fibonacci + SEQ3 + ConfFloor 30%)
+webhook_app.py — v4.5.0 (Fibonacci + SEQ3 + ConfFloor 30% + E8–E12 + M0)
 
 - Fluxo estrito + anti-tilt conservador (opcional, via ENV)
 - Especialista curto multi-janela em Fibonacci (opcional, via ENV)
 - Regra de sequência de 3 números (trio -> próximo) com support/conf/boost/force (opcional, via ENV)
 - IA local (LLM) como 4º especialista (opcional)
 - Pós-ajuste com piso de confiança (min 30%) sem quebrar o fluxo
+- Novos especialistas: E8 (Regime), E9 (Condicional), E10 (Dirichlet), E11 (Contrarian), E12 (Momentum)
+- IA Regente (M0) que calibra pesos on-line (sem EV nova)
 - "ANALISANDO": aprende sequência e pode adiantar fechamento
 - Placar zera todo dia às 00:00 (fuso TZ_NAME)
 
@@ -58,6 +60,7 @@ SEQ3_FORCE        = os.getenv("SEQ3_FORCE", "0").lower() in ("1","true","yes")
 
 # ===== Pós-ajuste (piso de confiança) =====
 MIN_CONF_FLOOR = 0.30  # nunca exibir < 30% após ajustes
+H_MAX          = 0.95  # teto de confiança
 
 # ===== LLM (IA local tipo ChatGPT) =====
 LLM_ENABLED    = os.getenv("LLM_ENABLED", "1").lower() in ("1","true","yes")
@@ -83,7 +86,6 @@ OBS_TIMEOUT_SEC = 240  # fecha por timeout só se já houver 2 observados
 # ======== Gates (diagnóstico; não bloqueiam abertura) ========
 CONF_MIN    = 0.62
 GAP_MIN     = 0.06
-H_MAX       = 0.95
 FREQ_WINDOW = 80
 
 # ======== Cooldown após RED (sem cortar fluxo) ========
@@ -458,7 +460,7 @@ def _norm_dict(d: Dict[int,float]) -> Dict[int,float]:
     s = sum(d.values()) or 1e-9
     return {k: v/s for k,v in d.items()}
 
-# --- (2) Frequência multi-janela com janelas de Fibonacci (conservador) ---
+# --- Frequência multi-janela com janelas de Fibonacci (conservador) ---
 FIB_WINS = [21, 34, 55, 89]
 _FIB_WIN_WEIGHTS = [1, 1, 1, 2]
 _FIB_WIN_WEIGHTS = [w/sum(_FIB_WIN_WEIGHTS) for w in _FIB_WIN_WEIGHTS]
@@ -480,47 +482,128 @@ def _post_freq_fib(tail: List[int]) -> Dict[int, float]:
     tot = sum(acc.values()) or 1e-9
     return {c: acc[c]/tot for c in (1,2,3,4)}
 
-# --- (3) SEQ3: regra de trio -> próximo ---
-def _seq3_rule(tail: List[int]) -> Tuple[Optional[int], int, float]:
-    """
-    Retorna (melhor_next, support, conf) baseado no trio final do tail.
-    Se não houver trio suficiente, retorna (None,0,0.0).
-    """
-    if len(tail) < 4:
-        return (None, 0, 0.0)
-    a,b,c = tail[-3:]
-    support_counts = {1:0,2:0,3:0,4:0}
-    support_total = 0
-    for i in range(len(tail)-3):
-        t0,t1,t2, nxt = tail[i], tail[i+1], tail[i+2], tail[i+3]
-        if (t0,t1,t2) == (a,b,c):
-            support_counts[nxt] += 1
-            support_total += 1
-    if support_total == 0:
-        return (None, 0, 0.0)
-    best = max(support_counts, key=support_counts.get)
-    conf = support_counts[best] / support_total
-    return (best, support_total, conf)
+# ======== E8–E12 + M0 (sem EV novas) =========================================
+def _last_runlength(tail: List[int]) -> int:
+    if not tail: return 0
+    x = tail[-1]; r = 1
+    for i in range(len(tail)-2, -1, -1):
+        if tail[i] == x: r += 1
+        else: break
+    return r
 
-def _apply_seq3_boost(post: Dict[int,float], tail: List[int]) -> Tuple[Dict[int,float], str]:
-    """
-    Aplica força/boost SEQ3 conforme thresholds. Devolve (post_ajustado, tag_reason_extra)
-    """
-    if not SEQ3_ENABLED:
-        return post, ""
-    nxt, support, conf = _seq3_rule(tail)
-    if nxt is None:
-        return post, ""
-    if support >= SEQ3_MIN_SUPPORT and conf >= SEQ3_MIN_CONF:
-        if SEQ3_FORCE:
-            forced = {1:0.0,2:0.0,3:0.0,4:0.0}; forced[int(nxt)] = 1.0
-            return forced, f"| SEQ3_FORCE s={support} c={conf:.2f}→{nxt}"
-        boosted = {c: (1.0-SEQ3_BOOST)*post.get(c,0.0) for c in (1,2,3,4)}
-        boosted[int(nxt)] += SEQ3_BOOST
-        return _norm_dict(boosted), f"| SEQ3_BOOST s={support} c={conf:.2f}→{nxt}"
-    return post, ""
+def _get_gale_stage_safe() -> int:
+    row = get_open_pending()
+    if not row: return 0
+    try:
+        st = int(row["stage"] or 0)
+        return 2 if st >= 2 else (1 if st == 1 else 0)
+    except Exception:
+        return 0
 
-# --- (4) Anti-tilt com intensidade guiada por Fibonacci (conservador) ---
+# --- E8: Detector de Regime (usa 'Crupiê' e entropia) ------------------------
+def _regime_prior() -> Dict[str, float]:
+    snap = _dealer_snapshot()
+    kl = float(snap.get("kl", 0.0))
+    ent_s = float(snap.get("ent_s", 0.0))
+    ent_l = float(snap.get("ent_l", 0.0))
+    thr = float(os.getenv("DEALER_KL_THRESH", "0.22"))
+
+    if kl > thr and ent_s < 0.70:
+        regime = "tendencioso"
+        w_mom = 0.65; w_ctr = 0.15; w_cond = 0.20
+    elif ent_s > 0.85 and ent_l > 0.85:
+        regime = "caotico"
+        w_mom = 0.30; w_ctr = 0.40; w_cond = 0.30
+    else:
+        regime = "estavel"
+        w_mom = 0.45; w_ctr = 0.20; w_cond = 0.35
+
+    return {"regime": regime, "w_momentum": w_mom, "w_contrarian": w_ctr, "w_conditional": w_cond}
+
+# --- E9: Transição Condicional (After + Runlength) ---------------------------
+def _post_conditional(tail: List[int], after: Optional[int]) -> Dict[int, float]:
+    if len(tail) < 6:
+        return {1:0.25, 2:0.25, 3:0.25, 4:0.25}
+
+    last = tail[-1]
+    rl = _last_runlength(tail)
+    rl_bucket = 1 if rl == 1 else (2 if rl == 2 else 3)
+
+    counts = {1:1e-9, 2:1e-9, 3:1e-9, 4:1e-9}
+    total = 0
+    for i in range(3, len(tail)-1):
+        a,b,c = tail[i-3], tail[i-2], tail[i-1]
+        nxt = tail[i]
+        _last = c
+        _rl = 1
+        if a == b == c: _rl = 3
+        elif b == c:    _rl = 2
+
+        cond_ok = True
+        if after is not None:
+            cond_ok = (_last == after)
+        if cond_ok and _last == last and _rl == rl_bucket:
+            counts[nxt] = counts.get(nxt, 0.0) + 1.0
+            total += 1
+
+    if total == 0:
+        for i in range(len(tail)-1):
+            if tail[i] == last:
+                counts[tail[i+1]] = counts.get(tail[i+1], 0.0) + 1.0
+                total += 1
+        if total == 0:
+            return {1:0.25, 2:0.25, 3:0.25, 4:0.25}
+
+    return _norm_dict(counts)
+
+# --- E10: Suavizador Bayesiano (Dirichlet) -----------------------------------
+def _dirichlet_smooth(post: Dict[int, float], samples: int) -> Dict[int, float]:
+    post = _norm_dict(post)
+    alpha = max(0.2, min(1.2, 1.0 - 0.0005 * float(samples)))
+    eff = {c: post[c] * max(1.0, float(samples)) for c in (1,2,3,4)}
+    smooth = {c: (eff[c] + alpha) for c in (1,2,3,4)}
+    tot = sum(smooth.values()) or 1e-9
+    return {c: smooth[c]/tot for c in (1,2,3,4)}
+
+# --- E11: Contrarian (reversão à média) --------------------------------------
+def _post_contrarian(post_base: Dict[int, float]) -> Dict[int, float]:
+    if not post_base: return {1:0.25,2:0.25,3:0.25,4:0.25}
+    inv = {c: max(1e-9, 1.0 - float(post_base.get(c,0.0))) for c in (1,2,3,4)}
+    return _norm_dict(inv)
+
+# --- E12: Momentum de Curto Prazo (Burst) ------------------------------------
+def _post_momentum_burst(tail: List[int]) -> Dict[int, float]:
+    if not tail:
+        return {1:0.25,2:0.25,3:0.25,4:0.25}
+    wins = [8, 13, 21]
+    weights = [0.2, 0.3, 0.5]
+    acc = {1:0.0,2:0.0,3:0.0,4:0.0}
+    for k, wk in zip(wins, weights):
+        pk = _post_freq_k(tail, k)
+        for c in (1,2,3,4):
+            acc[c] += wk * pk[c]
+    return _norm_dict(acc)
+
+# --- M0: IA Regente (calibra pesos on-line) ----------------------------------
+def _m0_blend_extended(base_post: Dict[int,float], tail: List[int], after: Optional[int], samples: int) -> Tuple[Dict[int,float], str]:
+    pri = _regime_prior()
+    w_mom = pri["w_momentum"]; w_ctr = pri["w_contrarian"]; w_cnd = pri["w_conditional"]
+
+    p_cnd = _post_conditional(tail, after)
+    p_mom = _post_momentum_burst(tail)
+    p_ctr = _post_contrarian(base_post)
+
+    w_base = max(0.0, 1.0 - (w_mom + w_ctr + w_cnd))
+    mix = {
+        c: w_base*base_post.get(c,0.0) + w_cnd*p_cnd.get(c,0.0) + w_mom*p_mom.get(c,0.0) + w_ctr*p_ctr.get(c,0.0)
+        for c in (1,2,3,4)
+    }
+    mix = _norm_dict(mix)
+    smooth = _dirichlet_smooth(mix, samples)
+    tag = f"| M0:{pri['regime']} w0={w_base:.2f} wCnd={w_cnd:.2f} wMom={w_mom:.2f} wCtr={w_ctr:.2f}"
+    return smooth, tag
+
+# --- Anti-tilt com intensidade guiada por Fibonacci (conservador) ------------
 def _fib(n: int) -> int:
     if n <= 1: return 1
     a, b = 1, 1
@@ -535,7 +618,7 @@ def _streak_adjust_choice(post:Dict[int,float], gap:float, ls:int) -> Tuple[int,
 
     if FIB_ANTITILT_ENABLED and ls >= 4 and gap < 0.04:
         k = min(3, _fib(ls))
-        mix = min(0.30, 0.20 + 0.04 * k)  # 0.24..0.30
+        mix = min(0.30, 0.20 + 0.04 * k)
         comp = _norm_dict({c: max(1e-9, 1.0 - post[c]) for c in [1,2,3,4]})
         post = _norm_dict({c: (1.0 - mix)*post[c] + mix*comp[c] for c in [1,2,3,4]})
         ranking = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
@@ -549,7 +632,7 @@ def _streak_adjust_choice(post:Dict[int,float], gap:float, ls:int) -> Tuple[int,
             reason = "IA_runnerup_ls2"
     return best, reason, post
 
-# --- (5) Pós-ajuste: garantir piso de confiança (30%) e cap no H_MAX ---
+# --- Pós-ajuste: garantir piso de confiança (30%) e cap no H_MAX -------------
 def _apply_conf_floor(post: Dict[int,float], floor: float = MIN_CONF_FLOOR, cap: float = H_MAX) -> Tuple[Dict[int,float], str]:
     if not post: return post, ""
     post = _norm_dict({c: float(post.get(c,0.0)) for c in (1,2,3,4)})
@@ -630,95 +713,6 @@ def _hedge_update4(true_c:int, p1:Dict[int,float], p2:Dict[int,float], p3:Dict[i
     w4n = w4 * exp(-HEDGE_ETA * (1.0 - l(p4)))
     S = (w1n + w2n + w3n + w4n) or 1e-9
     _set_expert_w(w1n/S, w2n/S, w3n/S, w4n/S)
-
-# ========= Decisão principal =========
-def choose_single_number(after: Optional[int]):
-    tail = get_tail(400)
-
-    # Especialistas base
-    post_e1 = _post_from_tail(tail, after)                             # n-grama + feedback
-    post_e2 = _post_freq_fib(tail) if FIB_FREQ_ENABLED else _post_freq_k(tail, K_SHORT)
-    post_e3 = _post_freq_k(tail, K_LONG)                               # freq longa (300)
-    post_e4 = _llm_probs_from_tail(tail) or {1:0.25,2:0.25,3:0.25,4:0.25}
-
-    # Blend (Hedge)
-    post, (w1,w2,w3,w4) = _hedge_blend4(post_e1, post_e2, post_e3, post_e4)
-
-    # SEQ3 (trio->próximo) como pós-mix opcional
-    post, seq3_tag = _apply_seq3_boost(post, tail)
-
-    # Rank, gap e ajustes por streak
-    ranking = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
-    top2 = ranking[:2]
-    gap = (top2[0][1] - top2[1][1]) if len(top2) >= 2 else ranking[0][1]
-    base_best = ranking[0][0]
-    conf = float(post[base_best])
-    ls = _get_loss_streak()
-    best, reason, post_adj = _streak_adjust_choice(post, gap, ls)
-
-    # Pós-ajuste: piso de confiança 30% (sem travar fluxo)
-    post_final, floor_tag = _apply_conf_floor(post_adj, MIN_CONF_FLOOR, H_MAX)
-    best = max(post_final, key=post_final.get)
-    conf = float(post_final[best])
-
-    r2 = sorted(post_final.items(), key=lambda kv: kv[1], reverse=True)[:2]
-    gap2 = (r2[0][1] - r2[1][1]) if len(r2) == 2 else r2[0][1]
-
-    if seq3_tag:
-        reason = f"{reason} {seq3_tag}".strip()
-    if floor_tag:
-        reason = f"{reason} {floor_tag}".strip()
-
-    return best, conf, timeline_size(), post_final, gap2, reason
-
-# ========= Parse (com keycaps e ANALISANDO) =========
-ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
-SEQ_RX   = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
-AFTER_RX = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
-GALE1_RX = re.compile(r"Estamos\s+no\s*1[ºo]\s*gale", re.I)
-GALE2_RX = re.compile(r"Estamos\s+no\s*2[ºo]\s*gale", re.I)
-ANALISANDO_RX = re.compile(r"\bANALISANDO\b", re.I)
-
-GREEN_RX = re.compile(r"(?:\bgr+e+e?n\b|\bwin\b|✅)", re.I)
-LOSS_RX  = re.compile(r"(?:\blo+s+s?\b|\bred\b|❌|\bperdemos\b)", re.I)
-
-PAREN_GROUP_RX = re.compile(r"\(([^)]*)\)")
-ANY_14_RX      = re.compile(r"[1-4]")
-
-KEYCAP_MAP = {"1️⃣":"1","2️⃣":"2","3️⃣":"3","4️⃣":"4"}
-def _normalize_keycaps(s: str) -> str:
-    return "".join(KEYCAP_MAP.get(ch, ch) for ch in (s or ""))
-
-def parse_entry_text(text: str) -> Optional[Dict]:
-    t = _normalize_keycaps(re.sub(r"\s+", " ", text).strip())
-    if not ENTRY_RX.search(t):
-        return None
-    mseq = SEQ_RX.search(t)
-    seq = []
-    if mseq:
-        parts = re.findall(r"[1-4]", _normalize_keycaps(mseq.group(1)))
-        seq = [int(x) for x in parts]
-    mafter = AFTER_RX.search(t)
-    after_num = int(mafter.group(1)) if mafter else None
-    return {"seq": seq, "after": after_num, "raw": t}
-
-def parse_close_numbers(text: str) -> List[int]:
-    t = _normalize_keycaps(re.sub(r"\s+", " ", text))
-    groups = PAREN_GROUP_RX.findall(t)
-    if groups:
-        last = groups[-1]
-        nums = re.findall(r"[1-4]", _normalize_keycaps(last))
-        return [int(x) for x in nums][:3]
-    nums = ANY_14_RX.findall(t)
-    return [int(x) for x in nums][:3]
-
-def parse_analise_seq(text: str) -> List[int]:
-    if not ANALISANDO_RX.search(_normalize_keycaps(text or "")):
-        return []
-    mseq = SEQ_RX.search(_normalize_keycaps(text or ""))
-    if not mseq:
-        return []
-    return [int(x) for x in re.findall(r"[1-4]", mseq.group(1))]
 
 # ========= Score/State helpers =========
 def bump_score(outcome: str) -> Tuple[int, int]:
@@ -879,7 +873,6 @@ def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_l
                     if true_first is not None:
                         _feedback_upsert(n, _ctx_to_key(ctx[:-1]), true_first, +1.2*FEED_POS)
 
-        # timeline a partir do fechamento
         obs_add = [int(x) for x in final_seen.split("-") if x.isdigit()]
         append_seq(obs_add)
     except Exception:
@@ -962,6 +955,86 @@ async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
     except Exception:
         pass
 
+# ========= Decisão principal =========
+def _apply_seq3_boost(post: Dict[int,float], tail: List[int]) -> Tuple[Dict[int,float], str]:
+    if not SEQ3_ENABLED:
+        return post, ""
+    if len(tail) < 4:
+        return post, ""
+    a,b,c = tail[-3:]
+    support_counts = {1:0,2:0,3:0,4:0}
+    support_total = 0
+    for i in range(len(tail)-3):
+        t0,t1,t2, nxt = tail[i], tail[i+1], tail[i+2], tail[i+3]
+        if (t0,t1,t2) == (a,b,c):
+            support_counts[nxt] += 1
+            support_total += 1
+    if support_total == 0:
+        return post, ""
+    best = max(support_counts, key=support_counts.get)
+    conf = support_counts[best] / support_total
+    if support_total >= SEQ3_MIN_SUPPORT and conf >= SEQ3_MIN_CONF:
+        if SEQ3_FORCE:
+            forced = {1:0.0,2:0.0,3:0.0,4:0.0}; forced[int(best)] = 1.0
+            return forced, f"| SEQ3_FORCE s={support_total} c={conf:.2f}→{best}"
+        boosted = {c_: (1.0-SEQ3_BOOST)*post.get(c_,0.0) for c_ in (1,2,3,4)}
+        boosted[int(best)] += SEQ3_BOOST
+        return _norm_dict(boosted), f"| SEQ3_BOOST s={support_total} c={conf:.2f}→{best}"
+    return post, ""
+
+def choose_single_number(after: Optional[int]):
+    tail = get_tail(400)
+
+    # Especialistas base
+    post_e1 = _post_from_tail(tail, after)
+    post_e2 = _post_freq_fib(tail) if FIB_FREQ_ENABLED else _post_freq_k(tail, K_SHORT)
+    post_e3 = _post_freq_k(tail, K_LONG)
+    post_e4 = _llm_probs_from_tail(tail) or {1:0.25,2:0.25,3:0.25,4:0.25}
+
+    # Blend (Hedge original)
+    post_base, (w1,w2,w3,w4) = _hedge_blend4(post_e1, post_e2, post_e3, post_e4)
+
+    # SEQ3 (trio->próximo) como pós-mix opcional
+    post_seq3, seq3_tag = _apply_seq3_boost(post_base, tail)
+
+    # Gap de diagnóstico (pré-M0)
+    ranking0 = sorted(post_seq3.items(), key=lambda kv: kv[1], reverse=True)
+    top20 = ranking0[:2]
+    gap0 = (top20[0][1] - top20[1][1]) if len(top20) >= 2 else ranking0[0][1]
+
+    # ===== M0: IA Regente (E8/E9/E10/E11/E12) =====
+    post_m0, m0_tag = _m0_blend_extended(post_seq3, tail, after, timeline_size())
+
+    # Ranking/gap após M0
+    ranking = sorted(post_m0.items(), key=lambda kv: kv[1], reverse=True)
+    top2 = ranking[:2]
+    gap = (top2[0][1] - top2[1][1]) if len(top2) >= 2 else ranking[0][1]
+    base_best = ranking[0][0]
+    conf = float(post_m0[base_best])
+
+    # Anti-tilt final
+    ls = _get_loss_streak()
+    best, reason, post_adj = _streak_adjust_choice(post_m0, gap, ls)
+
+    # Piso/cap de confiança
+    post_final, floor_tag = _apply_conf_floor(post_adj, MIN_CONF_FLOOR, H_MAX)
+    best = max(post_final, key=post_final.get)
+    conf = float(post_final[best])
+
+    r2 = sorted(post_final.items(), key=lambda kv: kv[1], reverse=True)[:2]
+    gap2 = (r2[0][1] - r2[1][1]) if len(r2) == 2 else r2[0][1]
+
+    # Motivo (tags)
+    reason_tags = []
+    if seq3_tag: reason_tags.append(seq3_tag)
+    if m0_tag:  reason_tags.append(m0_tag)
+    if floor_tag: reason_tags.append(floor_tag)
+    reason_full = (" ".join(reason_tags)).strip()
+    if reason_full:
+        reason = f"{reason} {reason_full}".strip()
+
+    return best, conf, timeline_size(), post_final, gap2, reason
+
 # ========= Rotas =========
 @app.get("/")
 async def root():
@@ -1012,7 +1085,16 @@ async def webhook(token: str, request: Request):
         return {"ok": True, "skipped": "sem_texto"}
 
     # 0) ANALISANDO — aprender e ADIANTAR FECHAMENTO (sem abrir/fechar por si só)
-    if ANALISANDO_RX.search(_normalize_keycaps(text)):
+    ANALISANDO_RX = re.compile(r"\bANALISANDO\b", re.I)
+    if ANALISANDO_RX.search(("".join({"1️⃣":"1","2️⃣":"2","3️⃣":"3","4️⃣":"4"}.get(ch, ch) for ch in text))):
+        def _normalize_keycaps(s: str) -> str:
+            return "".join({"1️⃣":"1","2️⃣":"2","3️⃣":"3","4️⃣":"4"}.get(ch, ch) for ch in (s or ""))
+        def parse_analise_seq(txt: str) -> List[int]:
+            SEQ_RX = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
+            if not ANALISANDO_RX.search(_normalize_keycaps(txt or "")): return []
+            mseq = SEQ_RX.search(_normalize_keycaps(txt or ""))
+            if not mseq: return []
+            return [int(x) for x in re.findall(r"[1-4]", mseq.group(1))]
         seq = parse_analise_seq(text)
         if seq:
             append_seq(seq)
@@ -1037,6 +1119,43 @@ async def webhook(token: str, request: Request):
                             return {"ok": True, "closed_from_analise": True, "seen": final_seen}
         return {"ok": True, "analise_seen": len(seq)}
 
+    # Regexes gerais
+    ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
+    SEQ_RX   = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
+    AFTER_RX = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
+    GALE1_RX = re.compile(r"Estamos\s+no\s*1[ºo]\s*gale", re.I)
+    GALE2_RX = re.compile(r"Estamos\s+no\s*2[ºo]\s*gale", re.I)
+    GREEN_RX = re.compile(r"(?:\bgr+e+e?n\b|\bwin\b|✅)", re.I)
+    LOSS_RX  = re.compile(r"(?:\blo+s+s?\b|\bred\b|❌|\bperdemos\b)", re.I)
+    PAREN_GROUP_RX = re.compile(r"\(([^)]*)\)")
+    ANY_14_RX      = re.compile(r"[1-4]")
+    KEYCAP_MAP = {"1️⃣":"1","2️⃣":"2","3️⃣":"3","4️⃣":"4"}
+    def _normalize_keycaps(s: str) -> str:
+        return "".join(KEYCAP_MAP.get(ch, ch) for ch in (s or ""))
+
+    def parse_entry_text(txt: str) -> Optional[Dict]:
+        t = _normalize_keycaps(re.sub(r"\s+", " ", txt).strip())
+        if not ENTRY_RX.search(t):
+            return None
+        mseq = SEQ_RX.search(t)
+        seq = []
+        if mseq:
+            parts = re.findall(r"[1-4]", _normalize_keycaps(mseq.group(1)))
+            seq = [int(x) for x in parts]
+        mafter = AFTER_RX.search(t)
+        after_num = int(mafter.group(1)) if mafter else None
+        return {"seq": seq, "after": after_num, "raw": t}
+
+    def parse_close_numbers(txt: str) -> List[int]:
+        t = _normalize_keycaps(re.sub(r"\s+", " ", txt))
+        groups = PAREN_GROUP_RX.findall(t)
+        if groups:
+            last = groups[-1]
+            nums = re.findall(r"[1-4]", _normalize_keycaps(last))
+            return [int(x) for x in nums][:3]
+        nums = ANY_14_RX.findall(t)
+        return [int(x) for x in nums][:3]
+
     # 1) Gales (informativo)
     if GALE1_RX.search(text):
         if get_open_pending():
@@ -1050,8 +1169,7 @@ async def webhook(token: str, request: Request):
         return {"ok": True, "noted": "g2"}
 
     # 2) Fechamentos do fonte (GREEN/LOSS)
-    if GREEN_RX.search(text) o
-r LOSS_RX.search(text):
+    if GREEN_RX.search(text) or LOSS_RX.search(text):
         pend = get_open_pending()
         if pend:
             nums = parse_close_numbers(text)
