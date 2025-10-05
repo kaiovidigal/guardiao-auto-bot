@@ -21,7 +21,7 @@ ENV opcionais:    TARGET_CHANNEL, SOURCE_CHANNEL, DB_PATH, DEBUG_MSG, BYPASS_SOU
                   DEALER_KL_THRESH, DEALER_ALPHA
 """
 import os, re, time, sqlite3, math, json
-from contextlib import contextmanager
+from contextmanager import contextmanager
 from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timezone
 
@@ -234,6 +234,21 @@ def _exec_write(sql: str, params: tuple=()):
             if "locked" in emsg or "busy" in emsg:
                 time.sleep(0.25*(attempt+1)); continue
             raise
+
+# --- dedupe helpers (faltavam) ---
+def _is_processed(update_id: str) -> bool:
+    if not update_id:
+        return False
+    con = _connect()
+    row = con.execute("SELECT 1 FROM processed WHERE update_id=?", (update_id,)).fetchone()
+    con.close()
+    return bool(row)
+
+def _mark_processed(update_id: str):
+    if not update_id:
+        return
+    _exec_write("INSERT OR IGNORE INTO processed (update_id, seen_at) VALUES (?,?)",
+                (str(update_id), now_ts()))
 
 # --- (1) Prior do Hedge com pesos de Fibonacci [1,1,2,3] normalizados (opcional) ---
 def _get_expert_w():
@@ -549,7 +564,7 @@ def _post_conditional(tail: List[int], after: Optional[int]) -> Dict[int, float]
     if total == 0:
         for i in range(len(tail)-1):
             if tail[i] == last:
-                counts[tail[i+1]] = counts.get(tail[i+1], 0.0) + 1.0
+                counts[tail[i+1]] = counts.get( tail[i+1], 0.0) + 1.0
                 total += 1
         if total == 0:
             return {1:0.25, 2:0.25, 3:0.25, 4:0.25}
