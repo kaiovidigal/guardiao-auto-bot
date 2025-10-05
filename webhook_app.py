@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-webhook_app.py — v4.5.0 (Fibonacci + SEQ3 + ConfFloor 30% + E8–E12 + M0)
+webhook_app.py — v4.6.0 (Fibonacci + SEQ3 + ConfFloor 30% + E8–E12 + M0 + Até G1/G2 + Parser Estrito + Timeout Neutro)
 
 - Fluxo estrito + anti-tilt conservador (opcional, via ENV)
 - Especialista curto multi-janela em Fibonacci (opcional, via ENV)
@@ -12,16 +12,18 @@ webhook_app.py — v4.5.0 (Fibonacci + SEQ3 + ConfFloor 30% + E8–E12 + M0)
 - IA Regente (M0) que calibra pesos on-line (sem EV nova)
 - "ANALISANDO": aprende sequência e pode adiantar fechamento
 - Placar zera todo dia às 00:00 (fuso TZ_NAME)
+- Até G1/G2 configurável (MAX_GALE); parser estrito (par/trinca) e timeout neutro
+- Endpoint /llm_status para diagnosticar IA
 
 ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
 ENV opcionais:    TARGET_CHANNEL, SOURCE_CHANNEL, DB_PATH, DEBUG_MSG, BYPASS_SOURCE
                   LLM_ENABLED, LLM_MODEL_PATH, LLM_CTX_TOKENS, LLM_N_THREADS, LLM_TEMP, LLM_TOP_P
                   TZ_NAME, FIB_FREQ_ENABLED, FIB_ANTITILT_ENABLED, HEDGE_FIB_SEED
                   SEQ3_ENABLED, SEQ3_MIN_SUPPORT, SEQ3_MIN_CONF, SEQ3_BOOST, SEQ3_FORCE
-                  DEALER_KL_THRESH, DEALER_ALPHA
+                  DEALER_KL_THRESH, DEALER_ALPHA, MAX_GALE, OBS_TIMEOUT_SEC
 """
 import os, re, time, sqlite3, math, json
-from contextmanager import contextmanager
+from contextlib import contextmanager
 from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timezone
 
@@ -76,12 +78,11 @@ if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
 # ========= App =========
-app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="4.5.0")
+app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="4.6.0")
 
 # ========= Parâmetros =========
 DECAY = 0.980
 W4, W3, W2, W1 = 0.42, 0.30, 0.18, 0.10
-OBS_TIMEOUT_SEC = 240  # fecha por timeout só se já houver 2 observados
 
 # ======== Gates (diagnóstico; não bloqueiam abertura) ========
 CONF_MIN    = 0.62
@@ -107,6 +108,15 @@ WF4, WF3, WF2, WF1 = W4, W3, W2, W1
 HEDGE_ETA = 0.75
 K_SHORT   = 60
 K_LONG    = 300
+
+# ======== Até qual gale considerar (G0/G1/G2) ========
+# MAX_GALE=2 (padrão) => até G2 (3 observações). Para até G1, use MAX_GALE=1 (2 observações).
+MAX_GALE = int(os.getenv("MAX_GALE", "2"))
+N_OBS_REQUIRED = max(1, min(3, MAX_GALE + 1))  # G0->1, G1->2, G2->3
+
+# ======== Timeout de observação ========
+# Sugerido: 420 (7min) se seu fonte é mais lento.
+OBS_TIMEOUT_SEC = int(os.getenv("OBS_TIMEOUT_SEC", str(240 if N_OBS_REQUIRED == 3 else 300)))
 
 # ========= Utils =========
 def now_ts() -> int: return int(time.time())
@@ -235,7 +245,7 @@ def _exec_write(sql: str, params: tuple=()):
                 time.sleep(0.25*(attempt+1)); continue
             raise
 
-# --- dedupe helpers (faltavam) ---
+# --- dedupe helpers ---
 def _is_processed(update_id: str) -> bool:
     if not update_id:
         return False
@@ -434,6 +444,14 @@ _LLM_SYSTEM = (
 def _llm_probs_from_tail(tail: List[int]) -> Dict[int,float]:
     llm = _llm_load()
     if llm is None or not LLM_ENABLED:
+        if DEBUG_MSG:
+            try:
+                import asyncio as _asyncio
+                _asyncio.create_task(
+                    tg_send_text(TARGET_CHANNEL, f"DEBUG LLM: enabled={LLM_ENABLED} path='{LLM_MODEL_PATH}' exists={os.path.exists(LLM_MODEL_PATH)} loaded=False")
+                )
+            except Exception:
+                pass
         return {}
     win60  = tail[-60:] if len(tail) >= 60 else tail
     win300 = tail[-300:] if len(tail) >= 300 else tail
@@ -817,19 +835,27 @@ def _seen_list(row: sqlite3.Row) -> List[str]:
 def _seen_append(row: sqlite3.Row, new_items: List[str]):
     cur_seen = _seen_list(row)
     for it in new_items:
-        if len(cur_seen) >= 3: break
+        if len(cur_seen) >= N_OBS_REQUIRED: break
         if it not in cur_seen:
             cur_seen.append(it)
-    seen_txt = "-".join(cur_seen[:3])
+    seen_txt = "-".join(cur_seen[:N_OBS_REQUIRED])
     with _tx() as con:
         con.execute("UPDATE pending SET seen=? WHERE id=?", (seen_txt, int(row["id"])))
 
 def _stage_from_observed(suggested: int, obs: List[int]) -> Tuple[str, str]:
-    if not obs: return ("LOSS", "G2")
-    if len(obs) >= 1 and obs[0] == suggested: return ("GREEN", "G0")
-    if len(obs) >= 2 and obs[1] == suggested: return ("GREEN", "G1")
-    if len(obs) >= 3 and obs[2] == suggested: return ("GREEN", "G2")
-    return ("LOSS", "G2")
+    """
+    GREEN se o 'suggested' aparecer em até MAX_GALE estágios:
+      G0: obs[0] == suggested
+      G1: obs[1] == suggested (se MAX_GALE>=1)
+      G2: obs[2] == suggested (se MAX_GALE>=2)
+    Caso contrário, LOSS com label G{MAX_GALE}.
+    """
+    stages = ["G0", "G1", "G2"]
+    lim = min(MAX_GALE, 2)
+    for i in range(0, lim + 1):
+        if len(obs) >= i + 1 and obs[i] == suggested:
+            return ("GREEN", stages[i])
+    return ("LOSS", stages[lim])
 
 def _ngram_snapshot_text(suggested: int) -> str:
     tail = get_tail(400)
@@ -928,22 +954,30 @@ def _maybe_close_by_timeout():
     if now_ts() - opened_at < OBS_TIMEOUT_SEC:
         return None
     seen_list = _seen_list(row)
-    if len(seen_list) == 2:
-        seen_list.append("X")
-        final_seen = "-".join(seen_list[:3])
-        suggested = int(row["suggested"] or 0)
-        obs_nums = [int(x) for x in seen_list if x.isdigit()]
-        outcome, stage_lbl = _stage_from_observed(suggested, obs_nums)
-        return _close_with_outcome(row, outcome, final_seen, stage_lbl, suggested)
+
+    # Timeout NEUTRO quando faltava apenas 1 observado
+    if len(seen_list) == N_OBS_REQUIRED - 1:
+        final_seen = "-".join(seen_list + ["X"])
+        with _tx() as con:
+            con.execute("UPDATE pending SET open=0, seen=? WHERE id=?", (final_seen, int(row["id"])))
+        if DEBUG_MSG:
+            try:
+                import asyncio as _asyncio
+                _asyncio.create_task(tg_send_text(TARGET_CHANNEL, f"⏳ Timeout neutro (faltava 1). seen={final_seen}"))
+            except Exception:
+                pass
+        return None
+
+    # Se já havia N_OBS_REQUIRED, deixa para os fluxos normais fecharem
     return None
 
 def close_pending(outcome:str):
     row = get_open_pending()
     if not row: return
     seen_list = _seen_list(row)
-    while len(seen_list) < 3:
+    while len(seen_list) < N_OBS_REQUIRED:
         seen_list.append("X")
-    final_seen = "-".join(seen_list[:3])
+    final_seen = "-".join(seen_list[:N_OBS_REQUIRED])
     suggested = int(row["suggested"] or 0)
     obs_nums = [int(x) for x in seen_list if x.isdigit()]
     outcome2, stage_lbl = _stage_from_observed(suggested, obs_nums)
@@ -1064,6 +1098,20 @@ async def health():
     seen = (pend["seen"] if pend else "")
     return {"ok": True, "db": DB_PATH, "pending_open": pend_open, "pending_seen": seen, "time": ts_str(), "tz": TZ_NAME}
 
+# ====== NOVO: status da IA (diagnóstico rápido) ======
+@app.get("/llm_status")
+async def llm_status():
+    llm = _llm_load()
+    exists = os.path.exists(LLM_MODEL_PATH)
+    return {
+        "enabled": bool(LLM_ENABLED),
+        "model_path": LLM_MODEL_PATH,
+        "model_exists": bool(exists),
+        "loaded": bool(llm is not None),
+        "ctx_tokens": LLM_CTX_TOKENS,
+        "threads": LLM_N_THREADS,
+    }
+
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
     if token != WEBHOOK_TOKEN:
@@ -1079,10 +1127,8 @@ async def webhook(token: str, request: Request):
         return {"ok": True, "skipped": "duplicate_update"}
     _mark_processed(upd_id)
 
-    # timeout pode fechar pendência antiga (apenas se já houver 2 observados)
-    timeout_msg = _maybe_close_by_timeout()
-    if timeout_msg:
-        await tg_send_text(TARGET_CHANNEL, timeout_msg)
+    # timeout pode fechar pendência antiga (apenas neutro quando faltar 1)
+    _ = _maybe_close_by_timeout()
 
     msg = data.get("channel_post") or data.get("message") \
         or data.get("edited_channel_post") or data.get("edited_message") or {}
@@ -1099,13 +1145,69 @@ async def webhook(token: str, request: Request):
     if not text:
         return {"ok": True, "skipped": "sem_texto"}
 
+    # === FECHAMENTO ESTRITO POR OBSERVAÇÕES (par/trinca no fim da msg) ===
+    # Aceita com/sem parênteses; separadores: -, –, —, x, /, |, .
+    SEP = r"[-–—xX/|\.]"
+    GRUPO_FINAL_PAREN_RX = re.compile(r"\(([^\)]*)\)\s*$")
+    PAR_SOLTO_FIM_RX    = re.compile(rf"\b([1-4])\s*{SEP}\s*([1-4])\s*$")
+    TRINCA_SOLTA_FIM_RX = re.compile(rf"\b([1-4])\s*{SEP}\s*([1-4])\s*{SEP}\s*([1-4])\s*$")
+    PAR_NUMS_RX    = re.compile(rf"\b([1-4])\s*{SEP}\s*([1-4])\b")
+    TRINCA_NUMS_RX = re.compile(rf"\b([1-4])\s*{SEP}\s*([1-4])\s*{SEP}\s*([1-4])\b")
+
+    def _normalize_keycaps(s: str) -> str:
+        return "".join({"1️⃣":"1","2️⃣":"2","3️⃣":"3","4️⃣":"4"}.get(ch, ch) for ch in (s or ""))
+
+    def parse_obs_estrito(txt: str, need: int) -> List[int]:
+        t = _normalize_keycaps(re.sub(r"\s+", " ", txt or ""))
+        m = GRUPO_FINAL_PAREN_RX.search(t)
+        if m:
+            seg = m.group(1)
+            if need == 2:
+                mp = PAR_NUMS_RX.search(seg)
+                if mp: return [int(mp.group(1)), int(mp.group(2))]
+            if need == 3:
+                m3 = TRINCA_NUMS_RX.search(seg)
+                if m3: return [int(m3.group(1)), int(m3.group(2)), int(m3.group(3))]
+        if need == 2:
+            ms = PAR_SOLTO_FIM_RX.search(t)
+            if ms: return [int(ms.group(1)), int(ms.group(2))]
+        if need == 3:
+            ms3 = TRINCA_SOLTA_FIM_RX.search(t)
+            if ms3: return [int(ms3.group(1)), int(ms3.group(2)), int(ms3.group(3))]
+        return []
+
+    pend = get_open_pending()
+    if pend:
+        nums_need = N_OBS_REQUIRED
+        nums = parse_obs_estrito(text, nums_need)
+        if nums:
+            _seen_append(pend, [str(n) for n in nums])
+            pend = get_open_pending()
+            cur_seen = _seen_list(pend)
+            if len(cur_seen) >= N_OBS_REQUIRED:
+                suggested = int(pend["suggested"] or 0)
+                obs_nums = [int(x) for x in cur_seen if x.isdigit()]
+                outcome, stage_lbl = _stage_from_observed(suggested, obs_nums)
+                final_seen = "-".join(cur_seen[:N_OBS_REQUIRED])
+                out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
+                await tg_send_text(TARGET_CHANNEL, out_msg)
+                return {"ok": True, "closed_by_obs_strict": True, "seen": final_seen, "outcome": outcome}
+
+    # Regexes gerais
+    ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
+    SEQ_RX   = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
+    AFTER_RX = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
+    GALE1_RX = re.compile(r"Estamos\s+no\s*1[ºo]\s*gale", re.I)
+    GALE2_RX = re.compile(r"Estamos\s+no\s*2[ºo]\s*gale", re.I)
+    GREEN_RX = re.compile(r"(?:\bgr+e+e?n\b|\bwin\b|✅)", re.I)
+    LOSS_RX  = re.compile(r"(?:\blo+s+s?\b|\bred\b|❌|\bperdemos\b)", re.I)
+    PAREN_GROUP_RX = re.compile(r"\(([^)]*)\)")
+    ANY_14_RX      = re.compile(r"[1-4]")  # não usar mais como fallback de fechamento
+
     # 0) ANALISANDO — aprender e ADIANTAR FECHAMENTO (sem abrir/fechar por si só)
     ANALISANDO_RX = re.compile(r"\bANALISANDO\b", re.I)
-    if ANALISANDO_RX.search(("".join({"1️⃣":"1","2️⃣":"2","3️⃣":"3","4️⃣":"4"}.get(ch, ch) for ch in text))):
-        def _normalize_keycaps(s: str) -> str:
-            return "".join({"1️⃣":"1","2️⃣":"2","3️⃣":"3","4️⃣":"4"}.get(ch, ch) for ch in (s or ""))
+    if ANALISANDO_RX.search(_normalize_keycaps(text)):
         def parse_analise_seq(txt: str) -> List[int]:
-            SEQ_RX = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
             if not ANALISANDO_RX.search(_normalize_keycaps(txt or "")): return []
             mseq = SEQ_RX.search(_normalize_keycaps(txt or ""))
             if not mseq: return []
@@ -1117,59 +1219,22 @@ async def webhook(token: str, request: Request):
             if pend:
                 to_add = []
                 cur_seen = _seen_list(pend)
-                need = 3 - len(cur_seen)
+                need = N_OBS_REQUIRED - len(cur_seen)
                 if need > 0:
                     to_add = [str(n) for n in seq[:need]]
                     if to_add:
                         _seen_append(pend, to_add)
                         pend = get_open_pending()
                         cur_seen = _seen_list(pend)
-                        if len(cur_seen) >= 3:
+                        if len(cur_seen) >= N_OBS_REQUIRED:
                             suggested = int(pend["suggested"] or 0)
                             obs_nums = [int(x) for x in cur_seen if x.isdigit()]
                             outcome, stage_lbl = _stage_from_observed(suggested, obs_nums)
-                            final_seen = "-".join(cur_seen[:3])
+                            final_seen = "-".join(cur_seen[:N_OBS_REQUIRED])
                             out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
                             await tg_send_text(TARGET_CHANNEL, out_msg)
                             return {"ok": True, "closed_from_analise": True, "seen": final_seen}
         return {"ok": True, "analise_seen": len(seq)}
-
-    # Regexes gerais
-    ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
-    SEQ_RX   = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
-    AFTER_RX = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
-    GALE1_RX = re.compile(r"Estamos\s+no\s*1[ºo]\s*gale", re.I)
-    GALE2_RX = re.compile(r"Estamos\s+no\s*2[ºo]\s*gale", re.I)
-    GREEN_RX = re.compile(r"(?:\bgr+e+e?n\b|\bwin\b|✅)", re.I)
-    LOSS_RX  = re.compile(r"(?:\blo+s+s?\b|\bred\b|❌|\bperdemos\b)", re.I)
-    PAREN_GROUP_RX = re.compile(r"\(([^)]*)\)")
-    ANY_14_RX      = re.compile(r"[1-4]")
-    KEYCAP_MAP = {"1️⃣":"1","2️⃣":"2","3️⃣":"3","4️⃣":"4"}
-    def _normalize_keycaps(s: str) -> str:
-        return "".join(KEYCAP_MAP.get(ch, ch) for ch in (s or ""))
-
-    def parse_entry_text(txt: str) -> Optional[Dict]:
-        t = _normalize_keycaps(re.sub(r"\s+", " ", txt).strip())
-        if not ENTRY_RX.search(t):
-            return None
-        mseq = SEQ_RX.search(t)
-        seq = []
-        if mseq:
-            parts = re.findall(r"[1-4]", _normalize_keycaps(mseq.group(1)))
-            seq = [int(x) for x in parts]
-        mafter = AFTER_RX.search(t)
-        after_num = int(mafter.group(1)) if mafter else None
-        return {"seq": seq, "after": after_num, "raw": t}
-
-    def parse_close_numbers(txt: str) -> List[int]:
-        t = _normalize_keycaps(re.sub(r"\s+", " ", txt))
-        groups = PAREN_GROUP_RX.findall(t)
-        if groups:
-            last = groups[-1]
-            nums = re.findall(r"[1-4]", _normalize_keycaps(last))
-            return [int(x) for x in nums][:3]
-        nums = ANY_14_RX.findall(t)
-        return [int(x) for x in nums][:3]
 
     # 1) Gales (informativo)
     if GALE1_RX.search(text):
@@ -1183,24 +1248,38 @@ async def webhook(token: str, request: Request):
             await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>2° gale (G2)</b>")
         return {"ok": True, "noted": "g2"}
 
-    # 2) Fechamentos do fonte (GREEN/LOSS)
+    # 2) Fechamentos do fonte (GREEN/LOSS) — usar parser estrito e exigir N_OBS_REQUIRED
     if GREEN_RX.search(text) or LOSS_RX.search(text):
         pend = get_open_pending()
         if pend:
-            nums = parse_close_numbers(text)
+            nums = parse_obs_estrito(text, N_OBS_REQUIRED)
             if nums:
                 _seen_append(pend, [str(n) for n in nums])
                 pend = get_open_pending()
             seen_list = _seen_list(pend) if pend else []
-            if pend and len(seen_list) >= 3:
+            if pend and len(seen_list) >= N_OBS_REQUIRED:
                 suggested = int(pend["suggested"] or 0)
                 obs_nums = [int(x) for x in seen_list if x.isdigit()]
                 outcome, stage_lbl = _stage_from_observed(suggested, obs_nums)
-                final_seen = "-".join(seen_list[:3])
+                final_seen = "-".join(seen_list[:N_OBS_REQUIRED])
                 out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
                 await tg_send_text(TARGET_CHANNEL, out_msg)
                 return {"ok": True, "closed": outcome.lower(), "seen": final_seen}
         return {"ok": True, "noted_close": True}
+
+    # Funções auxiliares para ENTRADA
+    def parse_entry_text(txt: str) -> Optional[Dict]:
+        t = _normalize_keycaps(re.sub(r"\s+", " ", txt).strip())
+        if not ENTRY_RX.search(t):
+            return None
+        mseq = SEQ_RX.search(t)
+        seq = []
+        if mseq:
+            parts = re.findall(r"[1-4]", _normalize_keycaps(mseq.group(1)))
+            seq = [int(x) for x in parts]
+        mafter = AFTER_RX.search(t)
+        after_num = int(mafter.group(1)) if mafter else None
+        return {"seq": seq, "after": after_num, "raw": t}
 
     # 3) Nova ENTRADA CONFIRMADA (Fluxo estrito)
     parsed = parse_entry_text(text)
@@ -1209,15 +1288,15 @@ async def webhook(token: str, request: Request):
             await tg_send_text(TARGET_CHANNEL, "DEBUG: Mensagem não reconhecida como ENTRADA/FECHAMENTO/ANALISANDO.")
         return {"ok": True, "skipped": "nao_eh_entrada_confirmada"}
 
-    # se existir pendência e estiver incompleta, NÃO abre novo (sem avisos)
+    # se existir pendência e estiver completa, fecha; senão mantém aberta
     pend = get_open_pending()
     if pend:
         seen_list = _seen_list(pend)
-        if len(seen_list) >= 3:
+        if len(seen_list) >= N_OBS_REQUIRED:
             suggested = int(pend["suggested"] or 0)
             obs_nums = [int(x) for x in seen_list if x.isdigit()]
             outcome, stage_lbl = _stage_from_observed(suggested, obs_nums)
-            final_seen = "-".join(seen_list[:3])
+            final_seen = "-".join(seen_list[:N_OBS_REQUIRED])
             out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
             await tg_send_text(TARGET_CHANNEL, out_msg)
         else:
