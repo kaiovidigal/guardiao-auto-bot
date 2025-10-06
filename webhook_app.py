@@ -2,18 +2,22 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v5.0 (G1-only, parser canal-fonte, IA hierárquica compacta, DB SQLite)
+v5.1 (G1-only, parser canal-fonte, empate neutro, timeout neutro, IA compacta, DB SQLite)
 
-Requisitos de ambiente (Render -> Environment):
+ENV obrigatórias (Render -> Environment):
 - TG_BOT_TOKEN
 - WEBHOOK_TOKEN
-- SOURCE_CHANNEL           ex: -1002810508717
-- TARGET_CHANNEL           ex: -1003052132833
-- (opcional) SHOW_DEBUG    "True"/"False"
-- (opcional) MAX_GALE      default 1 (G0/G1)
-- (opcional) OBS_TIMEOUT_SEC default 420
+- SOURCE_CHANNEL            ex: -1002810508717   (canal fonte)
+- TARGET_CHANNEL            ex: -1003052132833   (canal destino)
 
-Start command (Render):  uvicorn webhook_app:app --host 0.0.0.0 --port $PORT
+ENV opcionais:
+- SHOW_DEBUG                "True"/"False" (default False)
+- MAX_GALE                  default 1 (G0/G1)
+- OBS_TIMEOUT_SEC           default 420  (7 min)
+- ENABLE_TIE_WIN            "True"/"False" (default False -> EMPATE = neutro)
+
+Start command (Render):
+  uvicorn webhook_app:app --host 0.0.0.0 --port $PORT
 """
 
 import os, re, json, time, math, sqlite3, datetime
@@ -34,17 +38,19 @@ TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "").strip()
 SHOW_DEBUG      = os.getenv("SHOW_DEBUG", "False").strip().lower() == "true"
 MAX_GALE        = int(os.getenv("MAX_GALE", "1"))
 OBS_TIMEOUT_SEC = int(os.getenv("OBS_TIMEOUT_SEC", "420"))
+ENABLE_TIE_WIN  = os.getenv("ENABLE_TIE_WIN", "False").strip().lower() == "true"  # Empate = neutro por padrão
 
 if not TG_BOT_TOKEN or not WEBHOOK_TOKEN or not TARGET_CHANNEL:
     raise RuntimeError("Faltam ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN, TARGET_CHANNEL.")
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 DB_PATH = "/opt/render/project/src/main.sqlite"
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 # ------------------------------------------------------
 # App
 # ------------------------------------------------------
-app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="5.0")
+app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="5.1")
 
 # ------------------------------------------------------
 # DB helpers
@@ -88,6 +94,8 @@ def db_init():
 db_init()
 
 def _mark_processed(upd: str):
+    if not upd:
+        return
     try:
         con = _con()
         con.execute("INSERT OR IGNORE INTO processed(update_id,seen_at) VALUES(?,?)",(str(upd), int(time.time())))
@@ -143,8 +151,9 @@ def _pending_set_stage(stage:int):
     con.commit(); con.close()
 
 def _pending_seen_append(nums: List[int], need:int=2):
-    row = _pending_get(); ifnot = (row is None)
-    if ifnot: return
+    row = _pending_get()
+    if row is None:
+        return
     seen = (row["seen"] or "").strip()
     arr = [s for s in seen.split("-") if s]
     for n in nums:
@@ -159,6 +168,8 @@ def _pending_close(final_seen: str, outcome: str, stage_lbl: str, suggested:int)
     con = _con()
     con.execute("UPDATE pending SET open=0, seen=? WHERE id=?", (final_seen, int(row["id"])))
     con.commit(); con.close()
+
+    # contabiliza placar apenas se GREEN ou LOSS (timeout e neutros não chamam esta função)
     _score_add(outcome)
 
     # alimentar timeline com observados
@@ -186,7 +197,7 @@ def _post_freq(tail:List[int], k:int)->Dict[int,float]:
     return _norm({c:win.count(c)/tot for c in (1,2,3,4)})
 
 def _post_e1_ngram(tail:List[int])->Dict[int,float]:
-    # proxy simples: mistura de janelas
+    # proxy simples: mistura de janelas (8/21/55)
     mix={c:0.0 for c in (1,2,3,4)}
     for k,w in ((8,0.25),(21,0.35),(55,0.40)):
         pk=_post_freq(tail,k)
@@ -234,8 +245,8 @@ def _choose_number()->Tuple[int,float,int,Dict[int,float],float,str]:
     p3=_post_e3_long(tail)
     p4=_post_e4_llm(tail)
     base=_hedge(p1,p2,p3,p4)
-    # hierarquia-reguladores (antitilt, smooth etc. já embutido via conf_floor)
-    best, post, reason = _runnerup_ls2(base, loss_streak=_get_ls())
+    # hierarquia-reguladores (antitilt/smooth embutidos via conf_floor)
+    best, post, reason = _runnerup_ls2(base, loss_streak=0)   # loss_streak simples (0) nesta versão
     post=_conf_floor(post, 0.30, 0.95)
     best=max(post,key=post.get); conf=float(post[best])
     r=sorted(post.items(), key=lambda kv: kv[1], reverse=True)
@@ -245,10 +256,6 @@ def _choose_number()->Tuple[int,float,int,Dict[int,float],float,str]:
 def _timeline_size()->int:
     con=_con(); row=con.execute("SELECT COUNT(*) c FROM timeline").fetchone(); con.close()
     return int(row["c"] or 0)
-
-def _get_ls()->int:
-    # loss streak simples = diferença bruta (não persistimos por simplicidade)
-    return 0
 
 def _ngram_snapshot(suggested:int)->str:
     tail=_timeline_tail(400)
@@ -272,7 +279,7 @@ async def tg_send(chat_id: str, text: str, parse="HTML"):
         pass
 
 # ------------------------------------------------------
-# Parser do canal-fonte
+# Parser do canal-fonte (tolerante)
 # ------------------------------------------------------
 RX_ENTRADA = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
 RX_ANALISE = re.compile(r"\bANALISANDO\b", re.I)
@@ -283,8 +290,12 @@ RX_NUMS    = re.compile(r"[1-4]")
 RX_AFTER   = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
 
 RX_GREEN   = re.compile(r"GREEN|✅", re.I)
-RX_RED     = re.compile(r"RED|❌", re.I)
-RX_PAREN   = re.compile(r"\(([^\)]*)\)\s*$")
+RX_RED     = re.compile(r"\bRED\b|❌", re.I)
+RX_TIE     = re.compile(r"\bEMPATE\b|\bTIE\b", re.I)
+
+_RX_PAREN_FINAL = re.compile(r"\(([^\)]*)\)\s*$")
+_RX_NUMS_IN     = re.compile(r"[1-4]")
+_RX_FALLBACK_1  = re.compile(r"([1-4])\s*$")  # último número solto na linha
 
 def _parse_seq(text:str)->List[int]:
     m=RX_SEQ.search(text or "")
@@ -297,12 +308,35 @@ def _parse_after(text:str)->Optional[int]:
     try: return int(m.group(1))
     except: return None
 
-def _parse_obs_final(text:str, need:int=2)->List[int]:
-    # busca par no final entre parênteses: (3-2) ou (3 | 2) etc.
-    m=RX_PAREN.search(text or "")
-    if not m: return []
-    nums=[int(x) for x in re.findall(r"[1-4]", m.group(1))]
-    return nums[:need]
+def _parse_obs_final(text:str, need:int)->List[int]:
+    # tenta pegar do parênteses final: (3-2) | (3 | 2) | (3)
+    m=_RX_PAREN_FINAL.search(text or "")
+    if m:
+        got=[int(x) for x in _RX_NUMS_IN.findall(m.group(1))]
+        return got[:need] if got else []
+    # fallback: aceita 1 número solto no fim (ex.: "... 👍 3")
+    m2=_RX_FALLBACK_1.search((text or "").strip())
+    if m2:
+        return [int(m2.group(1))][:need]
+    return []
+
+# ------------------------------------------------------
+# Timeout neutro (quando faltou 1 observado)
+# ------------------------------------------------------
+def _maybe_timeout_neutro():
+    pend = _pending_get()
+    if not pend: return
+    opened_at = int(pend["opened_at"] or pend["created_at"] or time.time())
+    if (time.time() - opened_at) < OBS_TIMEOUT_SEC:
+        return
+    seen = [s for s in (pend["seen"] or "").split("-") if s]
+    need = min(2, MAX_GALE+1)
+    if len(seen) == need - 1:
+        final_seen = "-".join(seen + ["X"])
+        con = _con()
+        con.execute("UPDATE pending SET open=0, seen=? WHERE id=?", (final_seen, int(pend["id"])))
+        con.commit(); con.close()
+        # neutro: não mexe no placar
 
 # ------------------------------------------------------
 # Rotas básicas
@@ -317,7 +351,7 @@ async def health():
 
 @app.get("/debug_cfg")
 async def debug_cfg():
-    return {"MAX_GALE": MAX_GALE, "OBS_TIMEOUT_SEC": OBS_TIMEOUT_SEC}
+    return {"MAX_GALE": MAX_GALE, "OBS_TIMEOUT_SEC": OBS_TIMEOUT_SEC, "ENABLE_TIE_WIN": ENABLE_TIE_WIN}
 
 # ------------------------------------------------------
 # Webhook principal
@@ -326,6 +360,8 @@ async def debug_cfg():
 async def webhook(token: str, request: Request):
     if token != WEBHOOK_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
+
+    _maybe_timeout_neutro()
 
     data = await request.json()
     upd_id = str(data.get("update_id", "")); _mark_processed(upd_id)
@@ -348,47 +384,67 @@ async def webhook(token: str, request: Request):
         if seq: _append_seq(seq)
         return {"ok": True, "analise_seq": len(seq)}
 
-    # 2) APOSTA ENCERRADA: fechar pending (GREEN/RED) com parser estrito
-    if RX_FECHA.search(text) or RX_GREEN.search(text) or RX_RED.search(text):
+    # 2) APOSTA ENCERRADA / GREEN / RED / EMPATE
+    if RX_FECHA.search(text) or RX_GREEN.search(text) or RX_RED.search(text) or RX_TIE.search(text):
         pend=_pending_get()
         if pend:
-            obs=_parse_obs_final(text, need=min(2, MAX_GALE+1))
-            if obs: _pending_seen_append(obs, need=min(2, MAX_GALE+1))
-            # decidir outcome G0/G1
+            need = min(2, MAX_GALE+1)
+
+            # Empate como neutro quando ENABLE_TIE_WIN=False
+            if RX_TIE.search(text) and not ENABLE_TIE_WIN:
+                return JSONResponse({"ok": True, "tie_neutro": True})
+
+            obs=_parse_obs_final(text, need=need)
+            if obs:
+                _pending_seen_append(obs, need=need)
+
             pend=_pending_get()
             seen = [s for s in (pend["seen"] or "").split("-") if s]
             suggested=int(pend["suggested"] or 0)
-            outcome="LOSS"; stage_lbl="G1"
-            if len(seen)>=1 and seen[0].isdigit() and int(seen[0])==suggested:
-                outcome="GREEN"; stage_lbl="G0"
-            elif len(seen)>=2 and seen[1].isdigit() and int(seen[1])==suggested and MAX_GALE>=1:
-                outcome="GREEN"; stage_lbl="G1"
-            final_seen="-".join(seen[:min(2, MAX_GALE+1)]) if seen else "X"
+
+            # se ainda não temos pelo menos 1 observado, não fecha agora
+            if len(seen) < 1:
+                return JSONResponse({"ok": True, "not_enough_obs": len(seen)})
+
+            # Decide G0/G1 com o que existe (um número fecha G0; dois números permitem G1)
+            outcome = "LOSS"; stage_lbl = "G1" if need >= 2 else "G0"
+            if len(seen) >= 1 and seen[0].isdigit() and int(seen[0]) == suggested:
+                outcome = "GREEN"; stage_lbl = "G0"
+            elif need >= 2 and len(seen) >= 2 and seen[1].isdigit() and int(seen[1]) == suggested:
+                outcome = "GREEN"; stage_lbl = "G1"
+
+            final_seen="-".join(seen[:need]) if seen else "X"
             msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
             if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
-            return {"ok": True, "closed": outcome, "seen": final_seen}
-        return {"ok": True, "noted_close": True}
+            return JSONResponse({"ok": True, "closed": outcome, "seen": final_seen})
+        return JSONResponse({"ok": True, "noted_close": True})
 
-    # 3) ENTRADA CONFIRMADA: abre pending e sugere número
+    # 3) ENTRADA CONFIRMADA
     if RX_ENTRADA.search(text):
         seq=_parse_seq(text)
         if seq: _append_seq(seq)               # memória
-        _ = _parse_after(text)                  # (não usado diretamente nessa versão)
-        # fecha pendência anterior se esquecida (com X)
+        _ = _parse_after(text)                  # mantido para compatibilidade
+
+        # fecha pendência anterior, mas sem punir se faltou observado
         pend=_pending_get()
         if pend:
-            seen=[s for s in (pend["seen"] or "").split("-") if s]
-            while len(seen)<min(2,MAX_GALE+1): seen.append("X")
-            final_seen="-".join(seen[:min(2,MAX_GALE+1)])
-            suggested=int(pend["suggested"] or 0)
-            # recalcula outcome
-            outcome="LOSS"; stage_lbl="G1"
-            if len(seen)>=1 and seen[0].isdigit() and int(seen[0])==suggested:
-                outcome="GREEN"; stage_lbl="G0"
-            elif len(seen)>=2 and seen[1].isdigit() and int(seen[1])==suggested and MAX_GALE>=1:
-                outcome="GREEN"; stage_lbl="G1"
-            msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
-            if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
+            need = min(2, MAX_GALE+1)
+            seen = [s for s in (pend["seen"] or "").split("-") if s]
+            if len(seen) >= 1:
+                suggested = int(pend["suggested"] or 0)
+                outcome = "LOSS"; stage_lbl = "G1" if need >= 2 else "G0"
+                if len(seen) >= 1 and seen[0].isdigit() and int(seen[0]) == suggested:
+                    outcome = "GREEN"; stage_lbl = "G0"
+                elif need >= 2 and len(seen) >= 2 and seen[1].isdigit() and int(seen[1]) == suggested:
+                    outcome = "GREEN"; stage_lbl = "G1"
+                final_seen = "-".join(seen[:need])
+                msg_txt = _pending_close(final_seen, outcome, stage_lbl, suggested)
+                if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
+            else:
+                # nada observado -> fecha neutro (sem score)
+                con = _con()
+                con.execute("UPDATE pending SET open=0 WHERE id=?", (int(pend["id"]),))
+                con.commit(); con.close()
 
         # escolhe nova sugestão
         best, conf, samples, post, gap, reason = _choose_number()
