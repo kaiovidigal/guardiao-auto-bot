@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v5.1 (G1-only, parser canal-fonte, IA hierárquica compacta, dedupe por conteúdo, DB SQLite)
+v5.1.1 (G1-only, parser canal-fonte, IA hierárquica compacta, dedupe por conteúdo, DB SQLite, "GEN após X")
 
 ENV obrigatórias (Render -> Environment):
 - TG_BOT_TOKEN
@@ -48,7 +48,7 @@ DB_PATH = "/opt/render/project/src/main.sqlite"
 # ------------------------------------------------------
 # App
 # ------------------------------------------------------
-app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="5.1")
+app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="5.1.1")
 
 # ------------------------------------------------------
 # DB helpers
@@ -387,7 +387,7 @@ async def webhook(token: str, request: Request):
             outcome="LOSS"; stage_lbl="G1"
             if len(seen)>=1 and seen[0].isdigit() and int(seen[0])==suggested:
                 outcome="GREEN"; stage_lbl="G0"
-            elif len(seen)>=2 and seen[1].isdigit() and int(seen[1])==suggested and MAX_GALE>=1:
+            elif len(seen)>=2 and len(seen[1])>0 and seen[1].isdigit() and int(seen[1])==suggested and MAX_GALE>=1:
                 outcome="GREEN"; stage_lbl="G1"
             final_seen="-".join(seen[:min(2, MAX_GALE+1)]) if seen else "X"
             msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
@@ -395,7 +395,7 @@ async def webhook(token: str, request: Request):
             return {"ok": True, "closed": outcome, "seen": final_seen}
         return {"ok": True, "noted_close": True}
 
-    # 3) ENTRADA CONFIRMADA (com dedupe)
+    # 3) ENTRADA CONFIRMADA (com dedupe) — COM "GEN após X"
     if RX_ENTRADA.search(text):
         if _seen_recent("entrada", _dedupe_key(text)):
             if SHOW_DEBUG:
@@ -404,7 +404,9 @@ async def webhook(token: str, request: Request):
 
         seq=_parse_seq(text)
         if seq: _append_seq(seq)               # memória
-        _ = _parse_after(text)                  # reservado para versões futuras
+
+        # Captura "após o X"; se não tiver, infere do primeiro número da sequência
+        after_num = _parse_after(text) or (seq[0] if seq else None)
 
         # fecha pendência anterior se esquecida (com X)
         pend=_pending_get()
@@ -425,8 +427,9 @@ async def webhook(token: str, request: Request):
         best, conf, samples, post, gap, reason = _choose_number()
         opened=_pending_open(best)
         if opened:
+            padrao_txt = f"GEN após {after_num}" if after_num else "GEN"
             txt=(f"🤖 <b>IA SUGERE</b> — <b>{best}</b>\n"
-                 f"🧩 <b>Padrão:</b> GEN\n"
+                 f"🧩 <b>Padrão:</b> {padrao_txt}\n"
                  f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples} | <b>gap≈</b>{gap*100:.1f}pp\n"
                  f"🧠 <b>Modo:</b> {reason}\n"
                  f"{_ngram_snapshot(best)}")
