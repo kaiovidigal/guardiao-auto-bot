@@ -2,8 +2,9 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v6.1 (G1-only, parser canal-fonte, IA hierárquica compacta, dedupe por conteúdo,
-      mensagem "Analisando padrão..." com auto-delete, DB SQLite)
+v7.0 (G1-only, parser canal-fonte, IA hierárquica compacta, dedupe por conteúdo,
+      mensagem "Analisando padrão..." com auto-delete, G0 fecha imediato / G1 aguardado,
+      DB SQLite)
 
 ENV obrigatórias (Render -> Environment):
 - TG_BOT_TOKEN
@@ -49,7 +50,7 @@ DB_PATH = "/opt/render/project/src/main.sqlite"
 # ------------------------------------------------------
 # App
 # ------------------------------------------------------
-app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="6.1")
+app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.0")
 
 # ------------------------------------------------------
 # DB helpers
@@ -260,7 +261,7 @@ def _get_ls()->int:
     # loss streak simples (não persistido nesta versão)
     return 0
 
-def _choose_number()->Tuple[int,float,int,Dict[int,float],float,str]:
+def _choose_number(after: Optional[int]=None)->Tuple[int,float,int,Dict[int,float],float,str]:
     tail=_timeline_tail(400)
     p1=_post_e1_ngram(tail)
     p2=_post_e2_short(tail)
@@ -272,6 +273,7 @@ def _choose_number()->Tuple[int,float,int,Dict[int,float],float,str]:
     best=max(post,key=post.get); conf=float(post[best])
     r=sorted(post.items(), key=lambda kv: kv[1], reverse=True)
     gap=(r[0][1]-r[1][1]) if len(r)>=2 else r[0][1]
+    # (after é usado só para exibir no texto de saída)
     return best, conf, _timeline_size(), post, gap, reason
 
 def _ngram_snapshot(suggested:int)->str:
@@ -394,30 +396,51 @@ async def webhook(token: str, request: Request):
         if seq: _append_seq(seq)
         return {"ok": True, "analise_seq": len(seq)}
 
-    # 2) APOSTA ENCERRADA / GREEN / RED (com dedupe)
+    # 2) APOSTA ENCERRADA / GREEN / RED (com dedupe) — v7 regra G0/G1
     if RX_FECHA.search(text) or RX_GREEN.search(text) or RX_RED.search(text):
         if _seen_recent("fechamento", _dedupe_key(text)):
             return {"ok": True, "skipped": "fechamento_dupe"}
-        pend=_pending_get()
+
+        pend = _pending_get()
         if pend:
-            obs=_parse_obs_final(text, need=min(2, MAX_GALE+1))
-            if obs: _pending_seen_append(obs, need=min(2, MAX_GALE+1))
-            # decidir outcome G0/G1
-            pend=_pending_get()
+            # sempre tentamos capturar observados do texto
+            obs = _parse_obs_final(text, need=2)
+            if obs:
+                _pending_seen_append(obs, need=2)
+
+            # re-lê estado
+            pend = _pending_get()
             seen = [s for s in (pend["seen"] or "").split("-") if s]
-            suggested=int(pend["suggested"] or 0)
-            outcome="LOSS"; stage_lbl="G1"
-            if len(seen)>=1 and seen[0].isdigit() and int(seen[0])==suggested:
-                outcome="GREEN"; stage_lbl="G0"
-            elif len(seen)>=2 and seen[1].isdigit() and int(seen[1])==suggested and MAX_GALE>=1:
-                outcome="GREEN"; stage_lbl="G1"
-            final_seen="-".join(seen[:min(2, MAX_GALE+1)]) if seen else "X"
-            msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
+            suggested = int(pend["suggested"] or 0)
+
+            # NOVA REGRA:
+            # - Se o 1º observado == sugerido -> fecha IMEDIATO GREEN (G0)
+            # - Se errou G0, só fecha quando tivermos 2 observados (G1)
+            if len(seen) >= 1 and seen[0].isdigit() and int(seen[0]) == suggested:
+                final_seen = "-".join(seen[:1])
+                msg_txt = _pending_close(final_seen, "GREEN", "G0", suggested)
+                if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
+                return {"ok": True, "closed": "GREEN_G0", "seen": final_seen}
+
+            # errou o G0 → aguarda G1 (se ainda faltou segundo observado)
+            if len(seen) < 2:
+                _pending_set_stage(1)  # marca G1
+                if SHOW_DEBUG:
+                    await tg_send(TARGET_CHANNEL, f"DEBUG: aguardando G1 — seen={pend['seen'] or ''}")
+                return {"ok": True, "waiting_g1": True, "seen": pend["seen"] or ""}
+
+            # já temos 2 observados: decidir G1 GREEN/LOSS e fechar
+            outcome = "LOSS"; stage_lbl = "G1"
+            if seen[1].isdigit() and int(seen[1]) == suggested:
+                outcome = "GREEN"
+            final_seen = "-".join(seen[:2])
+            msg_txt = _pending_close(final_seen, outcome, stage_lbl, suggested)
             if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
             return {"ok": True, "closed": outcome, "seen": final_seen}
+
         return {"ok": True, "noted_close": True}
 
-    # 3) ENTRADA CONFIRMADA (com dedupe + “Analisando...” auto-delete)
+    # 3) ENTRADA CONFIRMADA (com dedupe + “Analisando...” auto-delete) — v7 protege G1 pendente
     if RX_ENTRADA.search(text):
         if _seen_recent("entrada", _dedupe_key(text)):
             if SHOW_DEBUG:
@@ -426,28 +449,24 @@ async def webhook(token: str, request: Request):
 
         seq=_parse_seq(text)
         if seq: _append_seq(seq)               # memória
-        after = _parse_after(text)             # usado apenas para exibir "após X"
+        after = _parse_after(text)             # apenas para exibir "após X"
 
-        # fecha pendência anterior se esquecida (com X)
+        # Se existe pendência e o primeiro observado NÃO foi o sugerido,
+        # e ainda não temos 2 observados, AGUARDAR G1 (não abrir nova entrada).
         pend=_pending_get()
         if pend:
             seen=[s for s in (pend["seen"] or "").split("-") if s]
-            while len(seen)<min(2,MAX_GALE+1): seen.append("X")
-            final_seen="-".join(seen[:min(2,MAX_GALE+1)])
             suggested=int(pend["suggested"] or 0)
-            outcome="LOSS"; stage_lbl="G1"
-            if len(seen)>=1 and seen[0].isdigit() and int(seen[0])==suggested:
-                outcome="GREEN"; stage_lbl="G0"
-            elif len(seen)>=2 and seen[1].isdigit() and int(seen[1])==suggested and MAX_GALE>=1:
-                outcome="GREEN"; stage_lbl="G1"
-            msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
-            if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
+            if len(seen) == 1 and (not seen[0].isdigit() or int(seen[0]) != suggested):
+                if SHOW_DEBUG:
+                    await tg_send(TARGET_CHANNEL, "DEBUG: nova entrada recebida, mas aguardando G1 do sinal anterior (primeiro foi miss).")
+                return {"ok": True, "kept_waiting_previous": True, "seen": pend["seen"] or ""}
 
-        # >>> nova: manda "Analisando..." e guarda message_id
+        # manda “Analisando…” e guarda ID pra apagar depois
         analyzing_id = await tg_send_return(TARGET_CHANNEL, "⏳ Analisando padrão, aguarde...")
 
         # escolhe nova sugestão
-        best, conf, samples, post, gap, reason = _choose_number()
+        best, conf, samples, post, gap, reason = _choose_number(after)
         opened=_pending_open(best)
         if opened:
             aft_txt = f" após {after}" if after else ""
@@ -457,11 +476,8 @@ async def webhook(token: str, request: Request):
                  f"🧠 <b>Modo:</b> {reason}\n"
                  f"{_ngram_snapshot(best)}")
             await tg_send(TARGET_CHANNEL, txt)
-
-            # apaga a mensagem “Analisando...”, se enviada
             if analyzing_id is not None:
                 await tg_delete(TARGET_CHANNEL, analyzing_id)
-
             return {"ok": True, "entry_opened": True, "best": best, "conf": conf}
         else:
             if analyzing_id is not None:
