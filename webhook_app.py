@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v7.0 (G1-only, parser canal-fonte, IA hierárquica compacta, dedupe por conteúdo,
-      fechamento correto G0/G1, “Analisando...” com auto-delete, DB SQLite)
+v7.1 (G0-only pronto, parser canal-fonte, IA hierárquica compacta, dedupe,
+      “Analisando...” com auto-delete, DB SQLite)
 
 ENV obrigatórias (Render -> Environment):
 - TG_BOT_TOKEN
@@ -13,7 +13,7 @@ ENV obrigatórias (Render -> Environment):
 
 ENV opcionais:
 - SHOW_DEBUG          (default False)
-- MAX_GALE            (default 1)          # G0/G1
+- MAX_GALE            (default 0)          # G0-only (força total no G0)
 - OBS_TIMEOUT_SEC     (default 420)
 - DEDUP_WINDOW_SEC    (default 40)
 
@@ -36,7 +36,7 @@ SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "").strip()
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "").strip()
 
 SHOW_DEBUG       = os.getenv("SHOW_DEBUG", "False").strip().lower() == "true"
-MAX_GALE         = int(os.getenv("MAX_GALE", "1"))
+MAX_GALE         = int(os.getenv("MAX_GALE", "0"))      # <-- default 0 (G0-only)
 OBS_TIMEOUT_SEC  = int(os.getenv("OBS_TIMEOUT_SEC", "420"))
 DEDUP_WINDOW_SEC = int(os.getenv("DEDUP_WINDOW_SEC", "40"))
 
@@ -45,11 +45,12 @@ if not TG_BOT_TOKEN or not WEBHOOK_TOKEN or not TARGET_CHANNEL:
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 DB_PATH = "/opt/render/project/src/main.sqlite"
+NEED_OBS = max(1, min(3, MAX_GALE + 1))  # com MAX_GALE=0 => NEED_OBS=1 (G0-only)
 
 # ------------------------------------------------------
 # App
 # ------------------------------------------------------
-app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.0")
+app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.1")
 
 # ------------------------------------------------------
 # DB helpers
@@ -152,12 +153,7 @@ def _pending_open(suggested:int):
     con.commit(); con.close()
     return True
 
-def _pending_set_stage(stage:int):
-    con = _con()
-    con.execute("UPDATE pending SET stage=? WHERE open=1",(int(stage),))
-    con.commit(); con.close()
-
-def _pending_seen_append(nums: List[int], need:int=2):
+def _pending_seen_append(nums: List[int], need:int=NEED_OBS):
     row = _pending_get()
     if not row: return
     seen = (row["seen"] or "").strip()
@@ -175,7 +171,7 @@ def _pending_close(final_seen: str, outcome: str, stage_lbl: str, suggested:int)
     con.execute("UPDATE pending SET open=0, seen=? WHERE id=?", (final_seen, int(row["id"])))
     con.commit(); con.close()
     _score_add(outcome)
-    # alimentar timeline com observados
+    # alimentar timeline com observados (apenas o que contou pro placar)
     obs = [int(x) for x in final_seen.split("-") if x.isdigit()]
     _append_seq(obs)
     our = suggested if outcome.upper()=="GREEN" else "X"
@@ -202,7 +198,7 @@ def _seen_recent(kind: str, dkey: str) -> bool:
     return False
 
 # ------------------------------------------------------
-# IA “12 camadas” compacta (4 especialistas + ajustes)
+# IA compacta (4 especialistas + ajustes básicos)
 # ------------------------------------------------------
 def _norm(d: Dict[int,float])->Dict[int,float]:
     s=sum(d.values()) or 1e-9
@@ -215,7 +211,6 @@ def _post_freq(tail:List[int], k:int)->Dict[int,float]:
     return _norm({c:win.count(c)/tot for c in (1,2,3,4)})
 
 def _post_e1_ngram(tail:List[int])->Dict[int,float]:
-    # proxy simples: mistura de janelas (Fibonacci curto embutido)
     mix={c:0.0 for c in (1,2,3,4)}
     for k,w in ((8,0.25),(21,0.35),(55,0.40)):
         pk=_post_freq(tail,k)
@@ -231,11 +226,9 @@ def _hedge(p1,p2,p3,p4, w=(0.40,0.25,0.25,0.10)):
     out={c: w[0]*p1.get(c,0)+w[1]*p2.get(c,0)+w[2]*p3.get(c,0)+w[3]*p4.get(c,0) for c in cands}
     return _norm(out)
 
-def _runnerup_ls2(post:Dict[int,float], loss_streak:int)->Tuple[int,Dict[int,float],str]:
+def _runnerup_ls2(post:Dict[int,float])->Tuple[int,Dict[int,float],str]:
     rank=sorted(post.items(), key=lambda kv: kv[1], reverse=True)
     best=rank[0][0]
-    if loss_streak>=2 and len(rank)>=2 and (rank[0][1]-rank[1][1])<0.05:
-        return rank[1][0], post, "IA_runnerup_ls2"
     return best, post, "IA"
 
 def _conf_floor(post:Dict[int,float], floor=0.30, cap=0.95):
@@ -256,10 +249,6 @@ def _conf_floor(post:Dict[int,float], floor=0.30, cap=0.95):
             if c!=b: post[c]+=add
     return _norm(post)
 
-def _get_ls()->int:
-    # loss streak simples (não persistido nesta versão)
-    return 0
-
 def _choose_number()->Tuple[int,float,int,Dict[int,float],float,str]:
     tail=_timeline_tail(400)
     p1=_post_e1_ngram(tail)
@@ -267,7 +256,7 @@ def _choose_number()->Tuple[int,float,int,Dict[int,float],float,str]:
     p3=_post_e3_long(tail)
     p4=_post_e4_llm(tail)
     base=_hedge(p1,p2,p3,p4)
-    best, post, reason = _runnerup_ls2(base, loss_streak=_get_ls())
+    best, post, reason = _runnerup_ls2(base)
     post=_conf_floor(post, 0.30, 0.95)
     best=max(post,key=post.get); conf=float(post[best])
     r=sorted(post.items(), key=lambda kv: kv[1], reverse=True)
@@ -284,7 +273,7 @@ def _ngram_snapshot(suggested:int)->str:
             f"🔎 E1(n-gram proxy): 1 {p1} | 2 {p2} | 3 {p3} | 4 {p4}")
 
 # ------------------------------------------------------
-# Telegram helpers (send + delete)
+# Telegram helpers
 # ------------------------------------------------------
 async def tg_send(chat_id: str, text: str, parse="HTML"):
     try:
@@ -336,10 +325,6 @@ def _parse_seq_list(text:str)->List[int]:
     if not m: return []
     return [int(x) for x in RX_NUMS.findall(m.group(1))]
 
-def _parse_seq_pair(text:str, need:int=2)->List[int]:
-    arr=_parse_seq_list(text)
-    return arr[:need]
-
 def _parse_after(text:str)->Optional[int]:
     m=RX_AFTER.search(text or "")
     if not m: return None
@@ -361,14 +346,14 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "db_exists": os.path.exists(DB_PATH), "db_path": DB_PATH}
+    return {"ok": True, "db_exists": os.path.exists(DB_PATH), "db_path": DB_PATH, "need_obs": NEED_OBS}
 
 @app.get("/debug_cfg")
 async def debug_cfg():
-    return {"MAX_GALE": MAX_GALE, "OBS_TIMEOUT_SEC": OBS_TIMEOUT_SEC, "DEDUP_WINDOW_SEC": DEDUP_WINDOW_SEC}
+    return {"MAX_GALE": MAX_GALE, "NEED_OBS": NEED_OBS, "OBS_TIMEOUT_SEC": OBS_TIMEOUT_SEC, "DEDUP_WINDOW_SEC": DEDUP_WINDOW_SEC}
 
 # ------------------------------------------------------
-# Webhook principal
+# Webhook principal (G0-only)
 # ------------------------------------------------------
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
@@ -384,13 +369,13 @@ async def webhook(token: str, request: Request):
     chat_id = str(chat.get("id") or "")
     text = (msg.get("text") or msg.get("caption") or "").strip()
 
-    # filtra fonte se configurado
+    # filtra fonte
     if SOURCE_CHANNEL and chat_id and chat_id != SOURCE_CHANNEL:
         if SHOW_DEBUG:
             await tg_send(TARGET_CHANNEL, f"DEBUG: Ignorando chat {chat_id}. Fonte esperada: {SOURCE_CHANNEL}")
         return {"ok": True, "skipped": "wrong_source"}
 
-    # 1) ANALISANDO: apenas alimenta memória (com dedupe)
+    # ANALISANDO → só memória
     if RX_ANALISE.search(text):
         if _seen_recent("analise", _dedupe_key(text)):
             return {"ok": True, "skipped": "analise_dupe"}
@@ -398,7 +383,7 @@ async def webhook(token: str, request: Request):
         if seq: _append_seq(seq)
         return {"ok": True, "analise_seq": len(seq)}
 
-    # 2) APOSTA ENCERRADA / GREEN / RED (com dedupe + FECHAMENTO CORRETO G0/G1)
+    # APOSTA ENCERRADA / GREEN / RED
     if RX_FECHA.search(text) or RX_GREEN.search(text) or RX_RED.search(text):
         if _seen_recent("fechamento", _dedupe_key(text)):
             return {"ok": True, "skipped": "fechamento_dupe"}
@@ -407,47 +392,31 @@ async def webhook(token: str, request: Request):
         if pend:
             suggested=int(pend["suggested"] or 0)
 
-            # (a) Observados do PLACAR: usar a linha "Sequência: a | b"
-            obs_pair = _parse_seq_pair(text, need=min(2, MAX_GALE+1))
-            if obs_pair:
-                _pending_seen_append(obs_pair, need=min(2, MAX_GALE+1))
+            # Observado do placar (G0-only): usar SÓ o primeiro número da "Sequência: a | b"
+            seq_full = _parse_seq_list(text)
+            obs_use = seq_full[:NEED_OBS] if seq_full else []
+            if obs_use:
+                _pending_seen_append(obs_use, need=NEED_OBS)
 
-            # (b) Memória extra: números finais entre parênteses "(x | y)" -> só para timeline
+            # Memória extra: números finais entre parênteses "(x | y)" → timeline
             extra_tail = _parse_paren_pair(text, need=2)
             if extra_tail:
                 _append_seq(extra_tail)
 
-            # Reavalia pendência após update
+            # Reavalia e fecha sempre no G0
             pend=_pending_get()
             seen = [s for s in (pend["seen"] or "").split("-") if s]
-
-            # Regra: se G0 != sugerido e ainda temos espaço para G1, NÃO fecha; aguarda próxima rodada
-            if len(seen)==1 and seen[0].isdigit() and int(seen[0]) != suggested and MAX_GALE>=1:
-                # mantém pendência aberta para o G1
-                if SHOW_DEBUG:
-                    await tg_send(TARGET_CHANNEL, f"DEBUG: aguardando G1 (visto G0={seen[0]}, nosso={suggested}).")
-                return {"ok": True, "waiting_g1": True, "seen": "-".join(seen)}
-
-            # Decisão final (se já temos 1 ou 2 observados suficientes)
-            outcome="LOSS"; stage_lbl="G1"
+            final_seen="-".join(seen[:NEED_OBS]) if seen else "X"
+            outcome="LOSS"; stage_lbl="G0"
             if len(seen)>=1 and seen[0].isdigit() and int(seen[0])==suggested:
-                outcome="GREEN"; stage_lbl="G0"
-            elif len(seen)>=2 and seen[1].isdigit() and int(seen[1])==suggested and MAX_GALE>=1:
-                outcome="GREEN"; stage_lbl="G1"
-
-            # fecha se: GREEN no G0, ou já temos G1 observado (independente de GREEN/LOSS)
-            if stage_lbl=="G0" or len(seen)>=min(2, MAX_GALE+1):
-                final_seen="-".join(seen[:min(2, MAX_GALE+1)]) if seen else "X"
-                msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
-                if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
-                return {"ok": True, "closed": outcome, "seen": final_seen}
-            else:
-                # ainda aguardando G1 (cenário raro se MAX_GALE>1 futuramente)
-                return {"ok": True, "waiting_more_obs": True, "seen": "-".join(seen)}
+                outcome="GREEN"
+            msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
+            if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
+            return {"ok": True, "closed": outcome, "seen": final_seen}
 
         return {"ok": True, "noted_close": True}
 
-    # 3) ENTRADA CONFIRMADA (com dedupe + “Analisando...” auto-delete)
+    # ENTRADA CONFIRMADA
     if RX_ENTRADA.search(text):
         if _seen_recent("entrada", _dedupe_key(text)):
             if SHOW_DEBUG:
@@ -455,28 +424,24 @@ async def webhook(token: str, request: Request):
             return {"ok": True, "skipped": "entrada_dupe"}
 
         seq=_parse_seq_list(text)
-        if seq: _append_seq(seq)               # memória
-        after = _parse_after(text)             # usado apenas para exibir "após X"
+        if seq: _append_seq(seq)
+        after = _parse_after(text)  # apenas para exibir "após X"
 
-        # fecha pendência anterior se esquecida (com X)
+        # Fecha pendência esquecida (preenche com X até NEED_OBS=1)
         pend=_pending_get()
         if pend:
             seen=[s for s in (pend["seen"] or "").split("-") if s]
-            while len(seen)<min(2,MAX_GALE+1): seen.append("X")
-            final_seen="-".join(seen[:min(2,MAX_GALE+1)])
+            while len(seen)<NEED_OBS: seen.append("X")
+            final_seen="-".join(seen[:NEED_OBS])
             suggested=int(pend["suggested"] or 0)
-            outcome="LOSS"; stage_lbl="G1"
+            outcome="LOSS"; stage_lbl="G0"
             if len(seen)>=1 and seen[0].isdigit() and int(seen[0])==suggested:
-                outcome="GREEN"; stage_lbl="G0"
-            elif len(seen)>=2 and seen[1].isdigit() and int(seen[1])==suggested and MAX_GALE>=1:
-                outcome="GREEN"; stage_lbl="G1"
+                outcome="GREEN"
             msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
             if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
 
-        # “Analisando...” (apaga depois)
         analyzing_id = await tg_send_return(TARGET_CHANNEL, "⏳ Analisando padrão, aguarde...")
 
-        # escolhe nova sugestão
         best, conf, samples, post, gap, reason = _choose_number()
         opened=_pending_open(best)
         if opened:
@@ -487,10 +452,8 @@ async def webhook(token: str, request: Request):
                  f"🧠 <b>Modo:</b> {reason}\n"
                  f"{_ngram_snapshot(best)}")
             await tg_send(TARGET_CHANNEL, txt)
-
             if analyzing_id is not None:
                 await tg_delete(TARGET_CHANNEL, analyzing_id)
-
             return {"ok": True, "entry_opened": True, "best": best, "conf": conf}
         else:
             if analyzing_id is not None:
