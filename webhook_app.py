@@ -2,8 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v7.1 (G0-only pronto, parser canal-fonte, IA hierárquica compacta, dedupe,
-      “Analisando...” com auto-delete, DB SQLite)
+v7.0 (G0-only, parser por parênteses GREEN/RED, dedupe, “Analisando...” auto-delete)
 
 ENV obrigatórias (Render -> Environment):
 - TG_BOT_TOKEN
@@ -13,11 +12,11 @@ ENV obrigatórias (Render -> Environment):
 
 ENV opcionais:
 - SHOW_DEBUG          (default False)
-- MAX_GALE            (default 0)          # G0-only (força total no G0)
+- MAX_GALE            (default 0)          # *** G0-ONLY ***
 - OBS_TIMEOUT_SEC     (default 420)
 - DEDUP_WINDOW_SEC    (default 40)
 
-Start command:
+Start:
   uvicorn webhook_app:app --host 0.0.0.0 --port $PORT
 """
 
@@ -36,7 +35,7 @@ SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "").strip()
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "").strip()
 
 SHOW_DEBUG       = os.getenv("SHOW_DEBUG", "False").strip().lower() == "true"
-MAX_GALE         = int(os.getenv("MAX_GALE", "0"))      # <-- default 0 (G0-only)
+MAX_GALE         = int(os.getenv("MAX_GALE", "0"))    # G0-only por padrão
 OBS_TIMEOUT_SEC  = int(os.getenv("OBS_TIMEOUT_SEC", "420"))
 DEDUP_WINDOW_SEC = int(os.getenv("DEDUP_WINDOW_SEC", "40"))
 
@@ -45,12 +44,11 @@ if not TG_BOT_TOKEN or not WEBHOOK_TOKEN or not TARGET_CHANNEL:
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 DB_PATH = "/opt/render/project/src/main.sqlite"
-NEED_OBS = max(1, min(3, MAX_GALE + 1))  # com MAX_GALE=0 => NEED_OBS=1 (G0-only)
 
 # ------------------------------------------------------
 # App
 # ------------------------------------------------------
-app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.1")
+app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.0")
 
 # ------------------------------------------------------
 # DB helpers
@@ -153,7 +151,7 @@ def _pending_open(suggested:int):
     con.commit(); con.close()
     return True
 
-def _pending_seen_append(nums: List[int], need:int=NEED_OBS):
+def _pending_seen_append(nums: List[int], need:int=1):
     row = _pending_get()
     if not row: return
     seen = (row["seen"] or "").strip()
@@ -171,7 +169,7 @@ def _pending_close(final_seen: str, outcome: str, stage_lbl: str, suggested:int)
     con.execute("UPDATE pending SET open=0, seen=? WHERE id=?", (final_seen, int(row["id"])))
     con.commit(); con.close()
     _score_add(outcome)
-    # alimentar timeline com observados (apenas o que contou pro placar)
+    # alimentar timeline com observado real
     obs = [int(x) for x in final_seen.split("-") if x.isdigit()]
     _append_seq(obs)
     our = suggested if outcome.upper()=="GREEN" else "X"
@@ -198,7 +196,7 @@ def _seen_recent(kind: str, dkey: str) -> bool:
     return False
 
 # ------------------------------------------------------
-# IA compacta (4 especialistas + ajustes básicos)
+# IA compacta (4 especialistas + ajustes simples)
 # ------------------------------------------------------
 def _norm(d: Dict[int,float])->Dict[int,float]:
     s=sum(d.values()) or 1e-9
@@ -211,6 +209,7 @@ def _post_freq(tail:List[int], k:int)->Dict[int,float]:
     return _norm({c:win.count(c)/tot for c in (1,2,3,4)})
 
 def _post_e1_ngram(tail:List[int])->Dict[int,float]:
+    # proxy simples: mistura de janelas (Fibonacci curto embutido)
     mix={c:0.0 for c in (1,2,3,4)}
     for k,w in ((8,0.25),(21,0.35),(55,0.40)):
         pk=_post_freq(tail,k)
@@ -226,9 +225,11 @@ def _hedge(p1,p2,p3,p4, w=(0.40,0.25,0.25,0.10)):
     out={c: w[0]*p1.get(c,0)+w[1]*p2.get(c,0)+w[2]*p3.get(c,0)+w[3]*p4.get(c,0) for c in cands}
     return _norm(out)
 
-def _runnerup_ls2(post:Dict[int,float])->Tuple[int,Dict[int,float],str]:
+def _runnerup_ls2(post:Dict[int,float], loss_streak:int)->Tuple[int,Dict[int,float],str]:
     rank=sorted(post.items(), key=lambda kv: kv[1], reverse=True)
     best=rank[0][0]
+    if loss_streak>=2 and len(rank)>=2 and (rank[0][1]-rank[1][1])<0.05:
+        return rank[1][0], post, "IA_runnerup_ls2"
     return best, post, "IA"
 
 def _conf_floor(post:Dict[int,float], floor=0.30, cap=0.95):
@@ -249,6 +250,9 @@ def _conf_floor(post:Dict[int,float], floor=0.30, cap=0.95):
             if c!=b: post[c]+=add
     return _norm(post)
 
+def _get_ls()->int:
+    return 0  # simples
+
 def _choose_number()->Tuple[int,float,int,Dict[int,float],float,str]:
     tail=_timeline_tail(400)
     p1=_post_e1_ngram(tail)
@@ -256,7 +260,7 @@ def _choose_number()->Tuple[int,float,int,Dict[int,float],float,str]:
     p3=_post_e3_long(tail)
     p4=_post_e4_llm(tail)
     base=_hedge(p1,p2,p3,p4)
-    best, post, reason = _runnerup_ls2(base)
+    best, post, reason = _runnerup_ls2(base, loss_streak=_get_ls())
     post=_conf_floor(post, 0.30, 0.95)
     best=max(post,key=post.get); conf=float(post[best])
     r=sorted(post.items(), key=lambda kv: kv[1], reverse=True)
@@ -273,7 +277,7 @@ def _ngram_snapshot(suggested:int)->str:
             f"🔎 E1(n-gram proxy): 1 {p1} | 2 {p2} | 3 {p3} | 4 {p4}")
 
 # ------------------------------------------------------
-# Telegram helpers
+# Telegram helpers (send + delete)
 # ------------------------------------------------------
 async def tg_send(chat_id: str, text: str, parse="HTML"):
     try:
@@ -306,7 +310,7 @@ async def tg_delete(chat_id: str, message_id: int):
         pass
 
 # ------------------------------------------------------
-# Parser do canal-fonte
+# Parser (canal-fonte)
 # ------------------------------------------------------
 RX_ENTRADA = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
 RX_ANALISE = re.compile(r"\bANALISANDO\b", re.I)
@@ -318,9 +322,9 @@ RX_AFTER   = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
 
 RX_GREEN   = re.compile(r"GREEN|✅", re.I)
 RX_RED     = re.compile(r"RED|❌", re.I)
-RX_PAREN   = re.compile(r"\(([^\)]*)\)\s*$")
+RX_PAREN   = re.compile(r"\(([^\)]*)\)\s*$")   # pega conteúdo no último parênteses
 
-def _parse_seq_list(text:str)->List[int]:
+def _parse_seq(text:str)->List[int]:
     m=RX_SEQ.search(text or "")
     if not m: return []
     return [int(x) for x in RX_NUMS.findall(m.group(1))]
@@ -331,11 +335,13 @@ def _parse_after(text:str)->Optional[int]:
     try: return int(m.group(1))
     except: return None
 
-def _parse_paren_pair(text:str, need:int=2)->List[int]:
-    m=RX_PAREN.search(text or "")
-    if not m: return []
-    nums=[int(x) for x in re.findall(r"[1-4]", m.group(1))]
-    return nums[:need]
+# >>> NOVO (G0): lê o número final de GREEN/RED a partir do último parênteses
+def _parse_result_num(text: str) -> Optional[int]:
+    m = RX_PAREN.search(text or "")
+    if not m:
+        return None
+    nums = re.findall(r"[1-4]", m.group(1))
+    return int(nums[-1]) if nums else None
 
 # ------------------------------------------------------
 # Rotas básicas
@@ -346,14 +352,14 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "db_exists": os.path.exists(DB_PATH), "db_path": DB_PATH, "need_obs": NEED_OBS}
+    return {"ok": True, "db_exists": os.path.exists(DB_PATH), "db_path": DB_PATH}
 
 @app.get("/debug_cfg")
 async def debug_cfg():
-    return {"MAX_GALE": MAX_GALE, "NEED_OBS": NEED_OBS, "OBS_TIMEOUT_SEC": OBS_TIMEOUT_SEC, "DEDUP_WINDOW_SEC": DEDUP_WINDOW_SEC}
+    return {"MAX_GALE": MAX_GALE, "OBS_TIMEOUT_SEC": OBS_TIMEOUT_SEC, "DEDUP_WINDOW_SEC": DEDUP_WINDOW_SEC}
 
 # ------------------------------------------------------
-# Webhook principal (G0-only)
+# Webhook principal
 # ------------------------------------------------------
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
@@ -369,79 +375,75 @@ async def webhook(token: str, request: Request):
     chat_id = str(chat.get("id") or "")
     text = (msg.get("text") or msg.get("caption") or "").strip()
 
-    # filtra fonte
+    # filtra fonte se configurado
     if SOURCE_CHANNEL and chat_id and chat_id != SOURCE_CHANNEL:
         if SHOW_DEBUG:
             await tg_send(TARGET_CHANNEL, f"DEBUG: Ignorando chat {chat_id}. Fonte esperada: {SOURCE_CHANNEL}")
         return {"ok": True, "skipped": "wrong_source"}
 
-    # ANALISANDO → só memória
+    # 1) ANALISANDO: só memória (com dedupe)
     if RX_ANALISE.search(text):
         if _seen_recent("analise", _dedupe_key(text)):
             return {"ok": True, "skipped": "analise_dupe"}
-        seq=_parse_seq_list(text)
+        seq=_parse_seq(text)
         if seq: _append_seq(seq)
         return {"ok": True, "analise_seq": len(seq)}
 
-    # APOSTA ENCERRADA / GREEN / RED
+    # 2) APOSTA ENCERRADA / GREEN / RED (G0-only, fecha pelo número entre parênteses)
     if RX_FECHA.search(text) or RX_GREEN.search(text) or RX_RED.search(text):
         if _seen_recent("fechamento", _dedupe_key(text)):
             return {"ok": True, "skipped": "fechamento_dupe"}
-
         pend=_pending_get()
         if pend:
-            suggested=int(pend["suggested"] or 0)
+            res=_parse_result_num(text)  # ex.: GREEN!!! (4) ou RED ❌ (2)
+            if res is not None:
+                _pending_seen_append([res], need=1)
 
-            # Observado do placar (G0-only): usar SÓ o primeiro número da "Sequência: a | b"
-            seq_full = _parse_seq_list(text)
-            obs_use = seq_full[:NEED_OBS] if seq_full else []
-            if obs_use:
-                _pending_seen_append(obs_use, need=NEED_OBS)
-
-            # Memória extra: números finais entre parênteses "(x | y)" → timeline
-            extra_tail = _parse_paren_pair(text, need=2)
-            if extra_tail:
-                _append_seq(extra_tail)
-
-            # Reavalia e fecha sempre no G0
             pend=_pending_get()
             seen = [s for s in (pend["seen"] or "").split("-") if s]
-            final_seen="-".join(seen[:NEED_OBS]) if seen else "X"
-            outcome="LOSS"; stage_lbl="G0"
-            if len(seen)>=1 and seen[0].isdigit() and int(seen[0])==suggested:
-                outcome="GREEN"
+            suggested=int(pend["suggested"] or 0)
+
+            # G0-only: GREEN se resultado == sugerido; senão LOSS
+            outcome, stage_lbl = "LOSS", "G0"
+            if len(seen)>=1 and seen[0].isdigit():
+                if int(seen[0]) == suggested:
+                    outcome = "GREEN"
+
+            final_seen = seen[0] if seen else "X"
             msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
             if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
             return {"ok": True, "closed": outcome, "seen": final_seen}
-
         return {"ok": True, "noted_close": True}
 
-    # ENTRADA CONFIRMADA
+    # 3) ENTRADA CONFIRMADA (com dedupe + “Analisando...” auto-delete)
     if RX_ENTRADA.search(text):
         if _seen_recent("entrada", _dedupe_key(text)):
             if SHOW_DEBUG:
                 await tg_send(TARGET_CHANNEL, "DEBUG: entrada duplicada ignorada (conteúdo repetido).")
             return {"ok": True, "skipped": "entrada_dupe"}
 
-        seq=_parse_seq_list(text)
-        if seq: _append_seq(seq)
-        after = _parse_after(text)  # apenas para exibir "após X"
+        seq=_parse_seq(text)
+        if seq: _append_seq(seq)               # memória
+        after = _parse_after(text)             # só para exibir "após X"
 
-        # Fecha pendência esquecida (preenche com X até NEED_OBS=1)
+        # fecha pendência antiga esquecida (marca X e fecha G0 como LOSS/GREEN conforme visto)
         pend=_pending_get()
         if pend:
             seen=[s for s in (pend["seen"] or "").split("-") if s]
-            while len(seen)<NEED_OBS: seen.append("X")
-            final_seen="-".join(seen[:NEED_OBS])
+            if not seen:
+                seen.append("X")
+            final_seen="-".join(seen[:1])
             suggested=int(pend["suggested"] or 0)
-            outcome="LOSS"; stage_lbl="G0"
+            outcome, stage_lbl = "LOSS", "G0"
             if len(seen)>=1 and seen[0].isdigit() and int(seen[0])==suggested:
                 outcome="GREEN"
             msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
             if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
 
+        # “Analisando...” (auto-delete)
         analyzing_id = await tg_send_return(TARGET_CHANNEL, "⏳ Analisando padrão, aguarde...")
 
+        # escolhe nova sugestão
         best, conf, samples, post, gap, reason = _choose_number()
         opened=_pending_open(best)
         if opened:
