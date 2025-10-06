@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v5.1.1 (G1-only, parser canal-fonte, IA hierárquica compacta, dedupe por conteúdo, DB SQLite, "GEN após X")
+v5.1.2 (G1-only correto, parser canal-fonte, IA hierárquica compacta,
+        dedupe por conteúdo, DB SQLite, "Entrar após X" no output)
 
 ENV obrigatórias (Render -> Environment):
 - TG_BOT_TOKEN
@@ -13,8 +14,8 @@ ENV obrigatórias (Render -> Environment):
 ENV opcionais:
 - SHOW_DEBUG          (default False)
 - MAX_GALE            (default 1)
-- OBS_TIMEOUT_SEC     (default 420)
-- DEDUP_WINDOW_SEC    (default 40)  # segundos para deduplicação por conteúdo
+- OBS_TIMEOUT_SEC     (default 420)   [reservado p/ futura lógica de timeout]
+- DEDUP_WINDOW_SEC    (default 40)    # segs para deduplicação por conteúdo
 
 Start command:
   uvicorn webhook_app:app --host 0.0.0.0 --port $PORT
@@ -48,7 +49,7 @@ DB_PATH = "/opt/render/project/src/main.sqlite"
 # ------------------------------------------------------
 # App
 # ------------------------------------------------------
-app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="5.1.1")
+app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="5.1.2")
 
 # ------------------------------------------------------
 # DB helpers
@@ -372,30 +373,63 @@ async def webhook(token: str, request: Request):
         if seq: _append_seq(seq)
         return {"ok": True, "analise_seq": len(seq)}
 
-    # 2) APOSTA ENCERRADA / GREEN / RED (com dedupe)
+    # 2) APOSTA ENCERRADA / GREEN / RED (com dedupe) — ESPERA G1
     if RX_FECHA.search(text) or RX_GREEN.search(text) or RX_RED.search(text):
         if _seen_recent("fechamento", _dedupe_key(text)):
             return {"ok": True, "skipped": "fechamento_dupe"}
-        pend=_pending_get()
-        if pend:
-            obs=_parse_obs_final(text, need=min(2, MAX_GALE+1))
-            if obs: _pending_seen_append(obs, need=min(2, MAX_GALE+1))
-            # decidir outcome G0/G1
-            pend=_pending_get()
-            seen = [s for s in (pend["seen"] or "").split("-") if s]
-            suggested=int(pend["suggested"] or 0)
-            outcome="LOSS"; stage_lbl="G1"
-            if len(seen)>=1 and seen[0].isdigit() and int(seen[0])==suggested:
-                outcome="GREEN"; stage_lbl="G0"
-            elif len(seen)>=2 and len(seen[1])>0 and seen[1].isdigit() and int(seen[1])==suggested and MAX_GALE>=1:
-                outcome="GREEN"; stage_lbl="G1"
-            final_seen="-".join(seen[:min(2, MAX_GALE+1)]) if seen else "X"
-            msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
-            if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
-            return {"ok": True, "closed": outcome, "seen": final_seen}
-        return {"ok": True, "noted_close": True}
 
-    # 3) ENTRADA CONFIRMADA (com dedupe) — COM "GEN após X"
+        pend=_pending_get()
+        if not pend:
+            return {"ok": True, "noted_close": True}
+
+        # tentar capturar números finais (ex: "(3-2)")
+        obs=_parse_obs_final(text, need=min(2, MAX_GALE+1))
+        if obs: _pending_seen_append(obs, need=min(2, MAX_GALE+1))
+
+        pend=_pending_get()
+        seen = [s for s in (pend["seen"] or "").split("-") if s]
+        suggested=int(pend["suggested"] or 0)
+
+        # 1) sem números ainda -> esperar
+        if len(seen) == 0:
+            if SHOW_DEBUG:
+                await tg_send(TARGET_CHANNEL, "DEBUG: fechamento sem números; aguardando observações (não fechei).")
+            return {"ok": True, "waiting_obs": True}
+
+        # 2) com 1º número:
+        #    - se igual ao sugerido -> GREEN G0
+        #    - se diferente e MAX_GALE>=1 -> esperar o 2º número
+        first_ok = seen[0].isdigit() and int(seen[0]) == suggested
+        if first_ok:
+            final_seen = "-".join(seen[:1])
+            msg_txt = _pending_close(final_seen, "GREEN", "G0", suggested)
+            if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
+            return {"ok": True, "closed": "GREEN_G0", "seen": final_seen}
+
+        if MAX_GALE >= 1:
+            if len(seen) < 2:
+                if SHOW_DEBUG:
+                    await tg_send(TARGET_CHANNEL, "DEBUG: aguardando G1 (ainda sem 2º número).")
+                return {"ok": True, "waiting_g1": True}
+
+            second_ok = seen[1].isdigit() and int(seen[1]) == suggested
+            final_seen = "-".join(seen[:2])
+            if second_ok:
+                msg_txt = _pending_close(final_seen, "GREEN", "G1", suggested)
+                if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
+                return {"ok": True, "closed": "GREEN_G1", "seen": final_seen}
+            else:
+                msg_txt = _pending_close(final_seen, "LOSS", "G1", suggested)
+                if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
+                return {"ok": True, "closed": "LOSS", "seen": final_seen}
+
+        # 4) sem gale (MAX_GALE == 0) e 1º diferente -> LOSS G0
+        final_seen = "-".join(seen[:1])
+        msg_txt = _pending_close(final_seen, "LOSS", "G0", suggested)
+        if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
+        return {"ok": True, "closed": "LOSS_G0", "seen": final_seen}
+
+    # 3) ENTRADA CONFIRMADA (com dedupe)
     if RX_ENTRADA.search(text):
         if _seen_recent("entrada", _dedupe_key(text)):
             if SHOW_DEBUG:
@@ -404,9 +438,7 @@ async def webhook(token: str, request: Request):
 
         seq=_parse_seq(text)
         if seq: _append_seq(seq)               # memória
-
-        # Captura "após o X"; se não tiver, infere do primeiro número da sequência
-        after_num = _parse_after(text) or (seq[0] if seq else None)
+        after_n = _parse_after(text)            # USADO no output
 
         # fecha pendência anterior se esquecida (com X)
         pend=_pending_get()
@@ -427,9 +459,11 @@ async def webhook(token: str, request: Request):
         best, conf, samples, post, gap, reason = _choose_number()
         opened=_pending_open(best)
         if opened:
-            padrao_txt = f"GEN após {after_num}" if after_num else "GEN"
+            padrao_line = f"🧩 <b>Padrão:</b> GEN"
+            if isinstance(after_n, int):
+                padrao_line += f" após {after_n}"
             txt=(f"🤖 <b>IA SUGERE</b> — <b>{best}</b>\n"
-                 f"🧩 <b>Padrão:</b> {padrao_txt}\n"
+                 f"{padrao_line}\n"
                  f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples} | <b>gap≈</b>{gap*100:.1f}pp\n"
                  f"🧠 <b>Modo:</b> {reason}\n"
                  f"{_ngram_snapshot(best)}")
