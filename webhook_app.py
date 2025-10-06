@@ -2,29 +2,28 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v7.1 (G0/G1 correto, IA hierárquica compacta, calibração on-line,
-      dedupe, “Analisando...” auto-delete, DB SQLite)
+v7.0 (G1-only, parser canal-fonte, IA hierárquica compacta, dedupe por conteúdo,
+      fechamento correto G0/G1, “Analisando...” com auto-delete, DB SQLite)
 
-ENV obrigatórias:
+ENV obrigatórias (Render -> Environment):
 - TG_BOT_TOKEN
 - WEBHOOK_TOKEN
-- SOURCE_CHANNEL
-- TARGET_CHANNEL
+- SOURCE_CHANNEL           ex: -1002810508717
+- TARGET_CHANNEL           ex: -1003052132833
 
 ENV opcionais:
-- SHOW_DEBUG=False
-- MAX_GALE=1
-- OBS_TIMEOUT_SEC=420
-- DEDUP_WINDOW_SEC=40
-- CALIB_LR=0.06
-- CALIB_BONUS_GREEN=0.04
-- CALIB_PENALTY_LOSS=0.03
-- CALIB_MIN=0.05
-- CALIB_MAX=0.85
+- SHOW_DEBUG          (default False)
+- MAX_GALE            (default 1)          # G0/G1
+- OBS_TIMEOUT_SEC     (default 420)
+- DEDUP_WINDOW_SEC    (default 40)
+
+Start command:
+  uvicorn webhook_app:app --host 0.0.0.0 --port $PORT
 """
 
-import os, re, time, sqlite3, datetime, hashlib
+import os, re, json, time, math, sqlite3, datetime, hashlib
 from typing import List, Dict, Optional, Tuple
+
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 
@@ -50,7 +49,7 @@ DB_PATH = "/opt/render/project/src/main.sqlite"
 # ------------------------------------------------------
 # App
 # ------------------------------------------------------
-app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.1")
+app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.0")
 
 # ------------------------------------------------------
 # DB helpers
@@ -64,18 +63,15 @@ def _con():
 
 def db_init():
     con = _con(); cur = con.cursor()
-
     cur.execute("""CREATE TABLE IF NOT EXISTS processed(
         update_id TEXT PRIMARY KEY,
         seen_at   INTEGER NOT NULL
     )""")
-
     cur.execute("""CREATE TABLE IF NOT EXISTS timeline(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         created_at INTEGER NOT NULL,
         number INTEGER NOT NULL
     )""")
-
     cur.execute("""CREATE TABLE IF NOT EXISTS pending(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         created_at INTEGER,
@@ -85,35 +81,19 @@ def db_init():
         seen       TEXT     DEFAULT '',
         open       INTEGER  DEFAULT 1
     )""")
-
     cur.execute("""CREATE TABLE IF NOT EXISTS score(
         id INTEGER PRIMARY KEY CHECK(id=1),
         green INTEGER DEFAULT 0,
         loss  INTEGER DEFAULT 0
     )""")
-    if not con.execute("SELECT 1 FROM score WHERE id=1").fetchone():
-        con.execute("INSERT INTO score(id,green,loss) VALUES(1,0,0)")
-
-    # pesos dos especialistas (corrigido: 6 colunas)
-    cur.execute("""CREATE TABLE IF NOT EXISTS expert_w(
-        id   INTEGER PRIMARY KEY CHECK(id=1),
-        w_e1 REAL NOT NULL,
-        w_e2 REAL NOT NULL,
-        w_e3 REAL NOT NULL,
-        w_e4 REAL NOT NULL,
-        w_p40 REAL NOT NULL
-    )""")
-    if not con.execute("SELECT 1 FROM expert_w WHERE id=1").fetchone():
-        # default inicial (mesmos pesos que o hedge original)
-        con.execute("INSERT INTO expert_w(id,w_e1,w_e2,w_e3,w_e4,w_p40) VALUES(1,0.40,0.25,0.25,0.10,0.00)")
-
     cur.execute("""CREATE TABLE IF NOT EXISTS dedupe(
         kind TEXT NOT NULL,
         dkey TEXT NOT NULL,
         ts   INTEGER NOT NULL,
         PRIMARY KEY (kind, dkey)
     )""")
-
+    if not con.execute("SELECT 1 FROM score WHERE id=1").fetchone():
+        con.execute("INSERT INTO score(id,green,loss) VALUES(1,0,0)")
     con.commit(); con.close()
 
 db_init()
@@ -195,56 +175,15 @@ def _pending_close(final_seen: str, outcome: str, stage_lbl: str, suggested:int)
     con.execute("UPDATE pending SET open=0, seen=? WHERE id=?", (final_seen, int(row["id"])))
     con.commit(); con.close()
     _score_add(outcome)
-
-    # timeline com observados
+    # alimentar timeline com observados
     obs = [int(x) for x in final_seen.split("-") if x.isdigit()]
     _append_seq(obs)
-
-    # >>> calibração on-line (segura; ignora erros)
-    try:
-        tail=_timeline_tail(400)
-        p1=_post_e1_ngram(tail); p2=_post_e2_short(tail)
-        p3=_post_e3_long(tail);  p4=_post_e4_llm(tail)
-        base=_hedge(p1,p2,p3,p4)
-        conf = float(base.get(int(suggested), 0.25))
-        r = sorted(base.items(), key=lambda kv: kv[1], reverse=True)
-        gap = (r[0][1]-r[1][1]) if len(r)>=2 else r[0][1]
-        _calibrate_weights(outcome, suggested, conf, gap)
-    except Exception:
-        pass
-
     our = suggested if outcome.upper()=="GREEN" else "X"
     snap = _ngram_snapshot(suggested)
     msg = (f"{'🟢' if outcome.upper()=='GREEN' else '🔴'} <b>{outcome.upper()}</b> — finalizado "
            f"(<b>{stage_lbl}</b>, nosso={our}, observados={final_seen}).\n"
            f"📊 Geral: {_score_text()}\n\n{snap}")
     return msg
-
-# ------------------ pesos especialistas (get/set) ------------------
-def _get_w():
-    con = _con()
-    row = con.execute("SELECT w_e1,w_e2,w_e3,w_e4,w_p40 FROM expert_w WHERE id=1").fetchone()
-    con.close()
-    if not row:
-        return (0.40,0.25,0.25,0.10,0.00)
-    return (float(row["w_e1"]), float(row["w_e2"]), float(row["w_e3"]), float(row["w_e4"]), float(row["w_p40"]))
-
-def _set_w(ws):
-    w_e1,w_e2,w_e3,w_e4,w_p40 = ws
-    con = _con()
-    con.execute(
-        "INSERT OR REPLACE INTO expert_w(id,w_e1,w_e2,w_e3,w_e4,w_p40) VALUES(1,?,?,?,?,?)",
-        (float(w_e1), float(w_e2), float(w_e3), float(w_e4), float(w_p40))
-    )
-    con.commit(); con.close()
-
-def _renorm_weights(ws):
-    s = sum(ws) or 1e-9
-    return [max(1e-9, w/s) for w in ws]
-
-def _clamp_weights(ws, wmin=0.05, wmax=0.85):
-    ws = [min(max(w, wmin), wmax) for w in ws]
-    return _renorm_weights(ws)
 
 # ------------------ DEDUPE por conteúdo ------------------
 def _dedupe_key(text: str) -> str:
@@ -276,7 +215,7 @@ def _post_freq(tail:List[int], k:int)->Dict[int,float]:
     return _norm({c:win.count(c)/tot for c in (1,2,3,4)})
 
 def _post_e1_ngram(tail:List[int])->Dict[int,float]:
-    # mistura com janelas tipo Fibonacci
+    # proxy simples: mistura de janelas (Fibonacci curto embutido)
     mix={c:0.0 for c in (1,2,3,4)}
     for k,w in ((8,0.25),(21,0.35),(55,0.40)):
         pk=_post_freq(tail,k)
@@ -285,13 +224,11 @@ def _post_e1_ngram(tail:List[int])->Dict[int,float]:
 
 def _post_e2_short(tail):  return _post_freq(tail, 60)
 def _post_e3_long(tail):   return _post_freq(tail, 300)
-def _post_e4_llm(tail):    return {1:0.25,2:0.25,3:0.25,4:0.25}  # placeholder
+def _post_e4_llm(tail):    return {1:0.25,2:0.25,3:0.25,4:0.25}  # placeholder offline
 
-def _hedge(p1,p2,p3,p4):
-    # usa pesos do DB
-    w_e1,w_e2,w_e3,w_e4,_ = _get_w()
+def _hedge(p1,p2,p3,p4, w=(0.40,0.25,0.25,0.10)):
     cands=(1,2,3,4)
-    out={c: w_e1*p1.get(c,0)+w_e2*p2.get(c,0)+w_e3*p3.get(c,0)+w_e4*p4.get(c,0) for c in cands}
+    out={c: w[0]*p1.get(c,0)+w[1]*p2.get(c,0)+w[2]*p3.get(c,0)+w[3]*p4.get(c,0) for c in cands}
     return _norm(out)
 
 def _runnerup_ls2(post:Dict[int,float], loss_streak:int)->Tuple[int,Dict[int,float],str]:
@@ -320,6 +257,7 @@ def _conf_floor(post:Dict[int,float], floor=0.30, cap=0.95):
     return _norm(post)
 
 def _get_ls()->int:
+    # loss streak simples (não persistido nesta versão)
     return 0
 
 def _choose_number()->Tuple[int,float,int,Dict[int,float],float,str]:
@@ -345,32 +283,8 @@ def _ngram_snapshot(suggested:int)->str:
     return (f"📈 Amostra: {_timeline_size()} • Conf: {conf}\n"
             f"🔎 E1(n-gram proxy): 1 {p1} | 2 {p2} | 3 {p3} | 4 {p4}")
 
-# ------------------ Calibrador on-line ------------------
-def _calibrate_weights(outcome: str, suggested: int, conf: float, gap: float):
-    w_e1, w_e2, w_e3, w_e4, w_p40 = _get_w()
-    ws = [w_e1, w_e2, w_e3, w_e4]
-
-    lr    = float(os.getenv("CALIB_LR", "0.06"))
-    bonus = float(os.getenv("CALIB_BONUS_GREEN", "0.04"))
-    malus = float(os.getenv("CALIB_PENALTY_LOSS", "0.03"))
-    wmin  = float(os.getenv("CALIB_MIN", "0.05"))
-    wmax  = float(os.getenv("CALIB_MAX", "0.85"))
-
-    sens = max(0.5, min(1.5, 0.5 + 0.8*conf + 0.7*gap))
-
-    # proxy: favorece E1 (se quiser, troque por contribuição real guardada no hedge)
-    leader_idx = 0
-
-    if outcome.upper() == "GREEN":
-        ws[leader_idx] += lr * sens * bonus
-    else:
-        ws[leader_idx] -= lr * sens * malus
-
-    ws = _clamp_weights(ws, wmin, wmax)
-    _set_w([ws[0], ws[1], ws[2], ws[3], w_p40])
-
 # ------------------------------------------------------
-# Telegram helpers
+# Telegram helpers (send + delete)
 # ------------------------------------------------------
 async def tg_send(chat_id: str, text: str, parse="HTML"):
     try:
@@ -476,7 +390,7 @@ async def webhook(token: str, request: Request):
             await tg_send(TARGET_CHANNEL, f"DEBUG: Ignorando chat {chat_id}. Fonte esperada: {SOURCE_CHANNEL}")
         return {"ok": True, "skipped": "wrong_source"}
 
-    # 1) ANALISANDO: memória + dedupe
+    # 1) ANALISANDO: apenas alimenta memória (com dedupe)
     if RX_ANALISE.search(text):
         if _seen_recent("analise", _dedupe_key(text)):
             return {"ok": True, "skipped": "analise_dupe"}
@@ -484,7 +398,7 @@ async def webhook(token: str, request: Request):
         if seq: _append_seq(seq)
         return {"ok": True, "analise_seq": len(seq)}
 
-    # 2) APOSTA ENCERRADA / GREEN / RED
+    # 2) APOSTA ENCERRADA / GREEN / RED (com dedupe + FECHAMENTO CORRETO G0/G1)
     if RX_FECHA.search(text) or RX_GREEN.search(text) or RX_RED.search(text):
         if _seen_recent("fechamento", _dedupe_key(text)):
             return {"ok": True, "skipped": "fechamento_dupe"}
@@ -493,45 +407,47 @@ async def webhook(token: str, request: Request):
         if pend:
             suggested=int(pend["suggested"] or 0)
 
-            # Observados do placar (linha Sequência: a | b)
+            # (a) Observados do PLACAR: usar a linha "Sequência: a | b"
             obs_pair = _parse_seq_pair(text, need=min(2, MAX_GALE+1))
             if obs_pair:
                 _pending_seen_append(obs_pair, need=min(2, MAX_GALE+1))
 
-            # Extras entre parênteses (para memória/timeline)
+            # (b) Memória extra: números finais entre parênteses "(x | y)" -> só para timeline
             extra_tail = _parse_paren_pair(text, need=2)
             if extra_tail:
                 _append_seq(extra_tail)
 
-            # Reavalia
+            # Reavalia pendência após update
             pend=_pending_get()
             seen = [s for s in (pend["seen"] or "").split("-") if s]
 
-            # Se G0 != sugerido e existe G1, aguarda próxima
+            # Regra: se G0 != sugerido e ainda temos espaço para G1, NÃO fecha; aguarda próxima rodada
             if len(seen)==1 and seen[0].isdigit() and int(seen[0]) != suggested and MAX_GALE>=1:
+                # mantém pendência aberta para o G1
                 if SHOW_DEBUG:
                     await tg_send(TARGET_CHANNEL, f"DEBUG: aguardando G1 (visto G0={seen[0]}, nosso={suggested}).")
                 return {"ok": True, "waiting_g1": True, "seen": "-".join(seen)}
 
-            # Decide
+            # Decisão final (se já temos 1 ou 2 observados suficientes)
             outcome="LOSS"; stage_lbl="G1"
             if len(seen)>=1 and seen[0].isdigit() and int(seen[0])==suggested:
                 outcome="GREEN"; stage_lbl="G0"
             elif len(seen)>=2 and seen[1].isdigit() and int(seen[1])==suggested and MAX_GALE>=1:
                 outcome="GREEN"; stage_lbl="G1"
 
-            # Fecha se GREEN G0 ou já temos G1 observado
+            # fecha se: GREEN no G0, ou já temos G1 observado (independente de GREEN/LOSS)
             if stage_lbl=="G0" or len(seen)>=min(2, MAX_GALE+1):
                 final_seen="-".join(seen[:min(2, MAX_GALE+1)]) if seen else "X"
                 msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
                 if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
                 return {"ok": True, "closed": outcome, "seen": final_seen}
             else:
+                # ainda aguardando G1 (cenário raro se MAX_GALE>1 futuramente)
                 return {"ok": True, "waiting_more_obs": True, "seen": "-".join(seen)}
 
         return {"ok": True, "noted_close": True}
 
-    # 3) ENTRADA CONFIRMADA
+    # 3) ENTRADA CONFIRMADA (com dedupe + “Analisando...” auto-delete)
     if RX_ENTRADA.search(text):
         if _seen_recent("entrada", _dedupe_key(text)):
             if SHOW_DEBUG:
@@ -539,10 +455,10 @@ async def webhook(token: str, request: Request):
             return {"ok": True, "skipped": "entrada_dupe"}
 
         seq=_parse_seq_list(text)
-        if seq: _append_seq(seq)
-        after = _parse_after(text)
+        if seq: _append_seq(seq)               # memória
+        after = _parse_after(text)             # usado apenas para exibir "após X"
 
-        # fecha pendência esquecida
+        # fecha pendência anterior se esquecida (com X)
         pend=_pending_get()
         if pend:
             seen=[s for s in (pend["seen"] or "").split("-") if s]
@@ -557,7 +473,7 @@ async def webhook(token: str, request: Request):
             msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
             if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
 
-        # “Analisando...” temporário
+        # “Analisando...” (apaga depois)
         analyzing_id = await tg_send_return(TARGET_CHANNEL, "⏳ Analisando padrão, aguarde...")
 
         # escolhe nova sugestão
@@ -571,8 +487,10 @@ async def webhook(token: str, request: Request):
                  f"🧠 <b>Modo:</b> {reason}\n"
                  f"{_ngram_snapshot(best)}")
             await tg_send(TARGET_CHANNEL, txt)
+
             if analyzing_id is not None:
                 await tg_delete(TARGET_CHANNEL, analyzing_id)
+
             return {"ok": True, "entry_opened": True, "best": best, "conf": conf}
         else:
             if analyzing_id is not None:
