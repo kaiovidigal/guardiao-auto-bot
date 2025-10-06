@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-webhook_app.py — v4.6.1 (G1-only + Parser Estrito + Timeout Neutro + LLM status/debug)
+webhook_app.py — v4.6.2 (G1-only + Parser compatível com seu canal + Timeout Neutro + IA hierárquica)
 
 - Fecha até G1 (2 números) — MAX_GALE fixo em 1
-- Usa N_OBS_REQUIRED em TODO o fluxo (sem [:3] / >=3)
-- Parser estrito: captura par/trinca no FINAL da mensagem (com/sem parênteses)
-  separadores aceitos: -, –, —, x, /, |, .
+- N_OBS_REQUIRED = 2 em TODO o fluxo (sem [:3] / >=3)
+- Parser compatível com seu canal:
+    • ENTRADA CONFIRMADA …  Sequência: a | b  …  Entrar após o X …
+    • APOSTA ENCERRADA … GREEN/RED (n)  ou  (a-b)
+    • ANALISANDO … Sequência: n
 - Timeout neutro quando faltar 1 observado (não marca LOSS)
 - Endpoints /llm_status e /debug_cfg
 - IA local (LLM) opcional como 4º especialista
@@ -19,7 +21,7 @@ from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timezone
 
 # ====== Fuso horário ======
-TZ_NAME = "America/Sao_Paulo"
+TZ_NAME = os.getenv("TZ_NAME", "America/Sao_Paulo").strip() or "America/Sao_Paulo"
 try:
     from zoneinfo import ZoneInfo
     _TZ = ZoneInfo(TZ_NAME)
@@ -42,7 +44,7 @@ TELEGRAM_API   = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 # ========= CONFIG FIXA (sem ENV) =========
 DB_PATH        = "/var/data/data.db"
-DEBUG_MSG      = True
+DEBUG_MSG      = False            # 🔇 sem spam
 BYPASS_SOURCE  = False
 
 # ===== IA (LLM) =====
@@ -54,8 +56,8 @@ LLM_TEMP       = 0.10
 LLM_TOP_P      = 0.90
 
 # ===== Fluxo/tempo =====
-MAX_GALE       = 1                     # G0/G1 (2 observações) — G2 desabilitado
-N_OBS_REQUIRED = max(1, min(3, MAX_GALE + 1))
+MAX_GALE        = 1                    # G0/G1 (2 observações) — G2 desabilitado
+N_OBS_REQUIRED  = 2                    # fixo, por ser G1-only
 OBS_TIMEOUT_SEC = 420                  # 7min
 
 # ===== Recursos (fixos) =====
@@ -73,7 +75,7 @@ MIN_CONF_FLOOR = 0.30
 H_MAX          = 0.95
 
 # ========= App =========
-app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="4.6.1")
+app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="4.6.2")
 
 # ========= Parâmetros =========
 DECAY = 0.980
@@ -194,7 +196,7 @@ migrate_db()
 def _exec_write(sql: str, params: tuple=()):
     for attempt in range(6):
         try:
-            with _tx() as con:
+            with __tx() as con:
                 con.execute(sql, params)
             return
         except sqlite3.OperationalError as e:
@@ -261,7 +263,8 @@ def _prob_from_ngrams(ctx: List[int], cand: int) -> float:
     tot = (row_tot["s"] or 0.0) if row_tot else 0.0
     if tot <= 0:
         con.close(); return 0.0
-    row_c = con.execute("SELECT w FROM ngram WHERE n=? AND ctx=? AND nxt=?", (n, ctx_key, int(cand))).fetchone()
+    row_c = con.execute("SELECT w FROM ngram WHERE n=? AND ctx=? AND nxt=?",
+                        (n, ctx_key, int(cand))).fetchone()
     w = (row_c["w"] or 0.0) if row_c else 0.0
     con.close()
     return w / max(tot, 1e-9)
@@ -422,6 +425,32 @@ def _last_runlength(tail: List[int]) -> int:
         else: break
     return r
 
+def _kl_divergence(p: Dict[int, float], q: Dict[int, float]) -> float:
+    eps = 1e-12; s = 0.0
+    for c in (1,2,3,4):
+        pc = max(eps, float(p.get(c, 0.0)))
+        qc = max(eps, float(q.get(c, 0.0)))
+        s += pc * math.log(pc / qc)
+    return s
+
+def _dealer_snapshot() -> Dict[str, float]:
+    tail = get_tail(400)
+    p_short = _post_freq_k(tail, K_SHORT)
+    p_long  = _post_freq_k(tail, K_LONG)
+    kl  = _kl_divergence(p_short, p_long)
+    dom_s = max(p_short, key=p_short.get)
+    dom_l = max(p_long,  key=p_long.get)
+    ent_s = _entropy_norm(p_short)
+    ent_l = _entropy_norm(p_long)
+    drift = kl > 0.22
+    return {"kl": kl, "drift": drift, "dom_s": dom_s, "dom_l": dom_l, "ent_s": ent_s, "ent_l": ent_l}
+
+def _dealer_print_line() -> str:
+    snap = _dealer_snapshot()
+    status = "DRIFT ALTO" if snap["drift"] else "OK"
+    return (f"🧑‍💼 <b>Crupiê</b>: KL={snap['kl']:.3f} (thr 0.22) • {status} • "
+            f"curto→{snap['dom_s']} | longo→{snap['dom_l']} • Hs={snap['ent_s']:.2f} Hl={snap['ent_l']:.2f} • α=0.0")
+
 def _regime_prior() -> Dict[str, float]:
     snap = _dealer_snapshot()
     kl = float(snap.get("kl", 0.0))
@@ -539,34 +568,6 @@ def _apply_conf_floor(post: Dict[int,float], floor: float = MIN_CONF_FLOOR, cap:
         post = _norm_dict(post); tag += f"| cap{int(cap*100)}"
     return post, tag
 
-# ========= Crupiê =========
-def _kl_divergence(p: Dict[int, float], q: Dict[int, float]) -> float:
-    eps = 1e-12; s = 0.0
-    for c in (1,2,3,4):
-        pc = max(eps, float(p.get(c, 0.0)))
-        qc = max(eps, float(q.get(c, 0.0)))
-        s += pc * math.log(pc / qc)
-    return s
-
-def _dealer_snapshot() -> Dict[str, float]:
-    tail = get_tail(400)
-    p_short = _post_freq_k(tail, K_SHORT)
-    p_long  = _post_freq_k(tail, K_LONG)
-    kl  = _kl_divergence(p_short, p_long)
-    dom_s = max(p_short, key=p_short.get)
-    dom_l = max(p_long,  key=p_long.get)
-    ent_s = _entropy_norm(p_short)
-    ent_l = _entropy_norm(p_long)
-    drift = kl > 0.22
-    return {"kl": kl, "drift": drift, "dom_s": dom_s, "dom_l": dom_l, "ent_s": ent_s, "ent_l": ent_l}
-
-def _dealer_print_line() -> str:
-    snap = _dealer_snapshot()
-    status = "DRIFT ALTO" if snap["drift"] else "OK"
-    return (f"🧑‍💼 <b>Crupiê</b>: KL={snap['kl']:.3f} (thr 0.22) • {status} • "
-            f"curto→{snap['dom_s']} | longo→{snap['dom_l']} • Hs={snap['ent_s']:.2f} Hl={snap['ent_l']:.2f} • α=0.0")
-
-# ========= Hedge =========
 def _get_expert_w():
     con = _connect()
     row = con.execute("SELECT w1,w2,w3,w4 FROM expert_w WHERE id=1").fetchone()
@@ -687,8 +688,9 @@ def _seen_append(row: sqlite3.Row, new_items: List[str]):
         con.execute("UPDATE pending SET seen=? WHERE id=?", (seen_txt, int(row["id"])))
 
 def _stage_from_observed(suggested: int, obs: List[int]) -> Tuple[str, str]:
+    # G1-only: GREEN se acertar no 1º (G0) OU 2º (G1); senão LOSS
     stages = ["G0", "G1", "G2"]
-    lim = min(MAX_GALE, 2)
+    lim = 1
     for i in range(0, lim + 1):
         if len(obs) >= i + 1 and obs[i] == suggested:
             return ("GREEN", stages[i])
@@ -769,17 +771,11 @@ def _maybe_close_by_timeout():
     if now_ts() - opened_at < OBS_TIMEOUT_SEC:
         return None
     seen_list = _seen_list(row)
-    # Timeout NEUTRO quando faltava apenas 1 observado
+    # Timeout NEUTRO quando faltava apenas 1 observado (G1-only → precisa de 2)
     if len(seen_list) == N_OBS_REQUIRED - 1:
         final_seen = "-".join(seen_list + ["X"])
         with _tx() as con:
             con.execute("UPDATE pending SET open=0, seen=? WHERE id=?", (final_seen, int(row["id"])))
-        if DEBUG_MSG:
-            try:
-                import asyncio as _asyncio
-                _asyncio.create_task(tg_send_text(TARGET_CHANNEL, f"⏳ Timeout neutro (faltava 1). seen={final_seen}"))
-            except Exception:
-                pass
         return None
     return None
 
@@ -815,6 +811,63 @@ async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
                                     "disable_web_page_preview": True})
     except Exception:
         pass
+
+# ========= PARSER — compatível com seu canal =========
+
+_SEP = r"[-–—xX/|\.]"
+
+def _norm_txt(s: str) -> str:
+    return "".join({"1️⃣":"1","2️⃣":"2","3️⃣":"3","4️⃣":"4"}.get(ch, ch) for ch in (s or "")).strip()
+
+# ENTRADA
+ENTRY_RX        = re.compile(r"(?:^|[\n\r])\s*💰?\s*ENTRADA\s+CONFIRMADA\s*💰?", re.I)
+SEQ_PAIR_RX     = re.compile(r"Sequ[eê]ncia\s*:\s*([1-4])\s*\|\s*([1-4])", re.I)
+AFTER_RX        = re.compile(r"Entrar\s+ap[oó]s\s+o\s+([1-4])\b", re.I)
+
+def parse_entry_full(txt: str):
+    t = _norm_txt(txt)
+    if not ENTRY_RX.search(t):
+        return None
+    mseq = SEQ_PAIR_RX.search(t)
+    seq = []
+    if mseq:
+        seq = [int(mseq.group(1)), int(mseq.group(2))]
+    mafter = AFTER_RX.search(t)
+    after_num = int(mafter.group(1)) if mafter else None
+    return {"seq": seq, "after": after_num}
+
+# FECHAMENTO
+CLOSE_BLOCK_RX   = re.compile(r"(?:^|[\n\r])\s*(?:APOSTA\s+ENCERRADA|ENCERRADA)\b", re.I)
+LAST_PAREN_RX    = re.compile(r"\(([^\)]*)\)\s*$")
+PAIR_IN_PAREN_RX = re.compile(rf"\b([1-4])\s*{_SEP}\s*([1-4])\b")
+ONE_IN_PAREN_RX  = re.compile(r"\b([1-4])\b")
+
+def parse_close_pair_or_one(txt: str) -> List[int]:
+    t = _norm_txt(txt)
+    if not CLOSE_BLOCK_RX.search(t): return []
+    mlast = LAST_PAREN_RX.search(t)
+    if not mlast: return []
+    seg = mlast.group(1)
+    mp = PAIR_IN_PAREN_RX.search(seg)
+    if mp:
+        return [int(mp.group(1)), int(mp.group(2))]
+    m1 = ONE_IN_PAREN_RX.findall(seg)
+    if m1:
+        # mantém somente valores 1..4 e devolve no máx 2 (G1-only)
+        vals = [int(x) for x in m1 if x in ("1","2","3","4")]
+        return vals[-2:] if len(vals) >= 2 else vals[-1:]
+    return []
+
+# ANALISANDO
+ANALISANDO_RX   = re.compile(r"(?:^|[\n\r])\s*ANALISANDO\b", re.I)
+AN_SEQUENCIA_RX = re.compile(r"Sequ[eê]ncia\s*:\s*([1-4])", re.I)
+
+def parse_analisando(txt: str) -> List[int]:
+    t = _norm_txt(txt)
+    if not ANALISANDO_RX.search(t): return []
+    m = AN_SEQUENCIA_RX.search(t)
+    if not m: return []
+    return [int(m.group(1))]
 
 # ========= Decisão principal =========
 def _apply_seq3_boost(post: Dict[int,float], tail: List[int]) -> Tuple[Dict[int,float], str]:
@@ -914,77 +967,41 @@ async def webhook(token: str, request: Request):
     if not text:
         return {"ok": True, "skipped": "sem_texto"}
 
-    # === Parser de observações (par/trinca no FINAL) ===
-    SEP = r"[-–—xX/|\.]"
-    GRUPO_FINAL_PAREN_RX = re.compile(r"\(([^\)]*)\)\s*$")
-    PAR_SOLTO_FIM_RX    = re.compile(rf"\b([1-4])\s*{SEP}\s*([1-4])\s*$")
-    TRINCA_SOLTA_FIM_RX = re.compile(rf"\b([1-4])\s*{SEP}\s*([1-4])\s*{SEP}\s*([1-4])\s*$")
-    PAR_NUMS_RX    = re.compile(rf"\b([1-4])\s*{SEP}\s*([1-4])\b")
-    TRINCA_NUMS_RX = re.compile(rf"\b([1-4])\s*{SEP}\s*([1-4])\s*{SEP}\s*([1-4])\b")
-    def _normalize_keycaps(s: str) -> str:
-        return "".join({"1️⃣":"1","2️⃣":"2","3️⃣":"3","4️⃣":"4"}.get(ch, ch) for ch in (s or ""))
-    def parse_obs_estrito(txt: str, need: int) -> List[int]:
-        t = _normalize_keycaps(re.sub(r"\s+", " ", txt or ""))
-        m = GRUPO_FINAL_PAREN_RX.search(t)
-        if m:
-            seg = m.group(1)
-            if need == 2:
-                mp = PAR_NUMS_RX.search(seg)
-                if mp: return [int(mp.group(1)), int(mp.group(2))]
-            if need == 3:
-                m3 = TRINCA_NUMS_RX.search(seg)
-                if m3: return [int(m3.group(1)), int(m3.group(2)), int(m3.group(3))]
-        if need == 2:
-            ms = PAR_SOLTO_FIM_RX.search(t)
-            if ms: return [int(ms.group(1)), int(ms.group(2))]
-        if need == 3:
-            ms3 = TRINCA_SOLTA_FIM_RX.search(t)
-            if ms3: return [int(ms3.group(1)), int(ms3.group(2)), int(ms3.group(3))]
-        return []
-
-    # Fechamento estrito por observações (antes de GALE/GREEN/LOSS/ENTRADA)
+    # === (A) FECHAMENTO: APOSTA ENCERRADA (aceita (a-b) ou (a) e espera o 2º) ===
     pend = get_open_pending()
     if pend:
-        nums = parse_obs_estrito(text, N_OBS_REQUIRED)
-        if nums:
-            _seen_append(pend, [str(n) for n in nums])
+        obs = parse_close_pair_or_one(text)
+        if obs:
+            _seen_append(pend, [str(n) for n in obs])
             pend = get_open_pending()
             cur_seen = _seen_list(pend)
-            if len(cur_seen) >= N_OBS_REQUIRED:
+            if len(cur_seen) >= N_OBS_REQUIRED:  # G1-only → precisa 2
                 suggested = int(pend["suggested"] or 0)
                 obs_nums = [int(x) for x in cur_seen if x.isdigit()]
                 outcome, stage_lbl = _stage_from_observed(suggested, obs_nums)
                 final_seen = "-".join(cur_seen[:N_OBS_REQUIRED])
                 out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
                 await tg_send_text(TARGET_CHANNEL, out_msg)
-                return {"ok": True, "closed_by_obs_strict": True, "seen": final_seen, "outcome": outcome}
+                return {"ok": True, "closed_by_closeblock": True, "seen": final_seen, "outcome": outcome}
 
-    # Regexes gerais
-    ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
-    SEQ_RX   = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
-    AFTER_RX = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
-    GALE1_RX = re.compile(r"Estamos\s+no\s*1[ºo]\s*gale", re.I)
-    GALE2_RX = re.compile(r"Estamos\s+no\s*2[ºo]\s*gale", re.I)
-    GREEN_RX = re.compile(r"(?:\bgr+e+e?n\b|\bwin\b|✅)", re.I)
-    LOSS_RX  = re.compile(r"(?:\blo+s+s?\b|\bred\b|❌|\bperdemos\b)", re.I)
+    # === (B) GALe informativo (opcional) ===
+    if re.search(r"Estamos\s+no\s*1[ºo]\s*gale", text, re.I):
+        if get_open_pending():
+            set_stage(1)
+            await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>1° gale (G1)</b>")
+        return {"ok": True, "noted": "g1"}
 
-    # 0) ANALISANDO
-    ANALISANDO_RX = re.compile(r"\bANALISANDO\b", re.I)
-    if ANALISANDO_RX.search(_normalize_keycaps(text)):
-        def parse_analise_seq(txt: str) -> List[int]:
-            if not ANALISANDO_RX.search(_normalize_keycaps(txt or "")): return []
-            mseq = SEQ_RX.search(_normalize_keycaps(txt or ""))
-            if not mseq: return []
-            return [int(x) for x in re.findall(r"[1-4]", mseq.group(1))]
-        seq = parse_analise_seq(text)
-        if seq:
-            append_seq(seq)
+    # === (C) ANALISANDO — alimenta memória; pode adiantar fechamento se faltar 1 número ===
+    if ANALISANDO_RX.search(text):
+        seq1 = parse_analisando(text)  # [n] ou []
+        if seq1:
+            append_seq(seq1)
             pend = get_open_pending()
             if pend:
                 cur_seen = _seen_list(pend)
                 need = N_OBS_REQUIRED - len(cur_seen)
                 if need > 0:
-                    _seen_append(pend, [str(n) for n in seq[:need]])
+                    _seen_append(pend, [str(n) for n in seq1[:need]])
                     pend = get_open_pending()
                     cur_seen = _seen_list(pend)
                     if len(cur_seen) >= N_OBS_REQUIRED:
@@ -995,92 +1012,52 @@ async def webhook(token: str, request: Request):
                         out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
                         await tg_send_text(TARGET_CHANNEL, out_msg)
                         return {"ok": True, "closed_from_analise": True, "seen": final_seen}
-        return {"ok": True, "analise_seen": len(seq)}
+        return {"ok": True, "analise_seen": len(seq1) if seq1 else 0}
 
-    # 1) Gales (informativo)
-    if GALE1_RX.search(text):
-        if get_open_pending():
-            set_stage(1)
-            await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>1° gale (G1)</b>")
-        return {"ok": True, "noted": "g1"}
-    if GALE2_RX.search(text):
-        if get_open_pending():
-            set_stage(2)
-            await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>2° gale (G2)</b>")
-        return {"ok": True, "noted": "g2"}
-
-    # 2) Fechamento GREEN/LOSS (usa parser estrito + N_OBS_REQUIRED)
-    if GREEN_RX.search(text) or LOSS_RX.search(text):
+    # === (D) NOVA ENTRADA CONFIRMADA ===
+    parsed = parse_entry_full(text)
+    if parsed:
+        # Se houver pendência aberta e completa, fecha; se incompleta, aguarda
         pend = get_open_pending()
         if pend:
-            nums = parse_obs_estrito(text, N_OBS_REQUIRED)
-            if nums:
-                _seen_append(pend, [str(n) for n in nums])
-                pend = get_open_pending()
-            seen_list = _seen_list(pend) if pend else []
-            if pend and len(seen_list) >= N_OBS_REQUIRED:
+            seen_list = _seen_list(pend)
+            if len(seen_list) >= N_OBS_REQUIRED:
                 suggested = int(pend["suggested"] or 0)
                 obs_nums = [int(x) for x in seen_list if x.isdigit()]
                 outcome, stage_lbl = _stage_from_observed(suggested, obs_nums)
                 final_seen = "-".join(seen_list[:N_OBS_REQUIRED])
                 out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
                 await tg_send_text(TARGET_CHANNEL, out_msg)
-                return {"ok": True, "closed": outcome.lower(), "seen": final_seen}
-        return {"ok": True, "noted_close": True}
+            else:
+                return {"ok": True, "kept_open_waiting_close": True}
 
-    # 3) Nova ENTRADA CONFIRMADA
-    def parse_entry_text(txt: str) -> Optional[Dict]:
-        t = _normalize_keycaps(re.sub(r"\s+", " ", txt).strip())
-        if not ENTRY_RX.search(t): return None
-        mseq = SEQ_RX.search(t); seq = []
-        if mseq:
-            parts = re.findall(r"[1-4]", _normalize_keycaps(mseq.group(1)))
-            seq = [int(x) for x in parts]
-        mafter = AFTER_RX.search(t)
-        after_num = int(mafter.group(1)) if mafter else None
-        return {"seq": seq, "after": after_num, "raw": t}
+        # alimenta memória com a sequência "a | b"
+        seq = parsed["seq"] or []
+        if seq: append_seq(seq)
 
-    parsed = parse_entry_text(text)
-    if not parsed:
-        if DEBUG_MSG:
-            await tg_send_text(TARGET_CHANNEL, "DEBUG: Mensagem não reconhecida como ENTRADA/FECHAMENTO/ANALISANDO.")
-        return {"ok": True, "skipped": "nao_eh_entrada_confirmada"}
+        after = parsed["after"]  # “Entrar após o X …”
+        best, conf, samples, post, gap, reason = choose_single_number(after)
 
-    # Se existir pendência aberta e completa, fecha; senão mantém
-    pend = get_open_pending()
-    if pend:
-        seen_list = _seen_list(pend)
-        if len(seen_list) >= N_OBS_REQUIRED:
-            suggested = int(pend["suggested"] or 0)
-            obs_nums = [int(x) for x in seen_list if x.isdigit()]
-            outcome, stage_lbl = _stage_from_observed(suggested, obs_nums)
-            final_seen = "-".join(seen_list[:N_OBS_REQUIRED])
-            out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
-            await tg_send_text(TARGET_CHANNEL, out_msg)
-        else:
-            return {"ok": True, "kept_open_waiting_close": True}
+        ctx1, ctx2, ctx3, ctx4 = _decision_context(after)
+        opened = _open_pending_with_ctx(best, after, ctx1, ctx2, ctx3, ctx4)
+        if not opened:
+            if DEBUG_MSG:
+                await tg_send_text(TARGET_CHANNEL, "DEBUG: Já existe pending open — não abri novo.")
+            return {"ok": True, "skipped": "pending_already_open"}
 
-    # Alimenta memória e decide
-    seq = parsed["seq"] or []
-    if seq: append_seq(seq)
-    after = parsed["after"]
-    best, conf, samples, post, gap, reason = choose_single_number(after)
+        aft_txt = f" após {after}" if after else ""
+        ls = _get_loss_streak()
+        txt = (
+            f"🤖 <b>IA SUGERE</b> — <b>{best}</b>\n"
+            f"🧩 <b>Padrão:</b> GEN{aft_txt}\n"
+            f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples} | <b>gap≈</b>{gap*100:.1f}pp\n"
+            f"🧠 <b>Modo:</b> {reason} | <b>streak RED:</b> {ls}\n"
+            f"{_dealer_print_line()}"
+        )
+        await tg_send_text(TARGET_CHANNEL, txt)
+        return {"ok": True, "posted": True, "best": best, "conf": conf, "gap": gap, "samples": samples}
 
-    ctx1, ctx2, ctx3, ctx4 = _decision_context(after)
-    opened = _open_pending_with_ctx(best, after, ctx1, ctx2, ctx3, ctx4)
-    if not opened:
-        if DEBUG_MSG:
-            await tg_send_text(TARGET_CHANNEL, "DEBUG: Já existe pending open — não abri novo.")
-        return {"ok": True, "skipped": "pending_already_open"}
-
-    aft_txt = f" após {after}" if after else ""
-    ls = _get_loss_streak()
-    txt = (
-        f"🤖 <b>IA SUGERE</b> — <b>{best}</b>\n"
-        f"🧩 <b>Padrão:</b> GEN{aft_txt}\n"
-        f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples} | <b>gap≈</b>{gap*100:.1f}pp\n"
-        f"🧠 <b>Modo:</b> {reason} | <b>streak RED:</b> {ls}\n"
-        f"{_dealer_print_line()}"
-    )
-    await tg_send_text(TARGET_CHANNEL, txt)
-    return {"ok": True, "posted": True, "best": best, "conf": conf, "gap": gap, "samples": samples}
+    # === (E) SE CHEGOU AQUI, NÃO É ENTRADA/FECHAMENTO/ANALISANDO ===
+    if DEBUG_MSG:
+        await tg_send_text(TARGET_CHANNEL, "DEBUG: Mensagem não reconhecida como ENTRADA/FECHAMENTO/ANALISANDO.")
+    return {"ok": True, "skipped": "fora_de_formato"}
