@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v7.1.2 (G0-only fix: fecha pelo número entre parênteses; observados=x; mantém IA)
+v7.1.1 (G0-only fechamento pelo número em parênteses)
 
-ENV obrigatórias (Render -> Environment):
+ENV obrigatórias:
 - TG_BOT_TOKEN
 - WEBHOOK_TOKEN
 - SOURCE_CHANNEL
@@ -12,7 +12,7 @@ ENV obrigatórias (Render -> Environment):
 
 ENV opcionais:
 - SHOW_DEBUG          (default False)
-- MAX_GALE            (default 1)   # coloque 0 para G0-only
+- MAX_GALE            (default 1)   # ignorado no fechamento (G0-only)
 - OBS_TIMEOUT_SEC     (default 420)
 - DEDUP_WINDOW_SEC    (default 40)
 
@@ -44,7 +44,7 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 DB_PATH = "/opt/render/project/src/main.sqlite"
 
 # =============== APP ===============
-app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.1.2")
+app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.1.1-g0paren")
 
 # =============== DB ===============
 def _con():
@@ -144,11 +144,15 @@ def _pending_open(suggested:int):
     con.commit(); con.close()
     return True
 
-def _pending_seen_set_one(n: int):
-    """Para G0: fixa 'seen' como um único número."""
+def _pending_seen_append(nums: List[int], need:int=2):
     row = _pending_get()
     if not row: return
-    txt = str(int(n))
+    seen = (row["seen"] or "").strip()
+    arr = [s for s in seen.split("-") if s]
+    for n in nums:
+        if len(arr) >= need: break
+        arr.append(str(int(n)))
+    txt = "-".join(arr[:need])
     con = _con(); con.execute("UPDATE pending SET seen=? WHERE id=?", (txt, int(row["id"]))); con.commit(); con.close()
 
 def _pending_close(final_seen: str, outcome: str, stage_lbl: str, suggested:int)->str:
@@ -158,7 +162,6 @@ def _pending_close(final_seen: str, outcome: str, stage_lbl: str, suggested:int)
     con.execute("UPDATE pending SET open=0, seen=? WHERE id=?", (final_seen, int(row["id"])))
     con.commit(); con.close()
     _score_add(outcome)
-    # Alimenta timeline com o(s) observado(s)
     obs = [int(x) for x in final_seen.split("-") if x.isdigit()]
     _append_seq(obs)
     our = suggested if outcome.upper()=="GREEN" else "X"
@@ -176,7 +179,7 @@ def _seen_recent(kind: str, dkey: str) -> bool:
     now = int(time.time())
     con = _con()
     row = con.execute("SELECT ts FROM dedupe WHERE kind=? AND dkey=?", (kind, dkey)).fetchone()
-    if row and now - int(row["ts"]) <= DEDUPE_WINDOW_SEC:
+    if row and now - int(row["ts"]) <= DEDUP_WINDOW_SEC:
         con.close(); return True
     con.execute("INSERT OR REPLACE INTO dedupe(kind, dkey, ts) VALUES (?,?,?)", (kind, dkey, now))
     con.commit(); con.close()
@@ -254,30 +257,40 @@ def _ngram_snapshot(suggested:int)->str:
     return (f"📈 Amostra: {_timeline_size()} • Conf: {conf}\n"
             f"🔎 E1(n-gram proxy): 1 {p1} | 2 {p2} | 3 {p3} | 4 {p4}")
 
-# =============== Regex / Parser ===============
+# =============== Parser (regex flexíveis) ===============
 RX_ENTRADA = re.compile(r"(💰\s*)?ENTRADA.*CONFIRMADA|ENTRADA\s*OK", re.I)
 RX_ANALISE = re.compile(r"\bANALIS(A|Á)NDO\b|ANALISE|🧩", re.I)
-RX_FECHA   = re.compile(r"APOSTA.*ENCERRADA|RESULTADO|GREEN|✅|RED|❌", re.I)
+RX_FECHA   = re.compile(r"APOSTA.*ENCERRADA|RESULTADO|✅|❌|GREEN|RED", re.I)
 
 RX_SEQ     = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
 RX_NUMS    = re.compile(r"[1-4]")
 RX_AFTER   = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
-RX_PAREN_ANY = re.compile(r"\(([^\)]*)\)")
+RX_PAREN   = re.compile(r"\(([^\)]*)\)\s*$")
 
 def _parse_seq_list(text:str)->List[int]:
     m=RX_SEQ.search(text or "");  return [int(x) for x in RX_NUMS.findall(m.group(1))] if m else []
 
+def _parse_seq_pair(text:str, need:int=2)->List[int]:
+    arr=_parse_seq_list(text);  return arr[:need]
+
 def _parse_after(text:str)->Optional[int]:
     m=RX_AFTER.search(text or "");  return int(m.group(1)) if m else None
 
-def _parse_last_paren_num(text:str)->Optional[int]:
-    """
-    Captura o ÚLTIMO número 1–4 entre parênteses na mensagem (caso venha RED(x) e depois GREEN(y)).
-    """
-    nums=[]
-    for m in RX_PAREN_ANY.findall(text or ""):
-        nums += [int(x) for x in RX_NUMS.findall(m)]
-    return nums[-1] if nums else None
+def _parse_paren_pair(text:str, need:int=2)->List[int]:
+    m=RX_PAREN.search(text or "");  nums=[int(x) for x in RX_NUMS.findall(m.group(1))] if m else []
+    return nums[:need]
+
+# >>>>>> NOVO: resultado único em parênteses (G0-only)
+def _parse_result_single(text: str) -> Optional[int]:
+    """Pega o último número 1-4 dentro do último parênteses encontrado na mensagem."""
+    parens = RX_PAREN.findall(text or "")
+    if not parens:
+        return None
+    last = parens[-1]
+    nums = [int(x) for x in RX_NUMS.findall(last)]
+    if not nums:
+        return None
+    return int(nums[-1])
 
 # =============== Rotas ===============
 @app.get("/")
@@ -316,83 +329,32 @@ async def webhook(token: str, request: Request):
     if RX_ANALISE.search(text):
         if _seen_recent("analise", _dedupe_key(text)):
             return {"ok": True, "skipped": "analise_dupe"}
-        # memória: podemos alimentar a timeline com a sequência se vier junto
         seq=_parse_seq_list(text)
         if seq: _append_seq(seq)
         if SHOW_DEBUG: await tg_send(TARGET_CHANNEL, "DEBUG: Análise reconhecida ✅")
         return {"ok": True, "analise_seq": len(seq)}
 
-    # -------- FECHAMENTO --------
+    # -------- FECHAMENTO (G0-only por parênteses) --------
     if RX_FECHA.search(text):
         if _seen_recent("fechamento", _dedupe_key(text)):
             return {"ok": True, "skipped": "fechamento_dupe"}
-
-        # Sempre alimenta memória com sequência e com quaisquer (x) vistos
-        seq_mem = _parse_seq_list(text);   if seq_mem: _append_seq(seq_mem)
-        paren_all = []
-        for m in RX_PAREN_ANY.findall(text or ""):
-            paren_all += [int(x) for x in RX_NUMS.findall(m)]
-        if paren_all: _append_seq(paren_all)
 
         pend=_pending_get()
         if pend:
             suggested=int(pend["suggested"] or 0)
 
-            if MAX_GALE==0:
-                # G0-only: fecha exclusivamente pelo último número entre parênteses
-                last_num = _parse_last_paren_num(text)
-                if last_num is None:
-                    if SHOW_DEBUG: await tg_send(TARGET_CHANNEL, "DEBUG: Fechamento G0 sem número ( ) ainda. Aguardando.")
-                    return {"ok": True, "waiting_g0_paren": True}
-                _pending_seen_set_one(last_num)
-                outcome = "GREEN" if last_num==suggested else "LOSS"
-                final_seen = str(last_num)
-                msg_txt=_pending_close(final_seen, outcome, "G0", suggested)
-                if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
-                return {"ok": True, "closed_g0": outcome, "seen": final_seen}
+            # Apenas 1 observado: o número do último parênteses (ignora "Sequência: a | b")
+            res = _parse_result_single(text)
+            final_seen = str(res) if isinstance(res, int) else "X"
 
-            # Caso MAX_GALE>=1, mantém a lógica antiga
-            # Observados pela linha "Sequência: a | b"
-            # usa dois números, mas o fechamento ainda prioriza parenteses quando houver
-            # (compatível com versões anteriores)
-            # ------ bloco legado (G0/G1) ------
-            # Observados do placar
-            seen_pair = seq_mem[:min(2, MAX_GALE+1)]
-            # Se já veio um número final entre ( ), substitui o primeiro observado:
-            if paren_all:
-                if seen_pair:
-                    seen_pair[0] = paren_all[-1]  # último entre ( )
-                else:
-                    seen_pair = [paren_all[-1]]
-            if seen_pair:
-                # registra como "a-b" na pendência (modo legado)
-                row=_pending_get()
-                if row:
-                    arr = [str(x) for x in seen_pair]
-                    con=_con(); con.execute("UPDATE pending SET seen=? WHERE id=?", ("-".join(arr), int(row["id"]))); con.commit(); con.close()
+            outcome="GREEN" if (isinstance(res,int) and res==suggested) else "LOSS"
+            stage_lbl="G0"  # sempre G0
 
-            pend=_pending_get()
-            seen = [s for s in (pend["seen"] or "").split("-") if s]
+            msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
+            if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
+            return {"ok": True, "closed": outcome, "seen": final_seen, "suggested": suggested}
 
-            if len(seen)==1 and seen[0].isdigit() and int(seen[0]) != suggested and MAX_GALE>=1:
-                if SHOW_DEBUG: await tg_send(TARGET_CHANNEL, f"DEBUG: aguardando G1 (G0={seen[0]}, nosso={suggested})")
-                return {"ok": True, "waiting_g1": True, "seen": "-".join(seen)}
-
-            outcome="LOSS"; stage_lbl="G1"
-            if len(seen)>=1 and seen[0].isdigit() and int(seen[0])==suggested:
-                outcome="GREEN"; stage_lbl="G0"
-            elif len(seen)>=2 and seen[1].isdigit() and int(seen[1])==suggested and MAX_GALE>=1:
-                outcome="GREEN"; stage_lbl="G1"
-
-            close_now = (stage_lbl=="G0") or (len(seen)>=min(2, MAX_GALE+1))
-            if close_now:
-                final_seen="-".join(seen[:min(2, MAX_GALE+1)]) if seen else "X"
-                msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
-                if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
-                return {"ok": True, "closed": outcome, "seen": final_seen}
-            return {"ok": True, "waiting_more_obs": True, "seen": "-".join(seen)}
-
-        if SHOW_DEBUG: await tg_send(TARGET_CHANNEL, "DEBUG: Fechamento reconhecido ✅ — sem pendência aberta.")
+        if SHOW_DEBUG: await tg_send(TARGET_CHANNEL, "DEBUG: Fechamento reconhecido ✅ — sem pendência aberta")
         return {"ok": True, "noted_close": True}
 
     # -------- ENTRADA --------
@@ -405,26 +367,17 @@ async def webhook(token: str, request: Request):
         if seq: _append_seq(seq)
         after = _parse_after(text)
 
-        # fecha pendência esquecida (failsafe)
+        # fecha pendência esquecida (como antes)
         pend=_pending_get()
         if pend:
+            seen=[s for s in (pend["seen"] or "").split("-") if s]
+            if not seen: seen.append("X")
+            final_seen="-".join(seen[:1])
             suggested=int(pend["suggested"] or 0)
-            if MAX_GALE==0:
-                # no G0: fecha como LOSS com X se alguém esqueceu de fechar antes
-                final_seen="X"
-                msg_txt=_pending_close(final_seen, "LOSS", "G0", suggested)
-                if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
-            else:
-                seen=[s for s in (pend["seen"] or "").split("-") if s]
-                while len(seen)<min(2,MAX_GALE+1): seen.append("X")
-                final_seen="-".join(seen[:min(2,MAX_GALE+1)])
-                outcome="LOSS"; stage_lbl="G1"
-                if len(seen)>=1 and seen[0].isdigit() and int(seen[0])==suggested:
-                    outcome="GREEN"; stage_lbl="G0"
-                elif len(seen)>=2 and seen[1].isdigit() and int(seen[1])==suggested and MAX_GALE>=1:
-                    outcome="GREEN"; stage_lbl="G1"
-                msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
-                if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
+            outcome="GREEN" if (seen and seen[0].isdigit() and int(seen[0])==suggested) else "LOSS"
+            stage_lbl="G0"
+            msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
+            if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
 
         analyzing_id = await tg_send_return(TARGET_CHANNEL, "⏳ Analisando padrão, aguarde...")
 
@@ -450,34 +403,3 @@ async def webhook(token: str, request: Request):
     if SHOW_DEBUG:
         await tg_send(TARGET_CHANNEL, "DEBUG: Mensagem não reconhecida como ENTRADA/FECHAMENTO/ANALISANDO.")
     return {"ok": True, "skipped": "unmatched"}
-
-# =============== Telegram helpers ===============
-async def tg_send(chat_id: str, text: str, parse="HTML"):
-    try:
-        async with httpx.AsyncClient(timeout=15) as cli:
-            await cli.post(f"{TELEGRAM_API}/sendMessage",
-                           json={"chat_id": chat_id, "text": text, "parse_mode": parse,
-                                 "disable_web_page_preview": True})
-    except Exception:
-        pass
-
-async def tg_send_return(chat_id: str, text: str, parse="HTML") -> Optional[int]:
-    try:
-        async with httpx.AsyncClient(timeout=15) as cli:
-            r = await cli.post(f"{TELEGRAM_API}/sendMessage",
-                               json={"chat_id": chat_id, "text": text, "parse_mode": parse,
-                                     "disable_web_page_preview": True})
-            data = r.json()
-            if isinstance(data, dict) and data.get("ok") and data.get("result", {}).get("message_id"):
-                return int(data["result"]["message_id"])
-    except Exception:
-        pass
-    return None
-
-async def tg_delete(chat_id: str, message_id: int):
-    try:
-        async with httpx.AsyncClient(timeout=15) as cli:
-            await cli.post(f"{TELEGRAM_API}/deleteMessage",
-                           json={"chat_id": chat_id, "message_id": int(message_id)})
-    except Exception:
-        pass
