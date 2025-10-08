@@ -2,18 +2,17 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v7.2.0-profoundsim  (G0-only; fecha pelo último número entre parênteses + IA Profunda Híbrida)
-- Parser flexível (entrada/analisando/fechamento)
-- Fecha G0 usando apenas o número dentro de parênteses (ex.: GREEN (3) ou RED (4))
-- IA Profunda Híbrida (ProfoundSim) DOMINANTE + especialistas estatísticos como consultoras
-- Calibrador automático de confiança/temperatura e pesos
-- Aprendizado leve por reforço (ema) após cada GREEN/LOSS
+v7.3.0-controller  (G0-only; ProfoundSim + NeuroController)
+- Fecha G0 pelo último número entre parênteses (ex.: GREEN (3)/RED (4))
+- IA Profunda Híbrida (ProfoundSim) DOMINANTE + especialistas estatísticos
+- **Neuro IA Controladora**: calibra e controla risco (epsilon, min_conf, cool-down, regime)
+- Aprendizado leve por reforço (EMA) a cada GREEN/LOSS
 - Anti-trava: timeout de pendência (fecha LOSS G0 X)
-- Endpoints de emergência: /admin/status e /admin/unlock
-- Dedupe por conteúdo e DB SQLite (sem dependências de GPU)
+- Admin: /admin/status, /admin/unlock, /debug_cfg
+- Dedupe + SQLite (CPU-only)
 """
 
-import os, re, time, sqlite3, datetime, hashlib, math, json
+import os, re, time, sqlite3, datetime, hashlib, math, json, random
 from typing import List, Dict, Optional, Tuple
 
 import httpx
@@ -36,7 +35,7 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 DB_PATH = "/opt/render/project/src/main.sqlite"
 
 # ================== APP ==================
-app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.2.0-profoundsim")
+app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.3.0-controller")
 
 # ================== DB ==================
 def _con():
@@ -68,7 +67,9 @@ def db_init():
     cur.execute("""CREATE TABLE IF NOT EXISTS score(
         id INTEGER PRIMARY KEY CHECK(id=1),
         green INTEGER DEFAULT 0,
-        loss  INTEGER DEFAULT 0
+        loss  INTEGER DEFAULT 0,
+        streak_green INTEGER DEFAULT 0,
+        streak_loss  INTEGER DEFAULT 0
     )""")
     cur.execute("""CREATE TABLE IF NOT EXISTS dedupe(
         kind TEXT NOT NULL,
@@ -83,10 +84,22 @@ def db_init():
         bias_json TEXT DEFAULT '{"1":0.0,"2":0.0,"3":0.0,"4":0.0}',
         weight_neural REAL DEFAULT 0.70
     )""")
+    # controlador (meta-IA) – 1 linha
+    cur.execute("""CREATE TABLE IF NOT EXISTS neuroctl(
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        epsilon REAL DEFAULT 0.06,            -- taxa de exploração
+        min_conf REAL DEFAULT 0.58,           -- confiança mínima para operar
+        cool_after_losses INTEGER DEFAULT 2,  -- aplica cool-down após N losses seguidos
+        cool_secs INTEGER DEFAULT 180,        -- duração do cool-down
+        throttle_until INTEGER DEFAULT 0,     -- timestamp até quando pular
+        regime TEXT DEFAULT 'neutral'         -- stable | volatile | neutral
+    )""")
     if not con.execute("SELECT 1 FROM score WHERE id=1").fetchone():
-        con.execute("INSERT INTO score(id,green,loss) VALUES(1,0,0)")
+        con.execute("INSERT INTO score(id,green,loss,streak_green,streak_loss) VALUES(1,0,0,0,0)")
     if not con.execute("SELECT 1 FROM neural WHERE id=1").fetchone():
         con.execute("INSERT INTO neural(id,temp,bias_json,weight_neural) VALUES(1,0.85,'{\"1\":0.0,\"2\":0.0,\"3\":0.0,\"4\":0.0}',0.70)")
+    if not con.execute("SELECT 1 FROM neuroctl WHERE id=1").fetchone():
+        con.execute("INSERT INTO neuroctl(id,epsilon,min_conf,cool_after_losses,cool_secs,throttle_until,regime) VALUES(1,0.06,0.58,2,180,0,'neutral')")
     con.commit(); con.close()
 db_init()
 
@@ -99,6 +112,7 @@ def _mark_processed(upd: str):
     except Exception:
         pass
 
+# ========= timeline util =========
 def _timeline_tail(n:int=400)->List[int]:
     con=_con()
     rows=con.execute("SELECT number FROM timeline ORDER BY id DESC LIMIT ?",(n,)).fetchall()
@@ -116,21 +130,25 @@ def _timeline_size()->int:
     con=_con(); row=con.execute("SELECT COUNT(*) c FROM timeline").fetchone(); con.close()
     return int(row["c"] or 0)
 
+# ========= score/performance =========
 def _score_add(outcome:str):
     con=_con()
-    row=con.execute("SELECT green,loss FROM score WHERE id=1").fetchone()
-    g,l = (int(row["green"]), int(row["loss"])) if row else (0,0)
-    if outcome.upper()=="GREEN": g+=1
-    elif outcome.upper()=="LOSS": l+=1
-    con.execute("INSERT OR REPLACE INTO score(id,green,loss) VALUES(1,?,?)",(g,l))
+    row=con.execute("SELECT green,loss,streak_green,streak_loss FROM score WHERE id=1").fetchone()
+    g,l,sg,sl = (int(row["green"]), int(row["loss"]), int(row["streak_green"]), int(row["streak_loss"])) if row else (0,0,0,0)
+    if outcome.upper()=="GREEN":
+        g+=1; sg+=1; sl=0
+    elif outcome.upper()=="LOSS":
+        l+=1; sl+=1; sg=0
+    con.execute("INSERT OR REPLACE INTO score(id,green,loss,streak_green,streak_loss) VALUES(1,?,?,?,?)",(g,l,sg,sl))
     con.commit(); con.close()
 
 def _score_text()->str:
-    con=_con(); row=con.execute("SELECT green,loss FROM score WHERE id=1").fetchone(); con.close()
+    con = _con(); row = con.execute("SELECT green,loss FROM score WHERE id=1").fetchone(); con.close()
     g,l = (int(row["green"]), int(row["loss"])) if row else (0,0)
     tot=g+l; acc=(g/tot*100.0) if tot>0 else 0.0
     return f"{g} GREEN × {l} LOSS — {acc:.1f}%"
 
+# ========= pending =========
 def _pending_get()->Optional[sqlite3.Row]:
     con=_con(); row=con.execute("SELECT * FROM pending WHERE open=1 ORDER BY id DESC LIMIT 1").fetchone(); con.close()
     return row
@@ -154,7 +172,7 @@ def _pending_close(final_seen: str, outcome: str, stage_lbl: str, suggested:int)
     con=_con()
     con.execute("UPDATE pending SET open=0, seen=? WHERE id=?", (final_seen, int(row["id"])))
     con.commit(); con.close()
-    # feedback de aprendizado para IA profunda
+    # feedback
     _update_neural_feedback(suggested, outcome)
     _score_add(outcome)
     obs=[int(x) for x in final_seen.split("-") if x.isdigit()]
@@ -168,8 +186,7 @@ def _pending_close(final_seen: str, outcome: str, stage_lbl: str, suggested:int)
 # ============== ANTI-TRAVA (timeout) ==============
 def _pending_timeout_check() -> Optional[dict]:
     row = _pending_get()
-    if not row:
-        return None
+    if not row: return None
     opened_at = int(row["opened_at"] or 0)
     now = int(time.time())
     if now - opened_at >= OBS_TIMEOUT_SEC:
@@ -260,7 +277,6 @@ def _save_neural_params(temp:float=None, wneu:float=None, bias:Dict[int,float]=N
     con.commit(); con.close()
 
 def _features_from_tail(tail:List[int])->List[float]:
-    """Extrai ~32 features do histórico (frequências, janelas, transições, streaks)."""
     if not tail: return [0.25,0.25,0.25,0.25] + [0.0]*28
     L = len(tail)
     freq = [tail.count(c)/L for c in (1,2,3,4)]
@@ -268,22 +284,18 @@ def _features_from_tail(tail:List[int])->List[float]:
     for k in (8,13,21,34,55,89,144):
         win = tail[-k:] if L>=k else tail
         wins.extend([win.count(c)/max(1,len(win)) for c in (1,2,3,4)])
-    # matriz de transição 4x4 (normalizada por linha)
     trans = [[0]*4 for _ in range(4)]
-    for a,b in zip(tail[:-1], tail[1:]):
-        trans[a-1][b-1]+=1
+    for a,b in zip(tail[:-1], tail[1:]): trans[a-1][b-1]+=1
     trans_norm=[]
     for i in range(4):
         s=sum(trans[i]) or 1
         trans_norm.extend([trans[i][j]/s for j in range(4)])
-    # streaks recentes de cada número
     streaks=[0,0,0,0]
     cur=tail[-1]; s=0
     for x in reversed(tail):
         if x==cur: s+=1
         else: break
     streaks[cur-1]=s/max(1, min(20,L))
-    # variance/entropy simples
     mean = sum(tail)/L
     var  = sum((x-mean)**2 for x in tail)/L
     ent  = 0.0
@@ -291,29 +303,16 @@ def _features_from_tail(tail:List[int])->List[float]:
         if p>0: ent -= p*math.log(p+1e-12)
     return freq + wins + trans_norm + streaks + [var/3.0, ent/1.4]
 
-def _randu(seed:int)->float:
-    # gerador determinístico [0,1)
-    seed = (seed * 1103515245 + 12345) & 0x7fffffff
-    return (seed % 100000) / 100000.0
-
 def _profoundsim_logits(feat:List[float], seed_base:int)->List[float]:
-    """
-    3 camadas simuladas: input->hidden(512)->output(4) com ativações senoidais/ruído determinístico.
-    Tudo determinístico por seed_base (depende do histórico), sem libs externas.
-    """
     H = 512
-    # hidden
     h = [0.0]*H
     for i in range(H):
         s = 0.0
         for j, f in enumerate(feat):
-            # pesos pseudo-aleatórios determinísticos por (i,j)
             seed = seed_base + i*131 + j*17
             w = math.sin(seed*0.000113) * math.cos(seed*0.000071)
             s += f * w
-        # ativação não-linear
         h[i] = math.tanh(1.2*s + 0.15*math.sin(s*3.0))
-    # output (4 classes)
     logits = [0.0,0.0,0.0,0.0]
     for c in range(4):
         s=0.0
@@ -331,79 +330,165 @@ def _softmax(x:List[float], temp:float)->List[float]:
     return [e/s for e in ex]
 
 def _neural_probs(tail:List[int])->Dict[int,float]:
-    temp, wneu, bias = _load_neural_params()
+    temp, _, bias = _load_neural_params()
     feat = _features_from_tail(tail)
     seed_base = len(tail)*1009 + (sum(tail)%997)
     logits = _profoundsim_logits(feat, seed_base)
-    # aplica bias aprendido por reforço
     for idx,c in enumerate((1,2,3,4)):
         logits[idx] += float(bias.get(c,0.0))
     probs = _softmax(logits, temp)
     return {c: float(probs[c-1]) for c in (1,2,3,4)}
 
 def _calibrate_from_score():
-    # ajusta temperatura e peso neural conforme accuracy
     con=_con()
     row=con.execute("SELECT green,loss FROM score WHERE id=1").fetchone()
     con.close()
     if not row: return
     g,l = int(row["green"]), int(row["loss"])
     tot = g+l
-    if tot < 50:  # só calibra com dados minimamente maduros
-        return
+    if tot < 50: return
     acc = g/max(1,tot)
     temp, wneu, bias = _load_neural_params()
-    # temperatura menor quando acerta mais
     new_temp = max(0.55, min(1.10, 1.00 - 0.35*(acc-0.50)))
-    # peso neural cresce com acurácia
     new_wneu = max(0.55, min(0.85, 0.60 + 0.50*(acc-0.50)))
     _save_neural_params(temp=new_temp, wneu=new_wneu, bias=None)
 
 def _update_neural_feedback(suggested:int, outcome:str):
-    """
-    Reforço simples: viés por classe com EMA (+delta para GREEN, -delta para LOSS).
-    """
     temp, wneu, bias = _load_neural_params()
     delta = 0.10 if outcome.upper()=="GREEN" else -0.07
-    ema   = 0.90  # memória longa
+    ema   = 0.90
     cur = float(bias.get(suggested,0.0))
     new = ema*cur + (1-ema)*delta
     bias[suggested] = new
     _save_neural_params(bias=bias)
     _calibrate_from_score()
 
+# ============== Neuro IA Controladora ==============
+def _ctl_load():
+    con=_con(); row=con.execute("SELECT epsilon,min_conf,cool_after_losses,cool_secs,throttle_until,regime FROM neuroctl WHERE id=1").fetchone(); con.close()
+    if not row:
+        return 0.06, 0.58, 2, 180, 0, "neutral"
+    return float(row["epsilon"]), float(row["min_conf"]), int(row["cool_after_losses"]), int(row["cool_secs"]), int(row["throttle_until"]), str(row["regime"])
+
+def _ctl_save(eps=None, minc=None, coolN=None, coolS=None, thr=None, reg=None):
+    e,mn,cn,cs,th,rg = _ctl_load()
+    if eps is not None: e = float(eps)
+    if minc is not None: mn = float(minc)
+    if coolN is not None: cn = int(coolN)
+    if coolS is not None: cs = int(coolS)
+    if thr is not None: th = int(thr)
+    if reg is not None: rg = str(reg)
+    con=_con()
+    con.execute("""INSERT OR REPLACE INTO neuroctl(id,epsilon,min_conf,cool_after_losses,cool_secs,throttle_until,regime)
+                   VALUES(1,?,?,?,?,?,?)""",(e,mn,cn,cs,th,rg))
+    con.commit(); con.close()
+
+def _ctl_perf():
+    con=_con(); row=con.execute("SELECT green,loss,streak_green,streak_loss FROM score WHERE id=1").fetchone(); con.close()
+    if not row: return 0,0,0,0
+    return int(row["green"]), int(row["loss"]), int(row["streak_green"]), int(row["streak_loss"])
+
+def _ctl_regime_update():
+    """Detecta regime de mercado/roletas simplificado via entropia/var e streaks."""
+    tail=_timeline_tail(200)
+    if len(tail)<50:
+        _ctl_save(reg="neutral"); return "neutral"
+    # entropia
+    freq = [tail.count(c)/len(tail) for c in (1,2,3,4)]
+    ent = 0.0
+    for p in freq:
+        if p>0: ent -= p*math.log(p+1e-12)
+    # variância
+    mean = sum(tail)/len(tail)
+    var  = sum((x-mean)**2 for x in tail)/len(tail)
+    # heurística
+    _,_,_, streak_loss = _ctl_perf()
+    if ent < 1.15 or var > 1.70 or streak_loss>=2:
+        _ctl_save(reg="volatile")
+        return "volatile"
+    if ent > 1.30 and var < 1.40:
+        _ctl_save(reg="stable")
+        return "stable"
+    _ctl_save(reg="neutral"); return "neutral"
+
+def _ctl_decide(best:int, conf:float, mix:Dict[int,float], gap:float)->Tuple[bool,str,int]:
+    """
+    Decide se abre entrada:
+      - verifica throttle (cool-down após losses seguidos)
+      - exige confiança mínima dinâmica
+      - pode explorar 2º melhor (epsilon)
+    Retorna: (play, reason, chosen)
+    """
+    now = int(time.time())
+    eps, minc, coolN, coolS, thr, reg = _ctl_load()
+    g,l,sg,sl = _ctl_perf()
+
+    # cool-down ativo?
+    if now < thr:
+        return False, f"cooldown até {thr} (loss_streak={sl})", -1
+
+    # regime dinâmico altera thresholds
+    regime = _ctl_regime_update()
+    dyn_min = minc
+    if regime=="volatile":
+        dyn_min = min(0.68, max(minc, 0.62))   # pede mais confiança
+    elif regime=="stable":
+        dyn_min = max(0.54, minc-0.02)         # aceita um pouco menos
+
+    # checa confiança mínima
+    if conf < dyn_min:
+        return False, f"conf {conf:.2f} < min {dyn_min:.2f} (regime={regime})", -1
+
+    # epsilon-explore: se gap for muito pequeno, chance de testar 2º
+    second = sorted(mix.items(), key=lambda kv: kv[1], reverse=True)[1][0]
+    if gap < 0.03 and random.random() < eps:
+        return True, f"explore ε={eps:.2f} (gap={gap:.3f})", int(second)
+
+    return True, f"exploit (gap={gap:.3f}, regime={regime})", int(best)
+
+def _ctl_on_feedback(outcome:str):
+    """Ajusta epsilon/min_conf e programa cool-down após feedback."""
+    eps, minc, coolN, coolS, thr, reg = _ctl_load()
+    g,l,sg,sl = _ctl_perf()
+    # adapta epsilon (menos exploração quando vai bem)
+    total=g+l
+    if total>=50:
+        acc = g/max(1,total)
+        new_eps = max(0.01, min(0.12, 0.10 - 0.15*(acc-0.50)))  # ~0.10 em 50%, cai até 0.01
+        eps = 0.9*eps + 0.1*new_eps
+    # min_conf sobe levemente após loss streaks, desce após green streak
+    if sl>=2:
+        minc = min(0.74, minc+0.01)
+    elif sg>=3:
+        minc = max(0.54, minc-0.01)
+    # cool-down: programa throttle quando atinge streak de losses
+    now=int(time.time())
+    if sl>=coolN:
+        thr = now + coolS
+    else:
+        # limpa throttle se não há mais pressão de perda
+        if now > thr: thr = 0
+    _ctl_save(eps=eps, minc=minc, thr=thr)
+
+# ============== Decisão final (neural + especialistas) ==============
 def _neural_decide()->Tuple[int,float,int,Dict[int,float],float,str]:
     tail = _timeline_tail(400)
-    # especialistas
     p1=_post_e1_ngram(tail); p2=_post_e2_short(tail)
     p3=_post_e3_long(tail);  p4=_post_e4_llm(tail)
-    # neural
     pn=_neural_probs(tail)
-    # pesos atuais
-    temp, wneu, _ = _load_neural_params()
+    _, wneu, _ = _load_neural_params()
     rest = 1.0 - wneu
-    w = {
-        "neural": wneu,
-        "e1":     0.40*rest,
-        "e2":     0.30*rest,
-        "e3":     0.20*rest,
-        "e4":     0.10*rest,
-    }
+    w = {"neural": wneu, "e1":0.40*rest, "e2":0.30*rest, "e3":0.20*rest, "e4":0.10*rest}
     mix = {}
     for c in (1,2,3,4):
-        mix[c] = (
-            w["neural"]*pn.get(c,0) +
-            w["e1"]*p1.get(c,0) +
-            w["e2"]*p2.get(c,0) +
-            w["e3"]*p3.get(c,0) +
-            w["e4"]*p4.get(c,0)
-        )
+        mix[c] = w["neural"]*pn.get(c,0) + w["e1"]*p1.get(c,0) + w["e2"]*p2.get(c,0) + w["e3"]*p3.get(c,0) + w["e4"]*p4.get(c,0)
     mix = _conf_floor(_norm(mix), 0.30, 0.95)
     best = max(mix,key=mix.get)
     conf = float(mix[best])
     r = sorted(mix.items(), key=lambda kv: kv[1], reverse=True)
     gap = (r[0][1]-r[1][1]) if len(r)>=2 else r[0][1]
-    reason = f"ProfoundSim(w={wneu:.2f},T={temp:.2f})"
+    temp, wneu_cur, _ = _load_neural_params()
+    reason = f"ProfoundSim(w={wneu_cur:.2f},T={temp:.2f})"
     return best, conf, _timeline_size(), mix, gap, reason
 
 def _ngram_snapshot(suggested:int)->str:
@@ -462,15 +547,10 @@ def _parse_after(text:str)->Optional[int]:
     m=RX_AFTER.search(text or "");  return int(m.group(1)) if m else None
 
 def _parse_paren_last_one(text:str)->Optional[int]:
-    """
-    Retorna o último número 1..4 encontrado ENTRE PARÊNTESES na mensagem.
-    Ex.: '... GREEN (3)' -> 3 ; '... RED ❌ (4)' -> 4 ; se não achar, None.
-    """
     nums=[]
     for m in RX_PAREN.finditer(text or ""):
         nums_in = [int(x) for x in RX_NUMS.findall(m.group(1))]
-        if nums_in:
-            nums.append(nums_in[-1])
+        if nums_in: nums.append(nums_in[-1])
     return nums[-1] if nums else None
 
 # ================== Rotas básicas ==================
@@ -485,8 +565,13 @@ async def health():
 @app.get("/debug_cfg")
 async def debug_cfg():
     temp, wneu, bias = _load_neural_params()
-    return {"MAX_GALE": MAX_GALE, "OBS_TIMEOUT_SEC": OBS_TIMEOUT_SEC, "DEDUP_WINDOW_SEC": DEDUP_WINDOW_SEC,
-            "neural_temp": temp, "neural_weight": wneu, "neural_bias": bias}
+    eps, minc, coolN, coolS, thr, reg = _ctl_load()
+    return {
+        "MAX_GALE": MAX_GALE, "OBS_TIMEOUT_SEC": OBS_TIMEOUT_SEC, "DEDUP_WINDOW_SEC": DEDUPE_WINDOW_SEC,
+        "neural_temp": temp, "neural_weight": wneu, "neural_bias": bias,
+        "ctl_epsilon": eps, "ctl_min_conf": minc, "ctl_cool_after_losses": coolN,
+        "ctl_cool_secs": coolS, "ctl_throttle_until": thr, "ctl_regime": reg
+    }
 
 # ----- Admin helpers -----
 @app.get("/admin/status")
@@ -561,21 +646,23 @@ async def webhook(token: str, request: Request):
         if pend:
             suggested=int(pend["suggested"] or 0)
 
-            # Só usamos o ÚLTIMO número entre parênteses para decidir
             obs = _parse_paren_last_one(text)   # 1..4 ou None
             if obs is not None:
                 _pending_seen_set(str(obs))
 
-            # Decide G0
             seen = (_pending_get()["seen"] or "").strip()
             outcome="LOSS"; stage_lbl="G0"
             if seen.isdigit() and int(seen)==suggested:
                 outcome="GREEN"
 
-            # Fecha imediatamente (G0 only)
             final_seen = seen if seen else "X"
             msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
             if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
+
+            # controlador recebe feedback (ajusta epsilon/min_conf/throttle automaticamente)
+            try: _ctl_on_feedback(outcome)
+            except Exception: pass
+
             return {"ok": True, "closed": outcome, "seen": final_seen}
 
         if SHOW_DEBUG: await tg_send(TARGET_CHANNEL, "DEBUG: Fechamento reconhecido ✅ — sem pendência aberta")
@@ -587,12 +674,11 @@ async def webhook(token: str, request: Request):
             if SHOW_DEBUG: await tg_send(TARGET_CHANNEL, "DEBUG: Entrada duplicada ignorada (conteúdo repetido).")
             return {"ok": True, "skipped": "entrada_dupe"}
 
-        # Alimenta memória a partir da "Sequência", mas isso NÃO decide o fechamento
         seq=_parse_seq_list(text)
         if seq: _append_seq(seq)
         after=_parse_after(text)
 
-        # Fecha pendência esquecida (como X)
+        # fecha pendência esquecida (como X)
         pend=_pending_get()
         if pend:
             suggested=int(pend["suggested"] or 0)
@@ -603,24 +689,36 @@ async def webhook(token: str, request: Request):
                 outcome="GREEN"
             msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
             if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
+            try: _ctl_on_feedback(outcome)
+            except Exception: pass
 
-        # Mensagem de “Analisando...”
         analyzing_id = await tg_send_return(TARGET_CHANNEL, "⏳ Analisando padrão, aguarde...")
 
-        # Sugestão — IA Profunda DOMINANTE
-        best, conf, samples, post, gap, reason = _neural_decide()
-        opened=_pending_open(best)
+        # sugestão (neural+especialistas)
+        best, conf, samples, mix, gap, reason = _neural_decide()
+
+        # controlador decide operar/ajustar
+        play, why, chosen = _ctl_decide(best, conf, mix, gap)
+
+        if not play:
+            if analyzing_id is not None: await tg_delete(TARGET_CHANNEL, analyzing_id)
+            await tg_send(TARGET_CHANNEL, f"⛔ <b>NeuroController:</b> pulando entrada — {why}")
+            return {"ok": True, "skipped_by_controller": True, "why": why}
+
+        suggested = chosen if chosen>0 else best
+        opened=_pending_open(suggested)
         if opened:
             aft_txt = f" após {after}" if after else ""
-            txt=(f"🤖 <b>IA SUGERE</b> — <b>{best}</b>\n"
+            label = "explore" if (chosen>0 and chosen!=best) else "exploit"
+            txt=(f"🤖 <b>IA SUGERE</b> — <b>{suggested}</b>\n"
                  f"🧩 <b>Padrão:</b> GEN{aft_txt}\n"
                  f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples} | <b>gap≈</b>{gap*100:.1f}pp\n"
-                 f"🧠 <b>Modo:</b> {reason}\n"
-                 f"{_ngram_snapshot(best)}")
+                 f"🧠 <b>Modo:</b> {reason} · <i>{label}</i>\n"
+                 f"{_ngram_snapshot(suggested)}")
             await tg_send(TARGET_CHANNEL, txt)
             if analyzing_id is not None: await tg_delete(TARGET_CHANNEL, analyzing_id)
-            if SHOW_DEBUG: await tg_send(TARGET_CHANNEL, "DEBUG: Entrada reconhecida ✅ — sugestão enviada.")
-            return {"ok": True, "entry_opened": True, "best": best, "conf": conf}
+            if SHOW_DEBUG: await tg_send(TARGET_CHANNEL, f"DEBUG: Entrada aberta (controller: {why}).")
+            return {"ok": True, "entry_opened": True, "best": suggested, "conf": conf, "why": why}
         else:
             if analyzing_id is not None: await tg_delete(TARGET_CHANNEL, analyzing_id)
             if SHOW_DEBUG: await tg_send(TARGET_CHANNEL, "DEBUG: pending já aberto; entrada ignorada.")
