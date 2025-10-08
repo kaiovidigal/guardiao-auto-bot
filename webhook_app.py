@@ -2,17 +2,18 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v7.1.1-g0paren-neural  (G0-only; fecha pelo último número entre parênteses + IA Neural Dominante)
+v7.2.0-profoundsim  (G0-only; fecha pelo último número entre parênteses + IA Profunda Híbrida)
 - Parser flexível (entrada/analisando/fechamento)
 - Fecha G0 usando apenas o número dentro de parênteses (ex.: GREEN (3) ou RED (4))
-- IA Neural Dominante (hierárquica) combinando histórico + especialistas
-- Calibrador automático de pesos conforme desempenho
+- IA Profunda Híbrida (ProfoundSim) DOMINANTE + especialistas estatísticos como consultoras
+- Calibrador automático de confiança/temperatura e pesos
+- Aprendizado leve por reforço (ema) após cada GREEN/LOSS
 - Anti-trava: timeout de pendência (fecha LOSS G0 X)
 - Endpoints de emergência: /admin/status e /admin/unlock
-- Dedupe por conteúdo e DB SQLite
+- Dedupe por conteúdo e DB SQLite (sem dependências de GPU)
 """
 
-import os, re, time, sqlite3, datetime, hashlib, math
+import os, re, time, sqlite3, datetime, hashlib, math, json
 from typing import List, Dict, Optional, Tuple
 
 import httpx
@@ -35,7 +36,7 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 DB_PATH = "/opt/render/project/src/main.sqlite"
 
 # ================== APP ==================
-app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.1.1-g0paren-neural")
+app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.2.0-profoundsim")
 
 # ================== DB ==================
 def _con():
@@ -75,8 +76,17 @@ def db_init():
         ts   INTEGER NOT NULL,
         PRIMARY KEY (kind, dkey)
     )""")
+    # parâmetros da IA ProfoundSim (persistentes, 1 linha)
+    cur.execute("""CREATE TABLE IF NOT EXISTS neural(
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        temp REAL DEFAULT 0.85,
+        bias_json TEXT DEFAULT '{"1":0.0,"2":0.0,"3":0.0,"4":0.0}',
+        weight_neural REAL DEFAULT 0.70
+    )""")
     if not con.execute("SELECT 1 FROM score WHERE id=1").fetchone():
         con.execute("INSERT INTO score(id,green,loss) VALUES(1,0,0)")
+    if not con.execute("SELECT 1 FROM neural WHERE id=1").fetchone():
+        con.execute("INSERT INTO neural(id,temp,bias_json,weight_neural) VALUES(1,0.85,'{\"1\":0.0,\"2\":0.0,\"3\":0.0,\"4\":0.0}',0.70)")
     con.commit(); con.close()
 db_init()
 
@@ -144,6 +154,8 @@ def _pending_close(final_seen: str, outcome: str, stage_lbl: str, suggested:int)
     con=_con()
     con.execute("UPDATE pending SET open=0, seen=? WHERE id=?", (final_seen, int(row["id"])))
     con.commit(); con.close()
+    # feedback de aprendizado para IA profunda
+    _update_neural_feedback(suggested, outcome)
     _score_add(outcome)
     obs=[int(x) for x in final_seen.split("-") if x.isdigit()]
     _append_seq(obs)
@@ -184,7 +196,7 @@ def _seen_recent(kind: str, dkey: str) -> bool:
     con.commit(); con.close()
     return False
 
-# ============== IA compacta (4 especialistas + ajustes) ==============
+# ============== Especialistas (estatística) ==============
 def _norm(d: Dict[int,float])->Dict[int,float]:
     s=sum(d.values()) or 1e-9
     return {k:v/s for k,v in d.items()}
@@ -206,17 +218,6 @@ def _post_e2_short(tail):  return _post_freq(tail, 60)
 def _post_e3_long(tail):   return _post_freq(tail, 300)
 def _post_e4_llm(tail):    return {1:0.25,2:0.25,3:0.25,4:0.25}
 
-def _hedge(p1,p2,p3,p4, w=(0.40,0.25,0.25,0.10)):
-    cands=(1,2,3,4)
-    return _norm({c: w[0]*p1.get(c,0)+w[1]*p2.get(c,0)+w[2]*p3.get(c,0)+w[3]*p4.get(c,0) for c in cands})
-
-def _runnerup_ls2(post:Dict[int,float], loss_streak:int)->Tuple[int,Dict[int,float],str]:
-    rank=sorted(post.items(), key=lambda kv: kv[1], reverse=True)
-    best=rank[0][0]
-    if loss_streak>=2 and len(rank)>=2 and (rank[0][1]-rank[1][1])<0.05:
-        return rank[1][0], post, "IA_runnerup_ls2"
-    return best, post, "IA"
-
 def _conf_floor(post:Dict[int,float], floor=0.30, cap=0.95):
     post=_norm({c:float(post.get(c,0)) for c in (1,2,3,4)})
     b=max(post,key=post.get); mx=post[b]
@@ -235,18 +236,175 @@ def _conf_floor(post:Dict[int,float], floor=0.30, cap=0.95):
             if c!=b: post[c]+=add
     return _norm(post)
 
-def _get_ls()->int: return 0
+# ============== IA Profunda Híbrida (ProfoundSim) ==============
+def _load_neural_params():
+    con=_con(); row=con.execute("SELECT temp,bias_json,weight_neural FROM neural WHERE id=1").fetchone(); con.close()
+    temp = float(row["temp"] if row else 0.85)
+    wneu = float(row["weight_neural"] if row else 0.70)
+    try:
+        bias = json.loads(row["bias_json"]) if row and row["bias_json"] else {"1":0.0,"2":0.0,"3":0.0,"4":0.0}
+    except Exception:
+        bias = {"1":0.0,"2":0.0,"3":0.0,"4":0.0}
+    return temp, wneu, {int(k):float(v) for k,v in bias.items()}
 
-def _choose_number()->Tuple[int,float,int,Dict[int,float],float,str]:
-    tail=_timeline_tail(400)
-    p1=_post_e1_ngram(tail); p2=_post_e2_short(tail); p3=_post_e3_long(tail); p4=_post_e4_llm(tail)
-    base=_hedge(p1,p2,p3,p4)
-    best, post, reason=_runnerup_ls2(base, loss_streak=_get_ls())
-    post=_conf_floor(post, 0.30, 0.95)
-    best=max(post,key=post.get); conf=float(post[best])
-    r=sorted(post.items(), key=lambda kv: kv[1], reverse=True)
-    gap=(r[0][1]-r[1][1]) if len(r)>=2 else r[0][1]
-    return best, conf, _timeline_size(), post, gap, reason
+def _save_neural_params(temp:float=None, wneu:float=None, bias:Dict[int,float]=None):
+    con=_con(); row=con.execute("SELECT temp,bias_json,weight_neural FROM neural WHERE id=1").fetchone()
+    cur_temp = float(row["temp"] if row else 0.85)
+    cur_w    = float(row["weight_neural"] if row else 0.70)
+    cur_bias = json.loads(row["bias_json"]) if row and row["bias_json"] else {"1":0.0,"2":0.0,"3":0.0,"4":0.0}
+    if temp is not None: cur_temp = float(temp)
+    if wneu is not None: cur_w    = float(wneu)
+    if bias is not None: cur_bias = {str(k):float(v) for k,v in bias.items()}
+    con.execute("INSERT OR REPLACE INTO neural(id,temp,bias_json,weight_neural) VALUES(1,?,?,?)",
+                (cur_temp, json.dumps(cur_bias), cur_w))
+    con.commit(); con.close()
+
+def _features_from_tail(tail:List[int])->List[float]:
+    """Extrai ~32 features do histórico (frequências, janelas, transições, streaks)."""
+    if not tail: return [0.25,0.25,0.25,0.25] + [0.0]*28
+    L = len(tail)
+    freq = [tail.count(c)/L for c in (1,2,3,4)]
+    wins = []
+    for k in (8,13,21,34,55,89,144):
+        win = tail[-k:] if L>=k else tail
+        wins.extend([win.count(c)/max(1,len(win)) for c in (1,2,3,4)])
+    # matriz de transição 4x4 (normalizada por linha)
+    trans = [[0]*4 for _ in range(4)]
+    for a,b in zip(tail[:-1], tail[1:]):
+        trans[a-1][b-1]+=1
+    trans_norm=[]
+    for i in range(4):
+        s=sum(trans[i]) or 1
+        trans_norm.extend([trans[i][j]/s for j in range(4)])
+    # streaks recentes de cada número
+    streaks=[0,0,0,0]
+    cur=tail[-1]; s=0
+    for x in reversed(tail):
+        if x==cur: s+=1
+        else: break
+    streaks[cur-1]=s/max(1, min(20,L))
+    # variance/entropy simples
+    mean = sum(tail)/L
+    var  = sum((x-mean)**2 for x in tail)/L
+    ent  = 0.0
+    for p in freq:
+        if p>0: ent -= p*math.log(p+1e-12)
+    return freq + wins + trans_norm + streaks + [var/3.0, ent/1.4]
+
+def _randu(seed:int)->float:
+    # gerador determinístico [0,1)
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff
+    return (seed % 100000) / 100000.0
+
+def _profoundsim_logits(feat:List[float], seed_base:int)->List[float]:
+    """
+    3 camadas simuladas: input->hidden(512)->output(4) com ativações senoidais/ruído determinístico.
+    Tudo determinístico por seed_base (depende do histórico), sem libs externas.
+    """
+    H = 512
+    # hidden
+    h = [0.0]*H
+    for i in range(H):
+        s = 0.0
+        for j, f in enumerate(feat):
+            # pesos pseudo-aleatórios determinísticos por (i,j)
+            seed = seed_base + i*131 + j*17
+            w = math.sin(seed*0.000113) * math.cos(seed*0.000071)
+            s += f * w
+        # ativação não-linear
+        h[i] = math.tanh(1.2*s + 0.15*math.sin(s*3.0))
+    # output (4 classes)
+    logits = [0.0,0.0,0.0,0.0]
+    for c in range(4):
+        s=0.0
+        for i, val in enumerate(h):
+            seed = seed_base + (c+1)*997 + i*29
+            w = math.sin(seed*0.000091) * math.cos(seed*0.000067)
+            s += val * w
+        logits[c] = s
+    return logits
+
+def _softmax(x:List[float], temp:float)->List[float]:
+    m = max(x)
+    ex = [math.exp((xi-m)/max(0.15, temp)) for xi in x]
+    s = sum(ex) or 1e-9
+    return [e/s for e in ex]
+
+def _neural_probs(tail:List[int])->Dict[int,float]:
+    temp, wneu, bias = _load_neural_params()
+    feat = _features_from_tail(tail)
+    seed_base = len(tail)*1009 + (sum(tail)%997)
+    logits = _profoundsim_logits(feat, seed_base)
+    # aplica bias aprendido por reforço
+    for idx,c in enumerate((1,2,3,4)):
+        logits[idx] += float(bias.get(c,0.0))
+    probs = _softmax(logits, temp)
+    return {c: float(probs[c-1]) for c in (1,2,3,4)}
+
+def _calibrate_from_score():
+    # ajusta temperatura e peso neural conforme accuracy
+    con=_con()
+    row=con.execute("SELECT green,loss FROM score WHERE id=1").fetchone()
+    con.close()
+    if not row: return
+    g,l = int(row["green"]), int(row["loss"])
+    tot = g+l
+    if tot < 50:  # só calibra com dados minimamente maduros
+        return
+    acc = g/max(1,tot)
+    temp, wneu, bias = _load_neural_params()
+    # temperatura menor quando acerta mais
+    new_temp = max(0.55, min(1.10, 1.00 - 0.35*(acc-0.50)))
+    # peso neural cresce com acurácia
+    new_wneu = max(0.55, min(0.85, 0.60 + 0.50*(acc-0.50)))
+    _save_neural_params(temp=new_temp, wneu=new_wneu, bias=None)
+
+def _update_neural_feedback(suggested:int, outcome:str):
+    """
+    Reforço simples: viés por classe com EMA (+delta para GREEN, -delta para LOSS).
+    """
+    temp, wneu, bias = _load_neural_params()
+    delta = 0.10 if outcome.upper()=="GREEN" else -0.07
+    ema   = 0.90  # memória longa
+    cur = float(bias.get(suggested,0.0))
+    new = ema*cur + (1-ema)*delta
+    bias[suggested] = new
+    _save_neural_params(bias=bias)
+    _calibrate_from_score()
+
+def _neural_decide()->Tuple[int,float,int,Dict[int,float],float,str]:
+    tail = _timeline_tail(400)
+    # especialistas
+    p1=_post_e1_ngram(tail); p2=_post_e2_short(tail)
+    p3=_post_e3_long(tail);  p4=_post_e4_llm(tail)
+    # neural
+    pn=_neural_probs(tail)
+    # pesos atuais
+    temp, wneu, _ = _load_neural_params()
+    rest = 1.0 - wneu
+    w = {
+        "neural": wneu,
+        "e1":     0.40*rest,
+        "e2":     0.30*rest,
+        "e3":     0.20*rest,
+        "e4":     0.10*rest,
+    }
+    mix = {}
+    for c in (1,2,3,4):
+        mix[c] = (
+            w["neural"]*pn.get(c,0) +
+            w["e1"]*p1.get(c,0) +
+            w["e2"]*p2.get(c,0) +
+            w["e3"]*p3.get(c,0) +
+            w["e4"]*p4.get(c,0)
+        )
+    mix = _conf_floor(_norm(mix), 0.30, 0.95)
+    best = max(mix,key=mix.get)
+    conf = float(mix[best])
+    r = sorted(mix.items(), key=lambda kv: kv[1], reverse=True)
+    gap = (r[0][1]-r[1][1]) if len(r)>=2 else r[0][1]
+    reason = f"ProfoundSim(w={wneu:.2f},T={temp:.2f})"
+    return best, conf, _timeline_size(), mix, gap, reason
 
 def _ngram_snapshot(suggested:int)->str:
     tail=_timeline_tail(400); post=_post_e1_ngram(tail)
@@ -255,88 +413,6 @@ def _ngram_snapshot(suggested:int)->str:
     conf=pct(post.get(int(suggested),0.0))
     return (f"📈 Amostra: {_timeline_size()} • Conf: {conf}\n"
             f"🔎 E1(n-gram proxy): 1 {p1} | 2 {p2} | 3 {p3} | 4 {p4}")
-
-# ============== IA NEURAL DOMINANTE (hierárquica) ==============
-NEURAL_WEIGHTS = {
-    "neural": 0.70,
-    "e1": 0.10,
-    "e2": 0.08,
-    "e3": 0.08,
-    "e4": 0.04
-}
-NEURAL_TEMP = 0.85   # temperatura base (mantida para futuras expansões)
-
-def _calibrate_weights(green:int, loss:int):
-    """Ajusta o peso da neural conforme desempenho cumulativo."""
-    total = green + loss
-    if total < 50:
-        return  # dados ainda imaturos
-    acc = green / total
-    if acc < 0.55:
-        NEURAL_WEIGHTS["neural"] = 0.55
-    elif acc > 0.85:
-        NEURAL_WEIGHTS["neural"] = 0.78
-    else:
-        # variação linear 0.65..0.78 dentro de 55%..85%
-        NEURAL_WEIGHTS["neural"] = 0.65 + 0.13 * (acc - 0.55) / 0.30
-
-def _neural_context(tail:List[int])->Dict[int,float]:
-    """
-    Rede neural simplificada offline: 40 micro-funções de probabilidade
-    em cima do histórico (timeline). Quanto mais dados, melhor.
-    """
-    if len(tail) < 20:
-        return {c:0.25 for c in (1,2,3,4)}
-    freq = {c:tail.count(c)/len(tail) for c in (1,2,3,4)}
-    probs = {c:0.0 for c in (1,2,3,4)}
-    # 40 'neurônios' artesanais: senos/combinações de janelas
-    for c in (1,2,3,4):
-        acc = 0.0
-        for k in range(1,41):
-            # janela dinâmica
-            wsize = max(5, min(len(tail), int(10 + 7*k)))
-            win = tail[-wsize:]
-            rep = win.count(c) / max(1,len(win))
-            # mistura de senos/cos com fase dependente de c e k
-            s = abs(math.sin(len(win)/ (k+0.7) + 0.4*c))
-            t = abs(math.cos(sum(win[-min(12,len(win)):])/(k+1.3) + 0.8*c))
-            # peso decrescente por k e reforço de repetição recente
-            weight = (1.0/(k**1.05)) * (0.5 + 0.5*rep)
-            acc += (0.6*s + 0.4*t) * weight * max(0.15, freq[c])
-        probs[c] = acc
-    return _norm(probs)
-
-def _neural_decide()->Tuple[int,float,int,Dict[int,float],float,str]:
-    """Combina IA Neural + especialistas (hierarquia)."""
-    tail = _timeline_tail(400)
-    p1=_post_e1_ngram(tail); p2=_post_e2_short(tail)
-    p3=_post_e3_long(tail);  p4=_post_e4_llm(tail)
-    pn=_neural_context(tail)
-
-    mix = {}
-    for c in (1,2,3,4):
-        mix[c] = (
-            NEURAL_WEIGHTS["neural"]*pn.get(c,0) +
-            NEURAL_WEIGHTS["e1"]*p1.get(c,0) +
-            NEURAL_WEIGHTS["e2"]*p2.get(c,0) +
-            NEURAL_WEIGHTS["e3"]*p3.get(c,0) +
-            NEURAL_WEIGHTS["e4"]*p4.get(c,0)
-        )
-    mix = _conf_floor(_norm(mix), 0.30, 0.95)
-    best = max(mix,key=mix.get)
-    conf = float(mix[best])
-    r = sorted(mix.items(), key=lambda kv: kv[1], reverse=True)
-    gap = (r[0][1]-r[1][1]) if len(r)>=2 else r[0][1]
-    reason = "IA_Neural_Dominante"
-
-    # calibração automática por desempenho cumulativo
-    con=_con()
-    row=con.execute("SELECT green,loss FROM score WHERE id=1").fetchone()
-    con.close()
-    if row:
-        _calibrate_weights(int(row["green"]), int(row["loss"]))
-
-    return best, conf, _timeline_size(), mix, gap, reason
 
 # ================== Telegram ==================
 async def tg_send(chat_id: str, text: str, parse="HTML"):
@@ -394,7 +470,7 @@ def _parse_paren_last_one(text:str)->Optional[int]:
     for m in RX_PAREN.finditer(text or ""):
         nums_in = [int(x) for x in RX_NUMS.findall(m.group(1))]
         if nums_in:
-            nums.append(nums_in[-1])  # pega o último de cada parênteses
+            nums.append(nums_in[-1])
     return nums[-1] if nums else None
 
 # ================== Rotas básicas ==================
@@ -408,7 +484,9 @@ async def health():
 
 @app.get("/debug_cfg")
 async def debug_cfg():
-    return {"MAX_GALE": MAX_GALE, "OBS_TIMEOUT_SEC": OBS_TIMEOUT_SEC, "DEDUP_WINDOW_SEC": DEDUP_WINDOW_SEC}
+    temp, wneu, bias = _load_neural_params()
+    return {"MAX_GALE": MAX_GALE, "OBS_TIMEOUT_SEC": OBS_TIMEOUT_SEC, "DEDUP_WINDOW_SEC": DEDUP_WINDOW_SEC,
+            "neural_temp": temp, "neural_weight": wneu, "neural_bias": bias}
 
 # ----- Admin helpers -----
 @app.get("/admin/status")
@@ -529,7 +607,7 @@ async def webhook(token: str, request: Request):
         # Mensagem de “Analisando...”
         analyzing_id = await tg_send_return(TARGET_CHANNEL, "⏳ Analisando padrão, aguarde...")
 
-        # Sugestão — usa IA Neural Dominante
+        # Sugestão — IA Profunda DOMINANTE
         best, conf, samples, post, gap, reason = _neural_decide()
         opened=_pending_open(best)
         if opened:
