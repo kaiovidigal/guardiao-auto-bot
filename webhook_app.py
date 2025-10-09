@@ -573,6 +573,49 @@ async def debug_cfg():
         "ctl_cool_secs": coolS, "ctl_throttle_until": thr, "ctl_regime": reg
     }
 
+# ====== MÉTRICAS RÁPIDAS ======
+@app.get("/timeline_size")
+async def timeline_size():
+    """Quantidade total de rodadas registradas na timeline."""
+    try:
+        return {"timeline_size": _timeline_size()}
+    except Exception as e:
+        return {"timeline_size": 0, "error": str(e)}
+
+@app.get("/stats")
+async def stats():
+    """Resumo de performance atual (GREEN, LOSS, acurácia e streaks)."""
+    try:
+        con = _con()
+        row = con.execute(
+            "SELECT green,loss,streak_green,streak_loss FROM score WHERE id=1"
+        ).fetchone()
+        con.close()
+        if not row:
+            return {
+                "green": 0,
+                "loss": 0,
+                "acc": 0.0,
+                "streak_green": 0,
+                "streak_loss": 0
+            }
+        g = int(row["green"] or 0)
+        l = int(row["loss"] or 0)
+        sg = int(row["streak_green"] or 0)
+        sl = int(row["streak_loss"] or 0)
+        tot = g + l
+        acc = (g / tot) if tot > 0 else 0.0
+        return {
+            "green": g,
+            "loss": l,
+            "acc": round(acc * 100, 2),
+            "streak_green": sg,
+            "streak_loss": sl,
+            "timeline_size": _timeline_size()
+        }
+    except Exception as e:
+        return {"error": str(e)}
+        
 # ----- Admin helpers -----
 @app.get("/admin/status")
 async def admin_status():
