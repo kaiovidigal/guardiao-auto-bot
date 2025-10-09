@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v7.4.0-fibo-pro+  (G0-only; ProfoundSim + NeuroController + Fibonacci reforçado)
+v7.3.1-controller (G0-only; ProfoundSim + NeuroController + /admin/tune)
 - Fecha G0 pelo último número entre parênteses (ex.: GREEN (3)/RED (4))
 - IA Profunda Híbrida (ProfoundSim) DOMINANTE + especialistas estatísticos
-- Especialista Fibonacci reforçado (8,21,55 com peso alto) + janelas profundas 233/377 na neural
-- Neuro IA Controladora: calibra risco (epsilon, min_conf, cool-down, regime)
+- Neuro IA Controladora: calibra e controla risco (epsilon, min_conf, cool-down, regime)
+- Endpoint /admin/tune para ajustar parâmetros on-line (presets + manual)
 - Aprendizado leve por reforço (EMA) a cada GREEN/LOSS
 - Anti-trava: timeout de pendência (fecha LOSS G0 X)
 - Admin: /admin/status, /admin/unlock, /debug_cfg
@@ -36,7 +36,7 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 DB_PATH = "/opt/render/project/src/main.sqlite"
 
 # ================== APP ==================
-app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.4.0-fibo-pro+")
+app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.3.1-controller")
 
 # ================== DB ==================
 def _con():
@@ -78,14 +78,14 @@ def db_init():
         ts   INTEGER NOT NULL,
         PRIMARY KEY (kind, dkey)
     )""")
-    # parâmetros ProfoundSim
+    # parâmetros da IA ProfoundSim (persistentes, 1 linha)
     cur.execute("""CREATE TABLE IF NOT EXISTS neural(
         id INTEGER PRIMARY KEY CHECK(id=1),
         temp REAL DEFAULT 0.85,
         bias_json TEXT DEFAULT '{"1":0.0,"2":0.0,"3":0.0,"4":0.0}',
-        weight_neural REAL DEFAULT 0.72
+        weight_neural REAL DEFAULT 0.70
     )""")
-    # controlador
+    # controlador (meta-IA) – 1 linha
     cur.execute("""CREATE TABLE IF NOT EXISTS neuroctl(
         id INTEGER PRIMARY KEY CHECK(id=1),
         epsilon REAL DEFAULT 0.06,
@@ -98,7 +98,7 @@ def db_init():
     if not con.execute("SELECT 1 FROM score WHERE id=1").fetchone():
         con.execute("INSERT INTO score(id,green,loss,streak_green,streak_loss) VALUES(1,0,0,0,0)")
     if not con.execute("SELECT 1 FROM neural WHERE id=1").fetchone():
-        con.execute("INSERT INTO neural(id,temp,bias_json,weight_neural) VALUES(1,0.85,'{\"1\":0.0,\"2\":0.0,\"3\":0.0,\"4\":0.0}',0.72)")
+        con.execute("INSERT INTO neural(id,temp,bias_json,weight_neural) VALUES(1,0.85,'{\"1\":0.0,\"2\":0.0,\"3\":0.0,\"4\":0.0}',0.70)")
     if not con.execute("SELECT 1 FROM neuroctl WHERE id=1").fetchone():
         con.execute("INSERT INTO neuroctl(id,epsilon,min_conf,cool_after_losses,cool_secs,throttle_until,regime) VALUES(1,0.06,0.58,2,180,0,'neutral')")
     con.commit(); con.close()
@@ -225,17 +225,11 @@ def _post_freq(tail:List[int], k:int)->Dict[int,float]:
     tot=max(1,len(win))
     return _norm({c:win.count(c)/tot for c in (1,2,3,4)})
 
-# >>>>>>>>>>>>>> FIBONACCI REFORÇADO (E1 PRO+) <<<<<<<<<<<<<<
-def _e_fibo(tail:List[int])->Dict[int,float]:
-    """
-    Especialista principal: reforça janelas Fibonacci, priorizando 55 (mais forte).
-    Pesos: 8=0.20, 21=0.30, 55=0.50
-    """
+def _post_e1_ngram(tail:List[int])->Dict[int,float]:
     mix={c:0.0 for c in (1,2,3,4)}
-    for k,w in ((8,0.20),(21,0.30),(55,0.50)):
+    for k,w in ((8,0.25),(21,0.35),(55,0.40)):
         pk=_post_freq(tail,k)
-        for c in (1,2,3,4): 
-            mix[c]+=w*pk[c]
+        for c in (1,2,3,4): mix[c]+=w*pk[c]
     return _norm(mix)
 
 def _post_e2_short(tail):  return _post_freq(tail, 60)
@@ -264,7 +258,7 @@ def _conf_floor(post:Dict[int,float], floor=0.30, cap=0.95):
 def _load_neural_params():
     con=_con(); row=con.execute("SELECT temp,bias_json,weight_neural FROM neural WHERE id=1").fetchone(); con.close()
     temp = float(row["temp"] if row else 0.85)
-    wneu = float(row["weight_neural"] if row else 0.72)
+    wneu = float(row["weight_neural"] if row else 0.70)
     try:
         bias = json.loads(row["bias_json"]) if row and row["bias_json"] else {"1":0.0,"2":0.0,"3":0.0,"4":0.0}
     except Exception:
@@ -274,7 +268,7 @@ def _load_neural_params():
 def _save_neural_params(temp:float=None, wneu:float=None, bias:Dict[int,float]=None):
     con=_con(); row=con.execute("SELECT temp,bias_json,weight_neural FROM neural WHERE id=1").fetchone()
     cur_temp = float(row["temp"] if row else 0.85)
-    cur_w    = float(row["weight_neural"] if row else 0.72)
+    cur_w    = float(row["weight_neural"] if row else 0.70)
     cur_bias = json.loads(row["bias_json"]) if row and row["bias_json"] else {"1":0.0,"2":0.0,"3":0.0,"4":0.0}
     if temp is not None: cur_temp = float(temp)
     if wneu is not None: cur_w    = float(wneu)
@@ -284,14 +278,11 @@ def _save_neural_params(temp:float=None, wneu:float=None, bias:Dict[int,float]=N
     con.commit(); con.close()
 
 def _features_from_tail(tail:List[int])->List[float]:
-    """
-    ~32+ features; agora com janelas Fibonacci profundas 233 e 377.
-    """
     if not tail: return [0.25,0.25,0.25,0.25] + [0.0]*28
     L = len(tail)
     freq = [tail.count(c)/L for c in (1,2,3,4)]
     wins = []
-    for k in (8,13,21,34,55,89,144,233,377):  # <<< adição pro+
+    for k in (8,13,21,34,55,89,144):
         win = tail[-k:] if L>=k else tail
         wins.extend([win.count(c)/max(1,len(win)) for c in (1,2,3,4)])
     trans = [[0]*4 for _ in range(4)]
@@ -360,7 +351,7 @@ def _calibrate_from_score():
     acc = g/max(1,tot)
     temp, wneu, bias = _load_neural_params()
     new_temp = max(0.55, min(1.10, 1.00 - 0.35*(acc-0.50)))
-    new_wneu = max(0.58, min(0.88, 0.62 + 0.52*(acc-0.50)))  # ligeiro buff no peso neural
+    new_wneu = max(0.55, min(0.85, 0.60 + 0.50*(acc-0.50)))
     _save_neural_params(temp=new_temp, wneu=new_wneu, bias=None)
 
 def _update_neural_feedback(suggested:int, outcome:str):
@@ -410,11 +401,9 @@ def _ctl_regime_update():
     var  = sum((x-mean)**2 for x in tail)/len(tail)
     _,_,_, streak_loss = _ctl_perf()
     if ent < 1.15 or var > 1.70 or streak_loss>=2:
-        _ctl_save(reg="volatile")
-        return "volatile"
+        _ctl_save(reg="volatile"); return "volatile"
     if ent > 1.30 and var < 1.40:
-        _ctl_save(reg="stable")
-        return "stable"
+        _ctl_save(reg="stable"); return "stable"
     _ctl_save(reg="neutral"); return "neutral"
 
 def _ctl_decide(best:int, conf:float, mix:Dict[int,float], gap:float)->Tuple[bool,str,int]:
@@ -463,17 +452,12 @@ def _ctl_on_feedback(outcome:str):
 # ============== Decisão final (neural + especialistas) ==============
 def _neural_decide()->Tuple[int,float,int,Dict[int,float],float,str]:
     tail = _timeline_tail(400)
-    p1=_e_fibo(tail)          # << usa Fibonacci PRO+ como especialista 1
-    p2=_post_e2_short(tail)
-    p3=_post_e3_long(tail)
-    p4=_post_e4_llm(tail)
+    p1=_post_e1_ngram(tail); p2=_post_e2_short(tail)
+    p3=_post_e3_long(tail);  p4=_post_e4_llm(tail)
     pn=_neural_probs(tail)
-
     _, wneu, _ = _load_neural_params()
     rest = 1.0 - wneu
-    # dá ênfase maior ao E1 (Fibo) dentro da fatia não-neural
-    w = {"neural": wneu, "e1":0.55*rest, "e2":0.25*rest, "e3":0.15*rest, "e4":0.05*rest}
-
+    w = {"neural": wneu, "e1":0.40*rest, "e2":0.30*rest, "e3":0.20*rest, "e4":0.10*rest}
     mix = {}
     for c in (1,2,3,4):
         mix[c] = w["neural"]*pn.get(c,0) + w["e1"]*p1.get(c,0) + w["e2"]*p2.get(c,0) + w["e3"]*p3.get(c,0) + w["e4"]*p4.get(c,0)
@@ -483,16 +467,16 @@ def _neural_decide()->Tuple[int,float,int,Dict[int,float],float,str]:
     r = sorted(mix.items(), key=lambda kv: kv[1], reverse=True)
     gap = (r[0][1]-r[1][1]) if len(r)>=2 else r[0][1]
     temp, wneu_cur, _ = _load_neural_params()
-    reason = f"ProfoundSim-FiboPro(w={wneu_cur:.2f},T={temp:.2f})"
+    reason = f"ProfoundSim(w={wneu_cur:.2f},T={temp:.2f})"
     return best, conf, _timeline_size(), mix, gap, reason
 
 def _ngram_snapshot(suggested:int)->str:
-    tail=_timeline_tail(400); post=_e_fibo(tail)
+    tail=_timeline_tail(400); post=_post_e1_ngram(tail)
     pct=lambda x:f"{x*100:.1f}%"
     p1,p2,p3,p4=pct(post[1]), pct(post[2]), pct(post[3]), pct(post[4])
     conf=pct(post.get(int(suggested),0.0))
     return (f"📈 Amostra: {_timeline_size()} • Conf: {conf}\n"
-            f"🔎 E1(FiboPro): 1 {p1} | 2 {p2} | 3 {p3} | 4 {p4}")
+            f"🔎 E1(n-gram proxy): 1 {p1} | 2 {p2} | 3 {p3} | 4 {p4}")
 
 # ================== Telegram ==================
 async def tg_send(chat_id: str, text: str, parse="HTML"):
@@ -592,6 +576,40 @@ async def admin_unlock():
     msg_txt = _pending_close("X", "LOSS", "G0", suggested)
     return {"ok": True, "forced_close": True, "message": msg_txt}
 
+# ----- Admin tune (NOVO) -----
+@app.get("/admin/tune")
+async def admin_tune(profile: str = None,
+                     eps: float = None,
+                     minc: float = None,
+                     coolN: int = None,
+                     coolS: int = None):
+    """
+    Ajusta NeuroController on-line.
+    Exemplos:
+      /admin/tune?profile=g0_60
+      /admin/tune?profile=aggressive
+      /admin/tune?profile=conservative
+      /admin/tune?eps=0.04&minc=0.60&coolN=3&coolS=120
+    """
+    if profile:
+        p = profile.strip().lower()
+        if p == "g0_60":            # alvo: subir taxa G0 (mais seletivo)
+            eps, minc, coolN, coolS = 0.04, 0.60, 3, 120
+        elif p == "aggressive":     # mais fluxo; maior risco
+            eps, minc, coolN, coolS = 0.06, 0.56, 2, 90
+        elif p == "conservative":   # menos fluxo; foco em acertividade
+            eps, minc, coolN, coolS = 0.03, 0.62, 2, 180
+
+    _ctl_save(eps=eps, minc=minc, coolN=coolN, coolS=coolS)
+
+    e, m, cN, cS, thr, reg = _ctl_load()
+    return {
+        "ok": True,
+        "applied": {"epsilon": eps, "min_conf": minc, "cool_after_losses": coolN, "cool_secs": coolS},
+        "current": {"epsilon": e, "min_conf": m, "cool_after_losses": cN, "cool_secs": cS,
+                    "throttle_until": thr, "regime": reg}
+    }
+
 # ================== Webhook ==================
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
@@ -632,7 +650,7 @@ async def webhook(token: str, request: Request):
         if SHOW_DEBUG: await tg_send(TARGET_CHANNEL, "DEBUG: Análise reconhecida ✅")
         return {"ok": True, "analise_seq": len(seq)}
 
-    # -------- FECHAMENTO (G0 pelo parênteses) --------
+    # -------- FECHAMENTO (G0 pelo parênteses/placar) --------
     if RX_FECHA.search(text):
         if _seen_recent("fechamento", _dedupe_key(text)):
             return {"ok": True, "skipped": "fechamento_dupe"}
@@ -640,11 +658,8 @@ async def webhook(token: str, request: Request):
         pend=_pending_get()
         if pend:
             suggested=int(pend["suggested"] or 0)
-
-            # Só usamos o ÚLTIMO número entre parênteses para decidir
-            obs = _parse_paren_last_one(text)   # 1..4 ou None
-            if obs is not None:
-                _pending_seen_set(str(obs))
+            obs = _parse_paren_last_one(text)
+            if obs is not None: _pending_seen_set(str(obs))
 
             seen = (_pending_get()["seen"] or "").strip()
             outcome="LOSS"; stage_lbl="G0"
@@ -655,7 +670,6 @@ async def webhook(token: str, request: Request):
             msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
             if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
 
-            # controlador recebe feedback (ajusta epsilon/min_conf/throttle automaticamente)
             try: _ctl_on_feedback(outcome)
             except Exception: pass
 
@@ -674,7 +688,6 @@ async def webhook(token: str, request: Request):
         if seq: _append_seq(seq)
         after=_parse_after(text)
 
-        # fecha pendência esquecida (como X)
         pend=_pending_get()
         if pend:
             suggested=int(pend["suggested"] or 0)
@@ -690,10 +703,7 @@ async def webhook(token: str, request: Request):
 
         analyzing_id = await tg_send_return(TARGET_CHANNEL, "⏳ Analisando padrão, aguarde...")
 
-        # sugestão (neural+especialistas com FiboPro)
         best, conf, samples, mix, gap, reason = _neural_decide()
-
-        # controlador decide operar/ajustar
         play, why, chosen = _ctl_decide(best, conf, mix, gap)
 
         if not play:
