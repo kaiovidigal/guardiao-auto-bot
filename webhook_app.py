@@ -2,15 +2,22 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v7.3.1-controller (G0-only; ProfoundSim + NeuroController + /admin/tune)
+v7.4.0-fibo10-t30 (G0-only; ProfoundSim + Fibo10 + T30 + AntiDominio + NeuroController)
+
 - Fecha G0 pelo último número entre parênteses (ex.: GREEN (3)/RED (4))
 - IA Profunda Híbrida (ProfoundSim) DOMINANTE + especialistas estatísticos
-- Neuro IA Controladora: calibra e controla risco (epsilon, min_conf, cool-down, regime)
-- Endpoint /admin/tune para ajustar parâmetros on-line (presets + manual)
+- Novos especialistas:
+    • Fibo10: mistura de 10 janelas (5..233) em estilo Fibonacci
+    • T30: janela “30 minutos” (≈180 amostras por padrão)
+- AntiDominio: evita que um número domine; rebaixa e redistribui prob.
+- NeuroController: calibra risk (epsilon, min_conf, cooldown, regime)
 - Aprendizado leve por reforço (EMA) a cada GREEN/LOSS
 - Anti-trava: timeout de pendência (fecha LOSS G0 X)
 - Admin: /admin/status, /admin/unlock, /debug_cfg
 - Dedupe + SQLite (CPU-only)
+
+Start command (Render):
+  uvicorn webhook_app:app --host 0.0.0.0 --port $PORT
 """
 
 import os, re, time, sqlite3, datetime, hashlib, math, json, random
@@ -30,13 +37,16 @@ MAX_GALE         = int(os.getenv("MAX_GALE", "0"))        # G0 por padrão
 OBS_TIMEOUT_SEC  = int(os.getenv("OBS_TIMEOUT_SEC", "420"))
 DEDUP_WINDOW_SEC = int(os.getenv("DEDUP_WINDOW_SEC", "40"))
 
+# janela "30 minutos" aproximada (mensagens rápidas ~180 últimas)
+T30_WINDOW      = int(os.getenv("T30_WINDOW", "180"))
+
 if not TG_BOT_TOKEN or not WEBHOOK_TOKEN or not TARGET_CHANNEL:
     raise RuntimeError("Faltam ENV: TG_BOT_TOKEN, WEBHOOK_TOKEN, TARGET_CHANNEL.")
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 DB_PATH = "/opt/render/project/src/main.sqlite"
 
 # ================== APP ==================
-app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.3.1-controller")
+app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.4.0-fibo10-t30")
 
 # ================== DB ==================
 def _con():
@@ -78,20 +88,18 @@ def db_init():
         ts   INTEGER NOT NULL,
         PRIMARY KEY (kind, dkey)
     )""")
-    # parâmetros da IA ProfoundSim (persistentes, 1 linha)
     cur.execute("""CREATE TABLE IF NOT EXISTS neural(
         id INTEGER PRIMARY KEY CHECK(id=1),
         temp REAL DEFAULT 0.85,
         bias_json TEXT DEFAULT '{"1":0.0,"2":0.0,"3":0.0,"4":0.0}',
         weight_neural REAL DEFAULT 0.70
     )""")
-    # controlador (meta-IA) – 1 linha
     cur.execute("""CREATE TABLE IF NOT EXISTS neuroctl(
         id INTEGER PRIMARY KEY CHECK(id=1),
         epsilon REAL DEFAULT 0.06,
         min_conf REAL DEFAULT 0.58,
         cool_after_losses INTEGER DEFAULT 2,
-        cool_secs INTEGER DEFAULT 180,
+        cool_secs INTEGER DEFAULT 120,
         throttle_until INTEGER DEFAULT 0,
         regime TEXT DEFAULT 'neutral'
     )""")
@@ -100,15 +108,14 @@ def db_init():
     if not con.execute("SELECT 1 FROM neural WHERE id=1").fetchone():
         con.execute("INSERT INTO neural(id,temp,bias_json,weight_neural) VALUES(1,0.85,'{\"1\":0.0,\"2\":0.0,\"3\":0.0,\"4\":0.0}',0.70)")
     if not con.execute("SELECT 1 FROM neuroctl WHERE id=1").fetchone():
-        con.execute("INSERT INTO neuroctl(id,epsilon,min_conf,cool_after_losses,cool_secs,throttle_until,regime) VALUES(1,0.06,0.58,2,180,0,'neutral')")
+        con.execute("INSERT INTO neuroctl(id,epsilon,min_conf,cool_after_losses,cool_secs,throttle_until,regime) VALUES(1,0.06,0.58,2,120,0,'neutral')")
     con.commit(); con.close()
 db_init()
 
 def _mark_processed(upd: str):
     try:
         con = _con()
-        con.execute("INSERT OR IGNORE INTO processed(update_id,seen_at) VALUES(?,?)",
-                    (str(upd), int(time.time())))
+        con.execute("INSERT OR IGNORE INTO processed(update_id,seen_at) VALUES(?,?)",(str(upd), int(time.time())))
         con.commit(); con.close()
     except Exception:
         pass
@@ -123,8 +130,7 @@ def _timeline_tail(n:int=400)->List[int]:
 def _append_seq(seq: List[int]):
     if not seq: return
     con=_con(); now=int(time.time())
-    con.executemany("INSERT INTO timeline(created_at,number) VALUES(?,?)",
-                    [(now,int(x)) for x in seq])
+    con.executemany("INSERT INTO timeline(created_at,number) VALUES(?,?)",[(now,int(x)) for x in seq])
     con.commit(); con.close()
 
 def _timeline_size()->int:
@@ -144,7 +150,7 @@ def _score_add(outcome:str):
     con.commit(); con.close()
 
 def _score_text()->str:
-    con = _con(); row = con.execute("SELECT green,loss FROM score WHERE id=1").fetchone(); con.close()
+    con=_con(); row=con.execute("SELECT green,loss FROM score WHERE id=1").fetchone(); con.close()
     g,l = (int(row["green"]), int(row["loss"])) if row else (0,0)
     tot=g+l; acc=(g/tot*100.0) if tot>0 else 0.0
     return f"{g} GREEN × {l} LOSS — {acc:.1f}%"
@@ -173,7 +179,6 @@ def _pending_close(final_seen: str, outcome: str, stage_lbl: str, suggested:int)
     con=_con()
     con.execute("UPDATE pending SET open=0, seen=? WHERE id=?", (final_seen, int(row["id"])))
     con.commit(); con.close()
-    # feedback
     _update_neural_feedback(suggested, outcome)
     _score_add(outcome)
     obs=[int(x) for x in final_seen.split("-") if x.isdigit()]
@@ -236,6 +241,28 @@ def _post_e2_short(tail):  return _post_freq(tail, 60)
 def _post_e3_long(tail):   return _post_freq(tail, 300)
 def _post_e4_llm(tail):    return {1:0.25,2:0.25,3:0.25,4:0.25}
 
+# --- Fibo10: 10 janelas tipo Fibonacci (reforça padrões) ---
+_FIBO_10 = (5,8,13,21,34,55,89,144,233,377)
+def _post_fibo10(tail:List[int])->Dict[int,float]:
+    if not tail: return {1:0.25,2:0.25,3:0.25,4:0.25}
+    wsum={c:0.0 for c in (1,2,3,4)}
+    totw=0.0
+    for k in _FIBO_10:
+        win = tail[-k:] if len(tail)>=k else tail
+        if not win: continue
+        w = 1.0/math.sqrt(k)   # peso decrescente
+        totw += w
+        for c in (1,2,3,4):
+            wsum[c] += w * (win.count(c)/len(win))
+    if totw<=0: return {1:0.25,2:0.25,3:0.25,4:0.25}
+    return _norm({c: wsum[c]/totw for c in (1,2,3,4)})
+
+# --- T30: janela curta (~30min) controlada por ENV T30_WINDOW ---
+def _post_t30(tail:List[int])->Dict[int,float]:
+    if not tail: return {1:0.25,2:0.25,3:0.25,4:0.25}
+    win = tail[-max(10, min(T30_WINDOW, len(tail))):]
+    return _norm({c: win.count(c)/len(win) for c in (1,2,3,4)})
+
 def _conf_floor(post:Dict[int,float], floor=0.30, cap=0.95):
     post=_norm({c:float(post.get(c,0)) for c in (1,2,3,4)})
     b=max(post,key=post.get); mx=post[b]
@@ -254,7 +281,7 @@ def _conf_floor(post:Dict[int,float], floor=0.30, cap=0.95):
             if c!=b: post[c]+=add
     return _norm(post)
 
-# ============== IA Profunda Híbrida (ProfoundSim) ==============
+# ============== ProfoundSim (neural) ==============
 def _load_neural_params():
     con=_con(); row=con.execute("SELECT temp,bias_json,weight_neural FROM neural WHERE id=1").fetchone(); con.close()
     temp = float(row["temp"] if row else 0.85)
@@ -279,106 +306,98 @@ def _save_neural_params(temp:float=None, wneu:float=None, bias:Dict[int,float]=N
 
 def _features_from_tail(tail:List[int])->List[float]:
     if not tail: return [0.25,0.25,0.25,0.25] + [0.0]*28
-    L = len(tail)
-    freq = [tail.count(c)/L for c in (1,2,3,4)]
-    wins = []
+    L=len(tail)
+    freq=[tail.count(c)/L for c in (1,2,3,4)]
+    wins=[]
     for k in (8,13,21,34,55,89,144):
-        win = tail[-k:] if L>=k else tail
+        win=tail[-k:] if L>=k else tail
         wins.extend([win.count(c)/max(1,len(win)) for c in (1,2,3,4)])
-    trans = [[0]*4 for _ in range(4)]
-    for a,b in zip(tail[:-1], tail[1:]): trans[a-1][b-1]+=1
+    trans=[[0]*4 for _ in range(4)]
+    for a,b in zip(tail[:-1],tail[1:]): trans[a-1][b-1]+=1
     trans_norm=[]
     for i in range(4):
         s=sum(trans[i]) or 1
         trans_norm.extend([trans[i][j]/s for j in range(4)])
-    streaks=[0,0,0,0]
-    cur=tail[-1]; s=0
+    streaks=[0,0,0,0]; cur=tail[-1]; s=0
     for x in reversed(tail):
         if x==cur: s+=1
         else: break
-    streaks[cur-1]=s/max(1, min(20,L))
-    mean = sum(tail)/L
-    var  = sum((x-mean)**2 for x in tail)/L
-    ent  = 0.0
+    streaks[cur-1]=s/max(1,min(20,L))
+    mean=sum(tail)/L
+    var=sum((x-mean)**2 for x in tail)/L
+    ent=0.0
     for p in freq:
         if p>0: ent -= p*math.log(p+1e-12)
     return freq + wins + trans_norm + streaks + [var/3.0, ent/1.4]
 
 def _profoundsim_logits(feat:List[float], seed_base:int)->List[float]:
-    H = 512
-    h = [0.0]*H
+    H=512
+    h=[0.0]*H
     for i in range(H):
-        s = 0.0
-        for j, f in enumerate(feat):
-            seed = seed_base + i*131 + j*17
-            w = math.sin(seed*0.000113) * math.cos(seed*0.000071)
-            s += f * w
-        h[i] = math.tanh(1.2*s + 0.15*math.sin(s*3.0))
-    logits = [0.0,0.0,0.0,0.0]
+        s=0.0
+        for j,f in enumerate(feat):
+            seed=seed_base + i*131 + j*17
+            w=math.sin(seed*0.000113)*math.cos(seed*0.000071)
+            s+=f*w
+        h[i]=math.tanh(1.2*s + 0.15*math.sin(s*3.0))
+    logits=[0.0,0.0,0.0,0.0]
     for c in range(4):
         s=0.0
-        for i, val in enumerate(h):
-            seed = seed_base + (c+1)*997 + i*29
-            w = math.sin(seed*0.000091) * math.cos(seed*0.000067)
-            s += val * w
-        logits[c] = s
+        for i,val in enumerate(h):
+            seed=seed_base + (c+1)*997 + i*29
+            w=math.sin(seed*0.000091)*math.cos(seed*0.000067)
+            s+=val*w
+        logits[c]=s
     return logits
 
 def _softmax(x:List[float], temp:float)->List[float]:
-    m = max(x)
-    ex = [math.exp((xi-m)/max(0.15, temp)) for xi in x]
-    s = sum(ex) or 1e-9
+    m=max(x); ex=[math.exp((xi-m)/max(0.15,temp)) for xi in x]; s=sum(ex) or 1e-9
     return [e/s for e in ex]
 
 def _neural_probs(tail:List[int])->Dict[int,float]:
-    temp, _, bias = _load_neural_params()
-    feat = _features_from_tail(tail)
-    seed_base = len(tail)*1009 + (sum(tail)%997)
-    logits = _profoundsim_logits(feat, seed_base)
-    for idx,c in enumerate((1,2,3,4)):
-        logits[idx] += float(bias.get(c,0.0))
-    probs = _softmax(logits, temp)
+    temp,_,bias=_load_neural_params()
+    feat=_features_from_tail(tail)
+    seed_base=len(tail)*1009 + (sum(tail)%997)
+    logits=_profoundsim_logits(feat, seed_base)
+    for idx,c in enumerate((1,2,3,4)): logits[idx]+=float(bias.get(c,0.0))
+    probs=_softmax(logits, temp)
     return {c: float(probs[c-1]) for c in (1,2,3,4)}
 
 def _calibrate_from_score():
-    con=_con()
-    row=con.execute("SELECT green,loss FROM score WHERE id=1").fetchone()
-    con.close()
+    con=_con(); row=con.execute("SELECT green,loss FROM score WHERE id=1").fetchone(); con.close()
     if not row: return
-    g,l = int(row["green"]), int(row["loss"])
-    tot = g+l
-    if tot < 50: return
-    acc = g/max(1,tot)
-    temp, wneu, bias = _load_neural_params()
-    new_temp = max(0.55, min(1.10, 1.00 - 0.35*(acc-0.50)))
-    new_wneu = max(0.55, min(0.85, 0.60 + 0.50*(acc-0.50)))
+    g,l=int(row["green"]),int(row["loss"]); tot=g+l
+    if tot<50: return
+    acc=g/max(1,tot)
+    temp,wneu,_=_load_neural_params()
+    new_temp=max(0.55, min(1.10, 1.00 - 0.35*(acc-0.50)))
+    new_wneu=max(0.55, min(0.85, 0.60 + 0.50*(acc-0.50)))
     _save_neural_params(temp=new_temp, wneu=new_wneu, bias=None)
 
 def _update_neural_feedback(suggested:int, outcome:str):
-    temp, wneu, bias = _load_neural_params()
+    temp,wneu,bias=_load_neural_params()
     delta = 0.10 if outcome.upper()=="GREEN" else -0.07
-    ema   = 0.90
-    cur = float(bias.get(suggested,0.0))
-    new = ema*cur + (1-ema)*delta
-    bias[suggested] = new
+    ema=0.90
+    cur=float(bias.get(suggested,0.0))
+    new=ema*cur + (1-ema)*delta
+    bias[suggested]=new
     _save_neural_params(bias=bias)
     _calibrate_from_score()
 
 # ============== Neuro IA Controladora ==============
 def _ctl_load():
     con=_con(); row=con.execute("SELECT epsilon,min_conf,cool_after_losses,cool_secs,throttle_until,regime FROM neuroctl WHERE id=1").fetchone(); con.close()
-    if not row:
-        return 0.06, 0.58, 2, 180, 0, "neutral"
+    if not row: return 0.06,0.58,2,120,0,"neutral"
     return float(row["epsilon"]), float(row["min_conf"]), int(row["cool_after_losses"]), int(row["cool_secs"]), int(row["throttle_until"]), str(row["regime"])
 
-def _ctl_save(eps=None, minc=None, coolN=None, coolS=None, thr=None, reg=None):
-    e,mn,cn,cs,th,rg = _ctl_load()
-    if eps is not None: e = float(eps)
-    if minc is not None: mn = float(minc)
-    if coolN is not None: cn = int(coolN)
-    if coolS is not None: cs = int(coolS)
-    if thr is not None: th = int(thr)
-    if reg is not None: rg = str(reg)
+def _ctl_save(eps=None,minc=None,coolN=None,coolS=None,thr=None,reg=None):
+    e,mn,cn,cs,th,rg=_ctl_load()
+    if eps is not None: e=float(eps)
+    if minc is not None: mn=float(minc)
+    if coolN is not None: cn=int(coolN)
+    if coolS is not None: cs=int(coolS)
+    if thr is not None: th=int(thr)
+    if reg is not None: rg=str(reg)
     con=_con()
     con.execute("""INSERT OR REPLACE INTO neuroctl(id,epsilon,min_conf,cool_after_losses,cool_secs,throttle_until,regime)
                    VALUES(1,?,?,?,?,?,?)""",(e,mn,cn,cs,th,rg))
@@ -387,87 +406,123 @@ def _ctl_save(eps=None, minc=None, coolN=None, coolS=None, thr=None, reg=None):
 def _ctl_perf():
     con=_con(); row=con.execute("SELECT green,loss,streak_green,streak_loss FROM score WHERE id=1").fetchone(); con.close()
     if not row: return 0,0,0,0
-    return int(row["green"]), int(row["loss"]), int(row["streak_green"]), int(row["streak_loss"])
+    return int(row["green"]),int(row["loss"]),int(row["streak_green"]),int(row["streak_loss"])
 
 def _ctl_regime_update():
     tail=_timeline_tail(200)
-    if len(tail)<50:
-        _ctl_save(reg="neutral"); return "neutral"
-    freq = [tail.count(c)/len(tail) for c in (1,2,3,4)]
-    ent = 0.0
+    if len(tail)<50: _ctl_save(reg="neutral"); return "neutral"
+    freq=[tail.count(c)/len(tail) for c in (1,2,3,4)]
+    ent=0.0
     for p in freq:
         if p>0: ent -= p*math.log(p+1e-12)
-    mean = sum(tail)/len(tail)
-    var  = sum((x-mean)**2 for x in tail)/len(tail)
-    _,_,_, streak_loss = _ctl_perf()
-    if ent < 1.15 or var > 1.70 or streak_loss>=2:
+    mean=sum(tail)/len(tail)
+    var=sum((x-mean)**2 for x in tail)/len(tail)
+    _,_,_,sl=_ctl_perf()
+    if ent<1.15 or var>1.70 or sl>=2:
         _ctl_save(reg="volatile"); return "volatile"
-    if ent > 1.30 and var < 1.40:
+    if ent>1.30 and var<1.40:
         _ctl_save(reg="stable"); return "stable"
     _ctl_save(reg="neutral"); return "neutral"
 
 def _ctl_decide(best:int, conf:float, mix:Dict[int,float], gap:float)->Tuple[bool,str,int]:
-    now = int(time.time())
-    eps, minc, coolN, coolS, thr, reg = _ctl_load()
-    g,l,sg,sl = _ctl_perf()
+    now=int(time.time())
+    eps,minc,coolN,coolS,thr,reg=_ctl_load()
+    g,l,sg,sl=_ctl_perf()
 
     if now < thr:
         return False, f"cooldown até {thr} (loss_streak={sl})", -1
 
-    regime = _ctl_regime_update()
-    dyn_min = minc
-    if regime=="volatile":
-        dyn_min = min(0.68, max(minc, 0.62))
-    elif regime=="stable":
-        dyn_min = max(0.54, minc-0.02)
+    regime=_ctl_regime_update()
+    dyn_min=minc
+    if regime=="volatile": dyn_min=min(0.68, max(minc,0.62))
+    elif regime=="stable": dyn_min=max(0.54, minc-0.02)
 
-    if conf < dyn_min:
+    if conf<dyn_min:
         return False, f"conf {conf:.2f} < min {dyn_min:.2f} (regime={regime})", -1
 
-    second = sorted(mix.items(), key=lambda kv: kv[1], reverse=True)[1][0]
-    if gap < 0.03 and random.random() < eps:
+    second=sorted(mix.items(), key=lambda kv: kv[1], reverse=True)[1][0]
+    if gap<0.03 and random.random()<eps:
         return True, f"explore ε={eps:.2f} (gap={gap:.3f})", int(second)
-
     return True, f"exploit (gap={gap:.3f}, regime={regime})", int(best)
 
 def _ctl_on_feedback(outcome:str):
-    eps, minc, coolN, coolS, thr, reg = _ctl_load()
-    g,l,sg,sl = _ctl_perf()
+    eps,minc,coolN,coolS,thr,reg=_ctl_load()
+    g,l,sg,sl=_ctl_perf()
     total=g+l
     if total>=50:
-        acc = g/max(1,total)
-        new_eps = max(0.01, min(0.12, 0.10 - 0.15*(acc-0.50)))
+        acc=g/max(1,total)
+        new_eps=max(0.01, min(0.12, 0.10 - 0.15*(acc-0.50)))
         eps = 0.9*eps + 0.1*new_eps
-    if sl>=2:
-        minc = min(0.74, minc+0.01)
-    elif sg>=3:
-        minc = max(0.54, minc-0.01)
+    if sl>=2: minc=min(0.74, minc+0.01)
+    elif sg>=3: minc=max(0.54, minc-0.01)
     now=int(time.time())
-    if sl>=coolN:
-        thr = now + coolS
+    if sl>=coolN: thr = now + coolS
     else:
-        if now > thr: thr = 0
+        if now>thr: thr=0
     _ctl_save(eps=eps, minc=minc, thr=thr)
 
-# ============== Decisão final (neural + especialistas) ==============
+# ============== Anti-dominância (qualquer número) ==============
+def _anti_dominio(mix:Dict[int,float], tail:List[int])->Dict[int,float]:
+    if not tail: return mix
+    freq={c: tail.count(c)/len(tail) for c in (1,2,3,4)}
+    # achou o topo:
+    top = max(mix, key=mix.get)
+    p_top = mix[top]
+    # se o topo estiver MUITO alto OU frequência histórica muito acima de 33%, rebaixa
+    if p_top>0.40 or freq[top]>0.38:
+        excesso = min(0.08, p_top-0.32)  # tira até 8pp
+        mix[top] -= excesso
+        give = excesso/3.0
+        for c in (1,2,3,4):
+            if c!=top: mix[c]+=give
+    return _norm(mix)
+
+# ============== Decisão final (neural + especialistas + Fibo10 + T30) ==============
 def _neural_decide()->Tuple[int,float,int,Dict[int,float],float,str]:
-    tail = _timeline_tail(400)
-    p1=_post_e1_ngram(tail); p2=_post_e2_short(tail)
-    p3=_post_e3_long(tail);  p4=_post_e4_llm(tail)
+    tail=_timeline_tail(400)
+    # especialistas clássicos
+    p1=_post_e1_ngram(tail); p2=_post_e2_short(tail); p3=_post_e3_long(tail); p4=_post_e4_llm(tail)
+    # novos
+    pf=_post_fibo10(tail)
+    pt=_post_t30(tail)
+    # neural
     pn=_neural_probs(tail)
+
+    # pesos base
     _, wneu, _ = _load_neural_params()
     rest = 1.0 - wneu
-    w = {"neural": wneu, "e1":0.40*rest, "e2":0.30*rest, "e3":0.20*rest, "e4":0.10*rest}
-    mix = {}
+    w = {
+        "neural": wneu,
+        "fibo10": 0.30*rest,
+        "t30":    0.25*rest,
+        "e1":     0.25*rest,
+        "e2":     0.12*rest,
+        "e3":     0.05*rest,
+        "e4":     0.03*rest
+    }
+
+    mix={}
     for c in (1,2,3,4):
-        mix[c] = w["neural"]*pn.get(c,0) + w["e1"]*p1.get(c,0) + w["e2"]*p2.get(c,0) + w["e3"]*p3.get(c,0) + w["e4"]*p4.get(c,0)
-    mix = _conf_floor(_norm(mix), 0.30, 0.95)
-    best = max(mix,key=mix.get)
-    conf = float(mix[best])
-    r = sorted(mix.items(), key=lambda kv: kv[1], reverse=True)
-    gap = (r[0][1]-r[1][1]) if len(r)>=2 else r[0][1]
+        mix[c] = (
+            w["neural"]*pn.get(c,0) +
+            w["fibo10"]*pf.get(c,0) +
+            w["t30"]*pt.get(c,0) +
+            w["e1"]*p1.get(c,0) +
+            w["e2"]*p2.get(c,0) +
+            w["e3"]*p3.get(c,0) +
+            w["e4"]*p4.get(c,0)
+        )
+
+    # anti-domínio + piso/teto de confiança
+    mix = _anti_dominio(mix, tail)
+    mix = _conf_floor(mix, 0.30, 0.95)
+
+    best=max(mix,key=mix.get)
+    conf=float(mix[best])
+    r=sorted(mix.items(), key=lambda kv: kv[1], reverse=True)
+    gap=(r[0][1]-r[1][1]) if len(r)>=2 else r[0][1]
     temp, wneu_cur, _ = _load_neural_params()
-    reason = f"ProfoundSim(w={wneu_cur:.2f},T={temp:.2f})"
+    reason = f"ProfoundSim·Fibo10+T30(w={wneu_cur:.2f},T={temp:.2f})"
     return best, conf, _timeline_size(), mix, gap, reason
 
 def _ngram_snapshot(suggested:int)->str:
@@ -549,7 +604,8 @@ async def debug_cfg():
         "MAX_GALE": MAX_GALE, "OBS_TIMEOUT_SEC": OBS_TIMEOUT_SEC, "DEDUP_WINDOW_SEC": DEDUP_WINDOW_SEC,
         "neural_temp": temp, "neural_weight": wneu, "neural_bias": bias,
         "ctl_epsilon": eps, "ctl_min_conf": minc, "ctl_cool_after_losses": coolN,
-        "ctl_cool_secs": coolS, "ctl_throttle_until": thr, "ctl_regime": reg
+        "ctl_cool_secs": coolS, "ctl_throttle_until": thr, "ctl_regime": reg,
+        "t30_window": T30_WINDOW
     }
 
 # ----- Admin helpers -----
@@ -575,40 +631,6 @@ async def admin_unlock():
     suggested = int(pend["suggested"] or 0)
     msg_txt = _pending_close("X", "LOSS", "G0", suggested)
     return {"ok": True, "forced_close": True, "message": msg_txt}
-
-# ----- Admin tune (NOVO) -----
-@app.get("/admin/tune")
-async def admin_tune(profile: str = None,
-                     eps: float = None,
-                     minc: float = None,
-                     coolN: int = None,
-                     coolS: int = None):
-    """
-    Ajusta NeuroController on-line.
-    Exemplos:
-      /admin/tune?profile=g0_60
-      /admin/tune?profile=aggressive
-      /admin/tune?profile=conservative
-      /admin/tune?eps=0.04&minc=0.60&coolN=3&coolS=120
-    """
-    if profile:
-        p = profile.strip().lower()
-        if p == "g0_60":            # alvo: subir taxa G0 (mais seletivo)
-            eps, minc, coolN, coolS = 0.04, 0.60, 3, 120
-        elif p == "aggressive":     # mais fluxo; maior risco
-            eps, minc, coolN, coolS = 0.06, 0.56, 2, 90
-        elif p == "conservative":   # menos fluxo; foco em acertividade
-            eps, minc, coolN, coolS = 0.03, 0.62, 2, 180
-
-    _ctl_save(eps=eps, minc=minc, coolN=coolN, coolS=coolS)
-
-    e, m, cN, cS, thr, reg = _ctl_load()
-    return {
-        "ok": True,
-        "applied": {"epsilon": eps, "min_conf": minc, "cool_after_losses": coolN, "cool_secs": coolS},
-        "current": {"epsilon": e, "min_conf": m, "cool_after_losses": cN, "cool_secs": cS,
-                    "throttle_until": thr, "regime": reg}
-    }
 
 # ================== Webhook ==================
 @app.post("/webhook/{token}")
@@ -650,7 +672,7 @@ async def webhook(token: str, request: Request):
         if SHOW_DEBUG: await tg_send(TARGET_CHANNEL, "DEBUG: Análise reconhecida ✅")
         return {"ok": True, "analise_seq": len(seq)}
 
-    # -------- FECHAMENTO (G0 pelo parênteses/placar) --------
+    # -------- FECHAMENTO (G0 pelo parênteses) --------
     if RX_FECHA.search(text):
         if _seen_recent("fechamento", _dedupe_key(text)):
             return {"ok": True, "skipped": "fechamento_dupe"}
@@ -658,8 +680,10 @@ async def webhook(token: str, request: Request):
         pend=_pending_get()
         if pend:
             suggested=int(pend["suggested"] or 0)
-            obs = _parse_paren_last_one(text)
-            if obs is not None: _pending_seen_set(str(obs))
+
+            obs = _parse_paren_last_one(text)   # 1..4 ou None
+            if obs is not None:
+                _pending_seen_set(str(obs))
 
             seen = (_pending_get()["seen"] or "").strip()
             outcome="LOSS"; stage_lbl="G0"
@@ -669,10 +693,8 @@ async def webhook(token: str, request: Request):
             final_seen = seen if seen else "X"
             msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
             if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
-
             try: _ctl_on_feedback(outcome)
             except Exception: pass
-
             return {"ok": True, "closed": outcome, "seen": final_seen}
 
         if SHOW_DEBUG: await tg_send(TARGET_CHANNEL, "DEBUG: Fechamento reconhecido ✅ — sem pendência aberta")
@@ -688,6 +710,7 @@ async def webhook(token: str, request: Request):
         if seq: _append_seq(seq)
         after=_parse_after(text)
 
+        # fecha pendência esquecida (como X)
         pend=_pending_get()
         if pend:
             suggested=int(pend["suggested"] or 0)
