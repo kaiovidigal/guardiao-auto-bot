@@ -2,12 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v7.5-slate (FLOW + Multi-horizonte + Anti-bias + Slate de opções)
+v7.5.1-slate-antibias  (FLOW + Multi-horizonte + Anti-bias forte + Slate + ClassCooldown)
 
 - Fecha G0 pelo último número entre parênteses
-- Ensemble: ProfoundSim + (curto, médio, longo) + Fibo10 + T30
+- Ensemble: ProfoundSim + (curto, médio, longo, n-gram) + Fibo10 + T30
 - Anti-viés (dominância / repetições) + empurrão de entropia
 - Slate de opções (top-K): primário + alternativas curto/médio
+- ClassCooldown: evita grudar no mesmo número quando gap é pequeno
 - NeuroController FLOW: sem cooldown, corte por confiança; ε explora dentro do slate
 - Reforço leve (EMA) por classe
 - Timeout de pendência (anti-trava) e dedupe
@@ -33,18 +34,22 @@ DEDUP_WINDOW_SEC = int(os.getenv("DEDUP_WINDOW_SEC", "40"))
 
 # Controller FLOW
 CTL_MIN_CONF     = float(os.getenv("CTL_MIN_CONF", "0.72"))
-CTL_EPSILON      = float(os.getenv("CTL_EPSILON", "0.03"))
+CTL_EPSILON      = float(os.getenv("CTL_EPSILON", "0.08"))
 
 # Slate (opções alternativas)
 SLATE_K          = int(os.getenv("SLATE_K", "3"))          # 1..4
-SLATE_GAP_MAX    = float(os.getenv("SLATE_GAP_MAX", "0.10"))
-SLATE_MINCONF    = float(os.getenv("SLATE_MINCONF", "0.23"))
+SLATE_GAP_MAX    = float(os.getenv("SLATE_GAP_MAX", "0.15"))
+SLATE_MINCONF    = float(os.getenv("SLATE_MINCONF", "0.18"))
 
 # Anti-viés/diversidade
-DIV_LASTK       = int(os.getenv("DIVERSITY_LASTK", "25"))
-DIV_MAX_SHARE   = float(os.getenv("DIVERSITY_MAX_SHARE", "0.38"))
-DIV_MAX_SAME    = int(os.getenv("DIVERSITY_MAX_SAME", "3"))
-ENTROPY_PUSH    = float(os.getenv("ANTIENTROPY_PUSH", "0.30"))
+DIV_LASTK       = int(os.getenv("DIVERSITY_LASTK", "30"))
+DIV_MAX_SHARE   = float(os.getenv("DIVERSITY_MAX_SHARE", "0.36"))
+DIV_MAX_SAME    = int(os.getenv("DIVERSITY_MAX_SAME", "2"))
+ENTROPY_PUSH    = float(os.getenv("ANTIENTROPY_PUSH", "0.12"))
+
+# ClassCooldown (promove 2º lugar se repetindo e gap pequeno)
+CLASS_COOLDOWN_REPS  = int(os.getenv("CLASS_COOLDOWN_REPS", "2"))
+CLASS_COOLDOWN_DELTA = float(os.getenv("CLASS_COOLDOWN_DELTA", "0.06"))
 
 if not TG_BOT_TOKEN or not WEBHOOK_TOKEN or not TARGET_CHANNEL:
     raise RuntimeError("Faltam ENV: TG_BOT_TOKEN, WEBHOOK_TOKEN, TARGET_CHANNEL.")
@@ -52,7 +57,7 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 DB_PATH = "/opt/render/project/src/main.sqlite"
 
 # ================== APP ==================
-app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.5-slate")
+app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.5.1-slate-antibias")
 
 # ================== DB ==================
 def _con():
@@ -234,7 +239,7 @@ def _post_e1_ngram(tail:List[int])->Dict[int,float]:
         for c in (1,2,3,4): mix[c]+=w*pk[c]
     return _norm(mix)
 
-def _post_e2_short(tail):  return _post_freq(tail, 40)   # mais curto
+def _post_e2_short(tail):  return _post_freq(tail, 40)   # curto
 def _post_e3_mid(tail):    return _post_freq(tail, 120)  # médio
 def _post_e4_long(tail):   return _post_freq(tail, 300)  # longo
 
@@ -383,26 +388,36 @@ def _entropy_mix(mix:Dict[int,float], push:float)->Dict[int,float]:
     uni={c:0.25 for c in (1,2,3,4)}
     return _norm({c: (1.0-push)*mix.get(c,0.0) + push*uni[c] for c in (1,2,3,4)})
 
+# >>> PATCH anti-viés reforçado
 def _antibias_adjust(mix:Dict[int,float])->Tuple[Dict[int,float],dict]:
     diag={}
     freq=_lastk_freq(DIV_LASTK)
     dom=max(freq, key=freq.get); share=freq[dom]
     same_reps=int(_kv_get("same_suggested_reps","0"))
+    last=_kv_get("last_suggested","")
+
     adjusted=dict(mix)
     parts=[]
+
+    # penaliza dominante recente de forma progressiva
     if share > DIV_MAX_SHARE:
-        excess=min(0.25, max(0.0, share-DIV_MAX_SHARE))
-        adjusted[dom] = max(0.0, adjusted.get(dom,0.0) * (1.0 - 0.6*excess))
+        excess = min(0.30, max(0.0, share - DIV_MAX_SHARE))
+        adjusted[dom] = max(0.0, adjusted.get(dom,0.0) * (1.0 - 0.9*excess))
         parts.append(f"share{dom}>{DIV_MAX_SHARE:.2f}")
-    last=_kv_get("last_suggested","")
-    if last.isdigit() and int(last)==dom and same_reps>=DIV_MAX_SAME:
-        adjusted[dom] = max(0.0, adjusted.get(dom,0.0) * 0.70)
+
+    # corta mais se repetindo o mesmo topo
+    if last.isdigit() and int(last)==dom and same_reps >= DIV_MAX_SAME:
+        adjusted[dom] = max(0.0, adjusted.get(dom,0.0) * 0.55)
         parts.append(f"same_reps={same_reps}")
-    if ENTROPY_PUSH>0:
-        adjusted=_entropy_mix(adjusted, ENTROPY_PUSH)
+
+    # empurrão de entropia
+    if ENTROPY_PUSH > 0:
+        adjusted = _entropy_mix(adjusted, ENTROPY_PUSH)
         parts.append(f"H{ENTROPY_PUSH:.2f}")
-    adjusted=_conf_floor(_norm(adjusted), 0.30, 0.95)
-    diag.update({"dominant":dom,"dominant_share":round(share,4),"same_reps":same_reps,"applied":" & ".join(parts) if parts else "none"})
+
+    adjusted = _conf_floor(_norm(adjusted), 0.30, 0.95)
+    diag.update({"dominant":dom,"dominant_share":round(share,4),
+                 "same_reps":same_reps,"applied":" & ".join(parts) if parts else "none"})
     return adjusted, diag
 
 # ===== Controller FLOW =====
@@ -424,12 +439,11 @@ def _ctl_decide_slate(ranked:List[Tuple[int,float]], gap01:float)->Tuple[bool,st
     topn, topc = ranked[0]
     if topc < minc:
         return False, f"conf {topc:.2f} < min {minc:.2f} (flow)", -1
-    # ε-explore dentro do slate quando gap pequeno
     if gap01 < 0.03 and random.random() < eps and len(ranked)>=2:
         return True, f"explore ε={eps:.2f} (gap={gap01:.3f})", int(ranked[1][0])
     return True, f"exploit (gap={gap01:.3f})", int(topn)
 
-# ===== decisão (ensemble + antibias + slate) =====
+# ===== decisão (ensemble + antibias + slate + class cooldown) =====
 def _neural_decide_slate()->Tuple[List[Tuple[int,float]], int, Dict[int,float], float, str, dict]:
     tail=_timeline_tail(400)
     # especialistas
@@ -458,6 +472,14 @@ def _neural_decide_slate()->Tuple[List[Tuple[int,float]], int, Dict[int,float], 
     # ranking + slate
     ranked = sorted(adj.items(), key=lambda kv: kv[1], reverse=True)
     ranked = [(int(n), float(p)) for n,p in ranked[:max(1,min(SLATE_K,4))]]
+
+    # --- ClassCooldown: evita grudar no mesmo número quando o 2º está perto ---
+    last = _kv_get("last_suggested","")
+    reps = int(_kv_get("same_suggested_reps","0"))
+    if len(ranked) >= 2 and last.isdigit() and int(last) == ranked[0][0] and reps >= CLASS_COOLDOWN_REPS:
+        if (ranked[0][1] - ranked[1][1]) <= CLASS_COOLDOWN_DELTA:
+            ranked[0], ranked[1] = ranked[1], ranked[0]  # promove o 2º
+
     gap01 = (ranked[0][1] - ranked[1][1]) if len(ranked)>=2 else ranked[0][1]
     temp, wneu_cur, _=_load_neural_params()
     reason=f"ProfoundSim+Multi(w={wneu_cur:.2f},T={temp:.2f})"
@@ -547,7 +569,8 @@ async def debug_cfg():
             "last_suggested": _kv_get("last_suggested",""),
             "same_suggested_reps": int(_kv_get("same_suggested_reps","0"))
         },
-        "slate": {"k": SLATE_K, "gap_max": SLATE_GAP_MAX, "min_conf": SLATE_MINCONF}
+        "slate": {"k": SLATE_K, "gap_max": SLATE_GAP_MAX, "min_conf": SLATE_MINCONF},
+        "class_cooldown": {"reps": CLASS_COOLDOWN_REPS, "delta": CLASS_COOLDOWN_DELTA}
     }
 
 # ----- Admin helpers -----
@@ -601,7 +624,7 @@ async def webhook(token: str, request: Request):
 
     # -------- ANALISANDO --------
     if RX_ANALISE.search(text):
-        if _seen_recent("analise", _dedupe_key(text)):  # evita spam de “analisando…”
+        if _seen_recent("analise", _dedupe_key(text)):
             return {"ok": True, "skipped": "analise_dupe"}
         seq=_parse_seq_list(text)
         if seq: _append_seq(seq)
@@ -656,7 +679,7 @@ async def webhook(token: str, request: Request):
         # decisão com slate
         ranked, samples, mix, gap01, reason, ab_diag = _neural_decide_slate()
 
-        # filtra slate por thresholds (curto/médio alternativas)
+        # filtra slate por thresholds
         slate = [(n,p) for (n,p) in ranked if p >= SLATE_MINCONF]
         if len(slate)==0: slate = [ranked[0]]
 
@@ -670,10 +693,8 @@ async def webhook(token: str, request: Request):
         opened=_pending_open(suggested)
         if opened:
             aft_txt=f" após {after}" if after else ""
-            # prepara linha de alternativas (se gap pequeno e temos >1)
             alt_txt=""
             if len(slate)>=2 and gap01 <= SLATE_GAP_MAX:
-                # até 2 alternativas
                 alts = ", ".join([f"{n}({p*100:.1f}%)" for n,p in slate[1:3]])
                 alt_txt=f"\n🅱️ <b>Opções curto/médio:</b> {alts}"
 
