@@ -2,16 +2,19 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v7.6-divguard (FLOW + Multi-horizonte + Anti-bias/DiversityGuard + Slate de opções)
+v7.5.2-guard  (FLOW + Multi-horizonte + Anti-bias forte + Slate + ClassGuard + Ban)
 
 - Fecha G0 pelo último número entre parênteses
-- Ensemble: ProfoundSim + (curto, médio, longo) + Fibo10 + T30
-- Anti-viés: DiversityGuard (dominação/repetição) + empurrão de entropia
+- Ensemble: ProfoundSim + (curto, médio, longo, n-gram) + Fibo10 + T30
+- Anti-viés (dominância / repetições) + empurrão de entropia
 - Slate de opções (top-K): primário + alternativas curto/médio
+- ClassCooldown + ClassGuard: evita grudar e corta classe em streaks ruins
+- Bias clamp no reforço (evita “viciar” no 4)
 - NeuroController FLOW: sem cooldown, corte por confiança; ε explora dentro do slate
-- Reforço leve (EMA) por classe (sem backprop, CPU-only)
+- Ban temporário por classe (/admin/ban/{cls}/{plays})
+- Reforço leve (EMA) por classe
 - Timeout de pendência (anti-trava) e dedupe
-- Admin: /health /debug_cfg /admin/status /admin/unlock /admin/reset_bias /admin/antibias
+- Admin: /health /debug_cfg /admin/status /admin/unlock /admin/flush_bias /admin/retune /admin/ban/{c}/{n}
 """
 
 import os, re, time, sqlite3, datetime, hashlib, math, json, random
@@ -32,25 +35,30 @@ OBS_TIMEOUT_SEC  = int(os.getenv("OBS_TIMEOUT_SEC", "420"))
 DEDUP_WINDOW_SEC = int(os.getenv("DEDUP_WINDOW_SEC", "40"))
 
 # Controller FLOW
-CTL_MIN_CONF     = float(os.getenv("CTL_MIN_CONF", "0.70"))   # 0.70 recomendado
-CTL_EPSILON      = float(os.getenv("CTL_EPSILON", "0.03"))
+CTL_MIN_CONF     = float(os.getenv("CTL_MIN_CONF", "0.74"))
+CTL_EPSILON      = float(os.getenv("CTL_EPSILON", "0.05"))
 
 # Slate (opções alternativas)
 SLATE_K          = int(os.getenv("SLATE_K", "3"))          # 1..4
-SLATE_GAP_MAX    = float(os.getenv("SLATE_GAP_MAX", "0.10"))
-SLATE_MINCONF    = float(os.getenv("SLATE_MINCONF", "0.24"))
+SLATE_GAP_MAX    = float(os.getenv("SLATE_GAP_MAX", "0.12"))
+SLATE_MINCONF    = float(os.getenv("SLATE_MINCONF", "0.20"))
+MIN_ALT_GAP      = float(os.getenv("MIN_ALT_GAP", "0.05"))  # se gap <= isso, consideramos 2º
 
-# Anti-viés/diversidade (geral)
-DIV_LASTK        = int(os.getenv("DIVERSITY_LASTK", "40"))    # janela p/ medir dominância
-DIV_MAX_SHARE    = float(os.getenv("DIVERSITY_MAX_SHARE", "0.38"))
-DIV_MAX_SAME     = int(os.getenv("DIVERSITY_MAX_SAME", "3"))
-ENTROPY_PUSH     = float(os.getenv("ANTIENTROPY_PUSH", "0.25"))
+# Anti-viés/diversidade
+DIV_LASTK       = int(os.getenv("DIVERSITY_LASTK", "40"))
+DIV_MAX_SHARE   = float(os.getenv("DIVERSITY_MAX_SHARE", "0.30"))
+DIV_MAX_SAME    = int(os.getenv("DIVERSITY_MAX_SAME", "1"))
+ENTROPY_PUSH    = float(os.getenv("ANTIENTROPY_PUSH", "0.20"))
 
-# DiversityGuard (bloqueio temporário da classe dominante)
-DIV_BAN_SHARE        = float(os.getenv("DIVERSITY_BAN_IF_SHARE", "0.42"))  # se share > ban
-DIV_BAN_WINDOW       = int(os.getenv("DIVERSITY_BAN_WINDOW", "35"))        # janela extra p/ ban
-DIV_BAN_COOLDOWN_SEC = int(os.getenv("DIVERSITY_BAN_COOLDOWN", "900"))     # 15 min
-DIV_ALLOW_IF_CONF_GE = float(os.getenv("DIVERSITY_ALLOW_IF_CONF_GE", "0.80"))  # ignora ban se conf >=
+# ClassCooldown / Guard
+CLASS_COOLDOWN_REPS  = int(os.getenv("CLASS_COOLDOWN_REPS", "2"))
+CLASS_COOLDOWN_DELTA = float(os.getenv("CLASS_COOLDOWN_DELTA", "0.06"))
+CLASS_GUARD_LASTN    = int(os.getenv("CLASS_GUARD_LASTN", "30"))
+CLASS_GUARD_MIN_HIT  = float(os.getenv("CLASS_GUARD_MIN_HIT", "0.35"))
+CLASS_GUARD_HARDLOSS = int(os.getenv("CLASS_GUARD_HARDLOSS", "2"))
+
+# Bias clamp no reforço
+BIAS_CLAMP = float(os.getenv("BIAS_CLAMP", "0.28"))
 
 if not TG_BOT_TOKEN or not WEBHOOK_TOKEN or not TARGET_CHANNEL:
     raise RuntimeError("Faltam ENV: TG_BOT_TOKEN, WEBHOOK_TOKEN, TARGET_CHANNEL.")
@@ -58,7 +66,7 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 DB_PATH = "/opt/render/project/src/main.sqlite"
 
 # ================== APP ==================
-app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.6-divguard")
+app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.5.2-guard")
 
 # ================== DB ==================
 def _con():
@@ -169,7 +177,7 @@ def _pending_open(suggested:int):
     con.execute("""INSERT INTO pending(created_at,opened_at,suggested,seen,open)
                    VALUES(?,?,?,?,1)""",(now,now,int(suggested),""))
     con.commit(); con.close()
-    # rastreia repetições
+    # rastreia repetições do mesmo sugerido
     last=_kv_get("last_suggested","")
     reps=int(_kv_get("same_suggested_reps","0"))
     if last.isdigit() and int(last)==int(suggested): reps+=1
@@ -222,7 +230,7 @@ def _seen_recent(kind:str,dkey:str)->bool:
     con.execute("INSERT OR REPLACE INTO dedupe(kind,dkey,ts) VALUES (?,?,?)",(kind,dkey,now))
     con.commit(); con.close(); return False
 
-# ===== especialistas =====
+# ================== Especialistas ==================
 def _norm(d:Dict[int,float])->Dict[int,float]:
     s=sum(d.values()) or 1e-9
     return {k:v/s for k,v in d.items()}
@@ -277,7 +285,7 @@ def _conf_floor(post:Dict[int,float], floor=0.30, cap=0.95):
             if c!=b: post[c]+=add
     return _norm(post)
 
-# ===== ProfoundSim =====
+# ================== ProfoundSim (neural “leve”) ==================
 def _load_neural_params():
     con=_con(); row=con.execute("SELECT temp,bias_json,weight_neural FROM neural WHERE id=1").fetchone(); con.close()
     temp=float(row["temp"] if row else 0.85)
@@ -293,7 +301,12 @@ def _save_neural_params(temp=None,wneu=None,bias=None):
     cur_bias=json.loads(row["bias_json"]) if row and row["bias_json"] else {"1":0.0,"2":0.0,"3":0.0,"4":0.0}
     if temp is not None: cur_temp=float(temp)
     if wneu is not None: cur_w=float(wneu)
-    if bias is not None: cur_bias={str(k):float(v) for k,v in bias.items()}
+    if bias is not None:
+        # clamp de bias por classe
+        for k in ("1","2","3","4"):
+            if k in bias:
+                bias[k]=max(-BIAS_CLAMP, min(BIAS_CLAMP, float(bias[k])))
+        cur_bias={str(k):float(v) for k,v in bias.items()}
     con.execute("INSERT OR REPLACE INTO neural(id,temp,bias_json,weight_neural) VALUES(1,?,?,?)",(cur_temp,json.dumps(cur_bias),cur_w))
     con.commit(); con.close()
 
@@ -378,7 +391,7 @@ def _update_neural_feedback(suggested:int,outcome:str):
     _save_neural_params(bias=bias)
     _calibrate_from_score()
 
-# ===== Anti-bias helpers =====
+# ================== Anti-bias + ClassGuard ==================
 def _lastk_freq(lastk:int)->Dict[int,float]:
     tail=_timeline_tail(lastk)
     if not tail: return {1:0.25,2:0.25,3:0.25,4:0.25}
@@ -394,87 +407,86 @@ def _antibias_adjust(mix:Dict[int,float])->Tuple[Dict[int,float],dict]:
     freq=_lastk_freq(DIV_LASTK)
     dom=max(freq, key=freq.get); share=freq[dom]
     same_reps=int(_kv_get("same_suggested_reps","0"))
-    adjusted=dict(mix); parts=[]
-    if share > DIV_MAX_SHARE:
-        excess=min(0.25, max(0.0, share-DIV_MAX_SHARE))
-        adjusted[dom] = max(0.0, adjusted.get(dom,0.0) * (1.0 - 0.6*excess))
-        parts.append(f"share{dom}>{DIV_MAX_SHARE:.2f}")
     last=_kv_get("last_suggested","")
-    if last.isdigit() and int(last)==dom and same_reps>=DIV_MAX_SAME:
-        adjusted[dom] = max(0.0, adjusted.get(dom,0.0) * 0.70)
+
+    adjusted=dict(mix)
+    parts=[]
+
+    # penaliza dominante recente de forma progressiva
+    if share > DIV_MAX_SHARE:
+        excess = min(0.30, max(0.0, share - DIV_MAX_SHARE))
+        adjusted[dom] = max(0.0, adjusted.get(dom,0.0) * (1.0 - 0.9*excess))
+        parts.append(f"share{dom}>{DIV_MAX_SHARE:.2f}")
+
+    # corta mais se repetindo o mesmo topo
+    if last.isdigit() and int(last)==dom and same_reps >= DIV_MAX_SAME:
+        adjusted[dom] = max(0.0, adjusted.get(dom,0.0) * 0.55)
         parts.append(f"same_reps={same_reps}")
-    if ENTROPY_PUSH>0:
-        adjusted=_entropy_mix(adjusted, ENTROPY_PUSH)
+
+    # empurrão de entropia
+    if ENTROPY_PUSH > 0:
+        adjusted = _entropy_mix(adjusted, ENTROPY_PUSH)
         parts.append(f"H{ENTROPY_PUSH:.2f}")
-    adjusted=_conf_floor(_norm(adjusted), 0.30, 0.95)
-    diag.update({"dominant":dom,"dominant_share":round(share,4),"same_reps":same_reps,"applied":" & ".join(parts) if parts else "none"})
+
+    adjusted = _conf_floor(_norm(adjusted), 0.30, 0.95)
+    diag.update({"dominant":dom,"dominant_share":round(share,4),
+                 "same_reps":same_reps,"applied":" & ".join(parts) if parts else "none"})
     return adjusted, diag
 
-# ===== Diversity Guard (ban temporário da dominante) =====
-def _diversity_guard(mix:Dict[int,float], top:int, top_conf:float)->Tuple[Dict[int,float], dict]:
-    """
-    Se a mesma classe domina muito a janela (DIV_BAN_WINDOW) OU share > DIV_BAN_SHARE,
-    cria um 'ban_until_ts' para ela. Enquanto banida, redistribui a massa para as demais,
-    a menos que a confiança do topo >= DIV_ALLOW_IF_CONF_GE (override).
-    """
-    diag={"ban":"none","until":0,"reason":"", "override":False}
-    now=int(time.time())
+def _class_guard_adjust(mix:Dict[int,float])->Tuple[Dict[int,float],dict]:
+    """Guarda de classe: se performance geral está baixa ou streak de LOSS está alta,
+    corta o topo (especialmente se é o último sugerido) para evitar grudar."""
+    con=_con(); row=con.execute("SELECT green,loss,streak_loss FROM score WHERE id=1").fetchone(); con.close()
+    g,l,sl=(int(row["green"]),int(row["loss"]),int(row["streak_loss"]))
+    acc = g/max(1,(g+l))
+    last = _kv_get("last_suggested","")
+    adjusted=dict(mix); parts=[]
+    # queda de acurácia: baixa o topo 20%
+    if acc < CLASS_GUARD_MIN_HIT:
+        top=max(adjusted,key=adjusted.get)
+        adjusted[top] = adjusted[top]*0.80
+        parts.append(f"acc<{CLASS_GUARD_MIN_HIT:.2f}")
+    # streak de LOSS: corta ainda mais a última classe sugerida
+    if sl >= CLASS_GUARD_HARDLOSS and last.isdigit():
+        n=int(last)
+        if n in adjusted:
+            adjusted[n] = adjusted[n]*0.70
+            parts.append(f"streak_loss>={CLASS_GUARD_HARDLOSS}")
+    adjusted=_conf_floor(_norm(adjusted),0.30,0.95)
+    return adjusted, {"acc":round(acc,4),"streak_loss":sl,"applied":" & ".join(parts) if parts else "none"}
 
-    # estado de ban atual
-    ban_num=int(_kv_get("ban_num","0") or 0)
-    ban_until=int(_kv_get("ban_until","0") or 0)
+# ================== Ban temporário ==================
+def _ban_get()->dict:
+    try:
+        j=_kv_get("ban_classes","{}"); return json.loads(j) if j else {}
+    except: return {}
 
-    # mede dominância na janela de ban
-    freq=_lastk_freq(DIV_BAN_WINDOW)
-    dom=max(freq, key=freq.get); share=freq[dom]
+def _ban_set(b:dict):
+    _kv_set("ban_classes", json.dumps(b))
 
-    # critério para iniciar ban
-    same_reps=int(_kv_get("same_suggested_reps","0") or 0)
-    want_ban = (share >= DIV_BAN_SHARE) or (same_reps >= DIV_MAX_SAME+1)
-    if ban_until < now and want_ban:
-        _kv_set("ban_num", str(dom))
-        _kv_set("ban_until", str(now + DIV_BAN_COOLDOWN_SEC))
-        ban_num, ban_until = dom, now + DIV_BAN_COOLDOWN_SEC
+def _ban_apply(mix:dict)->dict:
+    b=_ban_get(); adj=dict(mix)
+    changed=False
+    for k,v in list(b.items()):
+        n=int(k); left=int(v)
+        if left>0 and n in adj:
+            adj[n]=0.0; changed=True
+            b[k]=left-1
+        if b.get(k,0)<=0:
+            b.pop(k, None)
+    if changed:
+        _ban_set(b)
+        s=sum(adj.values()) or 1.0
+        adj={c: (p/s) for c,p in adj.items()}
+    return adj
 
-    # aplica ban se ativo
-    if ban_num in (1,2,3,4) and ban_until > now:
-        # override por confiança muito alta
-        if top==ban_num and top_conf >= DIV_ALLOW_IF_CONF_GE:
-            diag.update({"ban":ban_num,"until":ban_until,"reason":f"override_conf>={DIV_ALLOW_IF_CONF_GE:.2f}","override":True})
-            return mix, diag
-
-        # zera/abaixa a classe banida e normaliza
-        new_mix=dict(mix)
-        mass_banned=new_mix.get(ban_num,0.0)
-        new_mix[ban_num]=0.0
-        # redistribui proporcionalmente
-        rest_sum=sum(new_mix[c] for c in (1,2,3,4))
-        if rest_sum<=0:
-            # fallback uniforme
-            for c in (1,2,3,4):
-                new_mix[c]=0.25
-        else:
-            scale=(rest_sum+mass_banned)/rest_sum
-            for c in (1,2,3,4):
-                if c!=ban_num: new_mix[c]*=scale
-        new_mix=_conf_floor(_norm(new_mix), 0.30, 0.95)
-        diag.update({"ban":ban_num,"until":ban_until,"reason":f"share={share:.2f} or reps={same_reps}","override":False})
-        return new_mix, diag
-
-    # sem ban
-    if ban_until < now and ban_num:
-        # limpa estado expirado
-        _kv_set("ban_num","0"); _kv_set("ban_until","0")
-    return mix, diag
-
-# ===== Controller FLOW =====
+# ================== Controller FLOW ==================
 def _ctl_load():
     con=_con(); row=con.execute("SELECT epsilon,min_conf,cool_after_losses,cool_secs,throttle_until,regime FROM neuroctl WHERE id=1").fetchone(); con.close()
     if not row: return 0.06, 0.58, 2, 180, 0, "neutral"
     return float(row["epsilon"]), float(row["min_conf"]), int(row["cool_after_losses"]), int(row["cool_secs"]), int(row["throttle_until"]), str(row["regime"])
 
 def _ctl_force_flow():
-    # sem cooldown
     con=_con()
     con.execute("""INSERT OR REPLACE INTO neuroctl(id,epsilon,min_conf,cool_after_losses,cool_secs,throttle_until,regime)
                    VALUES(1,?,?,999999,1,0,'flow')""",(CTL_EPSILON, CTL_MIN_CONF))
@@ -486,12 +498,14 @@ def _ctl_decide_slate(ranked:List[Tuple[int,float]], gap01:float)->Tuple[bool,st
     topn, topc = ranked[0]
     if topc < minc:
         return False, f"conf {topc:.2f} < min {minc:.2f} (flow)", -1
-    # ε-explore dentro do slate quando gap pequeno
-    if gap01 < 0.03 and random.random() < eps and len(ranked)>=2:
-        return True, f"explore ε={eps:.2f} (gap={gap01:.3f})", int(ranked[1][0])
+    # ε-explore quando gap pequeno
+    if gap01 < MIN_ALT_GAP and len(ranked)>=2:
+        # escolhe 2º em pequena fração das vezes
+        if random.random() < max(0.02, min(0.50, eps*1.1)):
+            return True, f"explore ε≈{eps:.2f} (gap={gap01:.3f})", int(ranked[1][0])
     return True, f"exploit (gap={gap01:.3f})", int(topn)
 
-# ===== decisão (ensemble + antibias + diversity guard + slate) =====
+# ================== Decisão (ensemble + antibias + guards + slate) ==================
 def _neural_decide_slate()->Tuple[List[Tuple[int,float]], int, Dict[int,float], float, str, dict, dict]:
     tail=_timeline_tail(400)
     # especialistas
@@ -514,20 +528,28 @@ def _neural_decide_slate()->Tuple[List[Tuple[int,float]], int, Dict[int,float], 
         mix[c] = wneu*p_nn.get(c,0) + w_stat*stat + w_f*p_fb.get(c,0) + w_t*p_t30.get(c,0)
     mix=_conf_floor(_norm(mix), 0.30, 0.95)
 
-    # anti-viés (suave)
+    # anti-viés
     adj, ab_diag = _antibias_adjust(mix)
-
-    # diversity guard (ban temporário da dominante se necessário)
-    top = max(adj, key=adj.get); top_conf=float(adj[top])
-    guarded, dg_diag = _diversity_guard(adj, top, top_conf)
+    # class guard
+    adj, cg_diag = _class_guard_adjust(adj)
+    # ban temporário
+    adj = _ban_apply(adj)
 
     # ranking + slate
-    ranked = sorted(guarded.items(), key=lambda kv: kv[1], reverse=True)
+    ranked = sorted(adj.items(), key=lambda kv: kv[1], reverse=True)
     ranked = [(int(n), float(p)) for n,p in ranked[:max(1,min(SLATE_K,4))]]
+
+    # class cooldown: evita grudar quando 2º está perto
+    last = _kv_get("last_suggested","")
+    reps = int(_kv_get("same_suggested_reps","0"))
+    if len(ranked) >= 2 and last.isdigit() and int(last) == ranked[0][0] and reps >= CLASS_COOLDOWN_REPS:
+        if (ranked[0][1] - ranked[1][1]) <= CLASS_COOLDOWN_DELTA:
+            ranked[0], ranked[1] = ranked[1], ranked[0]  # promove o 2º
+
     gap01 = (ranked[0][1] - ranked[1][1]) if len(ranked)>=2 else ranked[0][1]
     temp, wneu_cur, _=_load_neural_params()
     reason=f"ProfoundSim+Multi(w={wneu_cur:.2f},T={temp:.2f})"
-    return ranked, _timeline_size(), guarded, gap01, reason, ab_diag, dg_diag
+    return ranked, _timeline_size(), adj, gap01, reason, ab_diag, cg_diag
 
 def _ngram_snapshot(suggested:int)->str:
     tail=_timeline_tail(400); post=_post_e1_ngram(tail)
@@ -604,7 +626,7 @@ async def debug_cfg():
     freq=_lastk_freq(DIV_LASTK); dom=max(freq,key=freq.get); share=freq[dom]
     return {
         "MAX_GALE": MAX_GALE, "OBS_TIMEOUT_SEC": OBS_TIMEOUT_SEC, "DEDUP_WINDOW_SEC": DEDUP_WINDOW_SEC,
-        "neural_temp": temp, "neural_weight": wneu, "neural_bias": bias,
+        "neural_temp": temp, "neural_weight": wneu, "neural_bias": bias, "bias_clamp": BIAS_CLAMP,
         "ctl_epsilon": eps, "ctl_min_conf": minc, "ctl_cool_after_losses": coolN,
         "ctl_cool_secs": coolS, "ctl_throttle_until": thr, "ctl_regime": reg,
         "antibias": {
@@ -613,13 +635,10 @@ async def debug_cfg():
             "last_suggested": _kv_get("last_suggested",""),
             "same_suggested_reps": int(_kv_get("same_suggested_reps","0"))
         },
-        "divguard": {
-            "ban_if_share": DIV_BAN_SHARE, "ban_window": DIV_BAN_WINDOW,
-            "ban_cooldown_sec": DIV_BAN_COOLDOWN_SEC, "allow_if_conf_ge": DIV_ALLOW_IF_CONF_GE,
-            "ban_num": int(_kv_get('ban_num','0') or 0),
-            "ban_until": int(_kv_get('ban_until','0') or 0)
-        },
-        "slate": {"k": SLATE_K, "gap_max": SLATE_GAP_MAX, "min_conf": SLATE_MINCONF}
+        "slate": {"k": SLATE_K, "gap_max": SLATE_GAP_MAX, "min_conf": SLATE_MINCONF, "min_alt_gap": MIN_ALT_GAP},
+        "class_cooldown": {"reps": CLASS_COOLDOWN_REPS, "delta": CLASS_COOLDOWN_DELTA},
+        "class_guard": {"lastN": CLASS_GUARD_LASTN, "min_hit": CLASS_GUARD_MIN_HIT, "hardloss": CLASS_GUARD_HARDLOSS},
+        "ban_classes": _ban_get()
     }
 
 # ----- Admin helpers -----
@@ -643,26 +662,27 @@ async def admin_unlock():
     msg_txt=_pending_close("X","LOSS","G0",suggested)
     return {"ok": True, "forced_close": True, "message": msg_txt}
 
-@app.post("/admin/reset_bias")
-async def admin_reset_bias():
-    # zera vieses aprendidos e marcadores de repetição/ban
-    _save_neural_params(bias={1:0.0,2:0.0,3:0.0,4:0.0})
+@app.post("/admin/flush_bias")
+async def admin_flush_bias():
+    # zera bias, repetições e bans
+    _save_neural_params(bias={"1":0.0,"2":0.0,"3":0.0,"4":0.0})
     _kv_set("same_suggested_reps","0")
     _kv_set("last_suggested","")
-    _kv_set("ban_num","0")
-    _kv_set("ban_until","0")
-    return {"ok": True, "message": "neural bias & diversity guard resetados"}
+    _ban_set({})
+    return {"ok": True, "message": "bias/reset aplicado"}
 
-@app.get("/admin/antibias")
-async def admin_antibias():
-    freq=_lastk_freq(DIV_LASTK); dom=max(freq,key=freq.get)
-    return {
-        "freq_lastk": freq,
-        "dominant": dom,
-        "same_suggested_reps": int(_kv_get("same_suggested_reps","0") or 0),
-        "ban_num": int(_kv_get("ban_num","0") or 0),
-        "ban_until": int(_kv_get("ban_until","0") or 0)
-    }
+@app.post("/admin/retune")
+async def admin_retune():
+    _calibrate_from_score()
+    t,w,b=_load_neural_params()
+    return {"ok": True, "neural": {"temp":t, "weight":w, "bias":b}}
+
+@app.post("/admin/ban/{cls}/{plays}")
+async def admin_ban(cls: int, plays: int):
+    cls=int(cls); plays=int(plays)
+    if cls not in (1,2,3,4): return {"ok": False, "error":"classe inválida"}
+    b=_ban_get(); b[str(cls)]=max(1,plays); _ban_set(b)
+    return {"ok": True, "message": f"classe {cls} banida por {plays} jogadas", "ban": b}
 
 # ================== Webhook ==================
 @app.post("/webhook/{token}")
@@ -694,7 +714,7 @@ async def webhook(token: str, request: Request):
 
     # -------- ANALISANDO --------
     if RX_ANALISE.search(text):
-        if _seen_recent("analise", _dedupe_key(text)):  # evita spam
+        if _seen_recent("analise", _dedupe_key(text)):
             return {"ok": True, "skipped": "analise_dupe"}
         seq=_parse_seq_list(text)
         if seq: _append_seq(seq)
@@ -746,8 +766,8 @@ async def webhook(token: str, request: Request):
         # “analisando…”
         analyzing_id = await tg_send_return(TARGET_CHANNEL, "⏳ Analisando padrão, aguarde...")
 
-        # decisão com slate (já com antibias + diversity guard)
-        ranked, samples, mix, gap01, reason, ab_diag, dg_diag = _neural_decide_slate()
+        # decisão com slate
+        ranked, samples, mix, gap01, reason, ab_diag, cg_diag = _neural_decide_slate()
 
         # filtra slate por thresholds
         slate = [(n,p) for (n,p) in ranked if p >= SLATE_MINCONF]
@@ -763,24 +783,21 @@ async def webhook(token: str, request: Request):
         opened=_pending_open(suggested)
         if opened:
             aft_txt=f" após {after}" if after else ""
-            # linha de alternativas
             alt_txt=""
             if len(slate)>=2 and gap01 <= SLATE_GAP_MAX:
                 alts = ", ".join([f"{n}({p*100:.1f}%)" for n,p in slate[1:3]])
                 alt_txt=f"\n🅱️ <b>Opções curto/médio:</b> {alts}"
 
-            dg_info = f"ban={dg_diag['ban']} até {dg_diag['until']} ({dg_diag['reason']})" if dg_diag['ban']!='none' else "ban=none"
-
             txt=(f"🤖 <b>IA SUGERE</b> — <b>{suggested}</b>\n"
                  f"🧩 <b>Padrão:</b> GEN{aft_txt}\n"
                  f"📊 <b>Conf:</b> {slate[0][1]*100:.2f}% | <b>Amostra≈</b>{samples} | <b>gap≈</b>{gap01*100:.1f}pp\n"
                  f"🧠 <b>Modo:</b> {reason} · flow\n"
-                 f"♻️ <i>anti-viés:</i> dom={ab_diag['dominant']}({ab_diag['dominant_share']*100:.1f}%), rep={ab_diag['same_reps']} • {ab_diag['applied']} • {dg_info}"
-                 f"{alt_txt}\n"
+                 f"♻️ <i>anti-viés:</i> dom={ab_diag['dominant']}({ab_diag['dominant_share']*100:.1f}%), rep={ab_diag['same_reps']} • {ab_diag['applied']}\n"
+                 f"🛡️ <i>class-guard:</i> acc={cg_diag['acc']*100:.1f}% • {cg_diag['applied']}{alt_txt}\n"
                  f"{_ngram_snapshot(suggested)}")
             await tg_send(TARGET_CHANNEL, txt)
             if analyzing_id is not None: await tg_delete(TARGET_CHANNEL, analyzing_id)
-            if SHOW_DEBUG: await tg_send(TARGET_CHANNEL, f"DEBUG: Entrada aberta (FLOW slate + divguard).")
+            if SHOW_DEBUG: await tg_send(TARGET_CHANNEL, f"DEBUG: Entrada aberta (FLOW slate).")
             return {"ok": True, "entry_opened": True, "best": suggested, "conf": slate[0][1], "gap": gap01}
         else:
             if analyzing_id is not None: await tg_delete(TARGET_CHANNEL, analyzing_id)
