@@ -2,53 +2,24 @@ services:
   - type: web
     name: guardiao-auto-bot
     env: python
-    buildCommand: pip install fastapi uvicorn httpx
+    plan: starter
+    buildCommand: pip install -r requirements.txt
     startCommand: uvicorn webhook_app:app --host 0.0.0.0 --port $PORT
-    plan: free
+    autoDeploy: true
+    disk:
+      name: data
+      mountPath: /opt/render/project/src
+      sizeGB: 2
     envVars:
       - key: TG_BOT_TOKEN
-        value: "8315698154:AAH38hr2RbR0DtfalMNuXdGsh4UghDeztK4"
+        sync: false
       - key: WEBHOOK_TOKEN
-        value: "meusegredo2"
+        sync: false
       - key: SOURCE_CHANNEL
-        value: "-1002810508717"
+        sync: false
       - key: TARGET_CHANNEL
-        value: "-1003052132833"
+        sync: false
       - key: SHOW_DEBUG
-        value: "True"         # coloque "False" p/ não enviar DEBUG
+        value: "True"
       - key: MAX_GALE
         value: "0"
-      - key: OBS_TIMEOUT_SEC
-        value: "420"
-      - key: DEDUP_WINDOW_SEC
-        value: "40"
-      - key: CTL_MIN_CONF
-        value: "0.72"
-      - key: CTL_EPSILON
-        value: "0.08"
-      - key: SLATE_K
-        value: "3"
-      - key: SLATE_GAP_MAX
-        value: "0.15"
-      - key: SLATE_MINCONF
-        value: "0.18"
-      - key: DIVERSITY_LASTK
-        value: "30"
-      - key: DIVERSITY_MAX_SHARE
-        value: "0.36"
-      - key: DIVERSITY_MAX_SAME
-        value: "2"
-      - key: ANTIENTROPY_PUSH
-        value: "0.12"
-      - key: CLASS_COOLDOWN_REPS
-        value: "2"
-      - key: CLASS_COOLDOWN_DELTA
-        value: "0.06"
-      - key: HARD_BLOCK_SHARE
-        value: "0.32"
-      - key: HARD_BLOCK_REPS
-        value: "2"
-      - key: HARD_BLOCK_FACTOR
-        value: "0.20"
-      - key: HARD_MARGIN
-        value: "0.04"
