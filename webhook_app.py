@@ -2,15 +2,16 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v7.6.0 flow-keeper (fibo fino-curta + regulador interno + check + hotfix parênteses)
+v7.5.1-flow-slate-antibias (G0-only)
 
-- Fecha G0 pelo ÚLTIMO dígito 1..4 no ÚLTIMO par de (), [] ou {} (também （）【】)
-- Ensemble: ProfoundSim + (curto, médio, longo, n-gram) + Fibo10 + FiboFino (5,8,13,21,34) + T30
-- Anti-viés (dominância/repetições) + empurrão de entropia
-- Slate de opções (top-K) + ClassCooldown
-- NeuroController FLOW com IA reguladora (auto-tuning de min_conf + peso neural) e “kill-switch” curto
-- Reforço leve (EMA) por classe
-- Timeout de pendência (anti-trava) e dedupe
+- Fecha G0 pelo último número entre parênteses no fechamento
+- Ensemble: ProfoundSim (neural leve) + (curto, médio, longo, n-gram) + Fibo5 + Fibo10 + T30
+- Anti-viés (dominância / repetições) + empurrão de entropia
+- Slate (top-K): primário + alternativas curto/médio (quando gap pequeno)
+- ClassCooldown: evita grudar no mesmo número quando gap é pequeno
+- FLOW: sem cooldown; corte por confiança apenas para descartar sinal fraco
+- Reforço leve (EMA) por classe + auto-calibração de temperatura/peso
+- Anti-trava: timeout de pendência (fecha como LOSS G0 X) + dedupe por conteúdo
 - Admin: /health /debug_cfg /admin/status /admin/unlock
 """
 
@@ -20,20 +21,20 @@ from typing import List, Dict, Optional, Tuple
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 
-# ================== ENV (com defaults internos) ==================
+# ================== ENV ==================
 TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
 WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
 SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "").strip()
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "").strip()
 
 SHOW_DEBUG       = os.getenv("SHOW_DEBUG", "False").strip().lower() == "true"
-MAX_GALE         = int(os.getenv("MAX_GALE", "0"))        # G0-only
+MAX_GALE         = int(os.getenv("MAX_GALE", "0"))        # G0-only neste build
 OBS_TIMEOUT_SEC  = int(os.getenv("OBS_TIMEOUT_SEC", "420"))
 DEDUP_WINDOW_SEC = int(os.getenv("DEDUP_WINDOW_SEC", "40"))
 
-# Controller FLOW (piso; regulador ajusta live)
-CTL_MIN_CONF_BASE = float(os.getenv("CTL_MIN_CONF", "0.66"))
-CTL_EPSILON       = float(os.getenv("CTL_EPSILON", "0.08"))
+# Controller FLOW
+CTL_MIN_CONF     = float(os.getenv("CTL_MIN_CONF", "0.72"))
+CTL_EPSILON      = float(os.getenv("CTL_EPSILON", "0.08"))
 
 # Slate (opções alternativas)
 SLATE_K          = int(os.getenv("SLATE_K", "3"))          # 1..4
@@ -46,27 +47,17 @@ DIV_MAX_SHARE   = float(os.getenv("DIVERSITY_MAX_SHARE", "0.36"))
 DIV_MAX_SAME    = int(os.getenv("DIVERSITY_MAX_SAME", "2"))
 ENTROPY_PUSH    = float(os.getenv("ANTIENTROPY_PUSH", "0.12"))
 
-# ClassCooldown
+# ClassCooldown (promove 2º lugar se repetindo e gap pequeno)
 CLASS_COOLDOWN_REPS  = int(os.getenv("CLASS_COOLDOWN_REPS", "2"))
 CLASS_COOLDOWN_DELTA = float(os.getenv("CLASS_COOLDOWN_DELTA", "0.06"))
 
-# Regulador interno (tudo com default interno; pode sobrescrever via EV)
-REG_TARGET_ACC    = float(os.getenv("REG_TARGET_ACC", "0.58"))
-REG_WIN           = int(os.getenv("REG_WIN", "120"))
-REG_MIN_CONF_BASE = float(os.getenv("REG_MIN_CONF_BASE","0.62"))
-REG_MIN_CONF_MAX  = float(os.getenv("REG_MIN_CONF_MAX","0.82"))
-REG_WNEU_MINMAX   = os.getenv("REG_WNEU_MINMAX","0.55,0.85")
-REG_KILL_AFTER_L  = int(os.getenv("REG_KILL_AFTER_L","4"))
-REG_KILL_SECS     = int(os.getenv("REG_KILL_SECS","180"))
-
-# Guardas obrigatórias mínimas (token + destino)
 if not TG_BOT_TOKEN or not WEBHOOK_TOKEN or not TARGET_CHANNEL:
     raise RuntimeError("Faltam ENV: TG_BOT_TOKEN, WEBHOOK_TOKEN, TARGET_CHANNEL.")
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 DB_PATH = "/opt/render/project/src/main.sqlite"
 
 # ================== APP ==================
-app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.6.0-flow-keeper")
+app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.5.1-flow-slate-antibias")
 
 # ================== DB ==================
 def _con():
@@ -101,11 +92,11 @@ def db_init():
     cur.execute("""CREATE TABLE IF NOT EXISTS neuroctl(
         id INTEGER PRIMARY KEY CHECK(id=1),
         epsilon REAL DEFAULT 0.06,
-        min_conf REAL DEFAULT 0.66,
-        cool_after_losses INTEGER DEFAULT 999999,
-        cool_secs INTEGER DEFAULT 1,
+        min_conf REAL DEFAULT 0.58,
+        cool_after_losses INTEGER DEFAULT 2,
+        cool_secs INTEGER DEFAULT 180,
         throttle_until INTEGER DEFAULT 0,
-        regime TEXT DEFAULT 'flow')""")
+        regime TEXT DEFAULT 'neutral')""")
     cur.execute("""CREATE TABLE IF NOT EXISTS meta(
         k TEXT PRIMARY KEY, v TEXT
     )""")
@@ -114,8 +105,7 @@ def db_init():
     if not con.execute("SELECT 1 FROM neural WHERE id=1").fetchone():
         con.execute("INSERT INTO neural(id,temp,bias_json,weight_neural) VALUES(1,0.85,'{\"1\":0.0,\"2\":0.0,\"3\":0.0,\"4\":0.0}',0.70)")
     if not con.execute("SELECT 1 FROM neuroctl WHERE id=1").fetchone():
-        con.execute("INSERT INTO neuroctl(id,epsilon,min_conf,cool_after_losses,cool_secs,throttle_until,regime) VALUES(1,?,?,999999,1,0,'flow')",
-                    (CTL_EPSILON, CTL_MIN_CONF_BASE))
+        con.execute("INSERT INTO neuroctl(id,epsilon,min_conf,cool_after_losses,cool_secs,throttle_until,regime) VALUES(1,0.06,0.58,2,180,0,'neutral')")
     con.commit(); con.close()
 db_init()
 
@@ -178,6 +168,7 @@ def _pending_open(suggested:int):
     con.execute("""INSERT INTO pending(created_at,opened_at,suggested,seen,open)
                    VALUES(?,?,?,?,1)""",(now,now,int(suggested),""))
     con.commit(); con.close()
+    # rastreia repetições do mesmo sugerido
     last=_kv_get("last_suggested","")
     reps=int(_kv_get("same_suggested_reps","0"))
     if last.isdigit() and int(last)==int(suggested): reps+=1
@@ -230,10 +221,53 @@ def _seen_recent(kind:str,dkey:str)->bool:
     con.execute("INSERT OR REPLACE INTO dedupe(kind,dkey,ts) VALUES (?,?,?)",(kind,dkey,now))
     con.commit(); con.close(); return False
 
-# ===== utils =====
+# ===== especialistas =====
 def _norm(d:Dict[int,float])->Dict[int,float]:
     s=sum(d.values()) or 1e-9
     return {k:v/s for k,v in d.items()}
+
+def _post_freq(tail:List[int], k:int)->Dict[int,float]:
+    if not tail: return {1:0.25,2:0.25,3:0.25,4:0.25}
+    win=tail[-k:] if len(tail)>=k else tail
+    tot=max(1,len(win))
+    return _norm({c:win.count(c)/tot for c in (1,2,3,4)})
+
+def _post_e1_ngram(tail:List[int])->Dict[int,float]:
+    mix={c:0.0 for c in (1,2,3,4)}
+    for k,w in ((8,0.25),(21,0.35),(55,0.40)):
+        pk=_post_freq(tail,k)
+        for c in (1,2,3,4): mix[c]+=w*pk[c]
+    return _norm(mix)
+
+def _post_e2_short(tail):  return _post_freq(tail, 40)    # curto
+def _post_e3_mid(tail):    return _post_freq(tail, 120)   # médio
+def _post_e4_long(tail):   return _post_freq(tail, 300)   # longo
+
+def _e_fibo5(tail:List[int])->Dict[int,float]:
+    if not tail: return {1:0.25,2:0.25,3:0.25,4:0.25}
+    wins=(5,8,13,21,34)
+    mix={c:0.0 for c in (1,2,3,4)}
+    for k in wins:
+        win=tail[-k:] if len(tail)>=k else tail
+        best=max((1,2,3,4), key=lambda c: win.count(c))
+        mix[best]+=1.0
+    return _norm(mix)
+
+def _e_fibo10(tail:List[int])->Dict[int,float]:
+    if not tail: return {1:0.25,2:0.25,3:0.25,4:0.25}
+    wins=(10,21,34,55)
+    mix={c:0.0 for c in (1,2,3,4)}
+    for k in wins:
+        win=tail[-k:] if len(tail)>=k else tail
+        best=max((1,2,3,4), key=lambda c: win.count(c))
+        mix[best]+=1.0
+    return _norm(mix)
+
+def _e_t30()->Dict[int,float]:
+    m=int(datetime.datetime.utcnow().timestamp()//1800)
+    vals=[(m*i*17)%100 for i in (1,2,3,4)]
+    s=sum(vals) or 1
+    return {i+1: vals[i]/s for i in range(4)}
 
 def _conf_floor(post:Dict[int,float], floor=0.30, cap=0.95):
     post=_norm({c:float(post.get(c,0)) for c in (1,2,3,4)})
@@ -252,53 +286,7 @@ def _conf_floor(post:Dict[int,float], floor=0.30, cap=0.95):
             if c!=b: post[c]+=add
     return _norm(post)
 
-# ===== especialistas =====
-def _post_freq(tail:List[int], k:int)->Dict[int,float]:
-    if not tail: return {1:0.25,2:0.25,3:0.25,4:0.25}
-    win=tail[-k:] if len(tail)>=k else tail
-    tot=max(1,len(win))
-    return _norm({c:win.count(c)/tot for c in (1,2,3,4)})
-
-def _post_e1_ngram(tail:List[int])->Dict[int,float]:
-    mix={c:0.0 for c in (1,2,3,4)}
-    for k,w in ((8,0.25),(21,0.35),(55,0.40)):
-        pk=_post_freq(tail,k)
-        for c in (1,2,3,4): mix[c]+=w*pk[c]
-    return _norm(mix)
-
-def _post_e2_short(tail):  return _post_freq(tail, 40)   # curto
-def _post_e3_mid(tail):    return _post_freq(tail, 120)  # médio
-def _post_e4_long(tail):   return _post_freq(tail, 300)  # longo
-
-def _e_fibo10(tail:List[int])->Dict[int,float]:
-    if not tail: return {1:0.25,2:0.25,3:0.25,4:0.25}
-    wins=(10,21,34,55)
-    mix={c:0.0 for c in (1,2,3,4)}
-    for k in wins:
-        win=tail[-k:] if len(tail)>=k else tail
-        best=max((1,2,3,4), key=lambda c: win.count(c))
-        mix[best]+=1.0
-    return _norm(mix)
-
-def _e_fibo_multi(tail: List[int]) -> Dict[int, float]:
-    if not tail: return {1:0.25,2:0.25,3:0.25,4:0.25}
-    wins = (5, 8, 13, 21, 34)
-    votes = {1:0.0,2:0.0,3:0.0,4:0.0}
-    for k in wins:
-        win = tail[-k:] if len(tail) >= k else tail
-        if not win: 
-            continue
-        best = max((1,2,3,4), key=lambda c: win.count(c))
-        votes[best] += 1.0
-    return _norm(votes)
-
-def _e_t30()->Dict[int,float]:
-    m=int(datetime.datetime.utcnow().timestamp()//1800)
-    vals=[(m*i*17)%100 for i in (1,2,3,4)]
-    s=sum(vals) or 1
-    return {i+1: vals[i]/s for i in range(4)}
-
-# ===== ProfoundSim (neural offline) =====
+# ===== ProfoundSim (neural leve) =====
 def _load_neural_params():
     con=_con(); row=con.execute("SELECT temp,bias_json,weight_neural FROM neural WHERE id=1").fetchone(); con.close()
     temp=float(row["temp"] if row else 0.85)
@@ -345,7 +333,7 @@ def _features_from_tail(tail:List[int])->List[float]:
     return freq+wins+tn+streaks+[var/3.0, ent/1.4]
 
 def _profoundsim_logits(feat:List[float], seed_base:int)->List[float]:
-    H=512
+    H=384
     h=[0.0]*H
     for i in range(H):
         s=0.0
@@ -353,7 +341,7 @@ def _profoundsim_logits(feat:List[float], seed_base:int)->List[float]:
             seed=seed_base + i*131 + j*17
             w=math.sin(seed*0.000113)*math.cos(seed*0.000071)
             s += f*w
-        h[i]=math.tanh(1.2*s + 0.15*math.sin(s*3.0))
+        h[i]=math.tanh(1.15*s + 0.12*math.sin(s*3.0))
     logits=[0.0]*4
     for c in range(4):
         s=0.0
@@ -419,16 +407,13 @@ def _antibias_adjust(mix:Dict[int,float])->Tuple[Dict[int,float],dict]:
 
     adjusted=dict(mix)
     parts=[]
-
     if share > DIV_MAX_SHARE:
         excess = min(0.30, max(0.0, share - DIV_MAX_SHARE))
         adjusted[dom] = max(0.0, adjusted.get(dom,0.0) * (1.0 - 0.9*excess))
         parts.append(f"share{dom}>{DIV_MAX_SHARE:.2f}")
-
     if last.isdigit() and int(last)==dom and same_reps >= DIV_MAX_SAME:
         adjusted[dom] = max(0.0, adjusted.get(dom,0.0) * 0.55)
         parts.append(f"same_reps={same_reps}")
-
     if ENTROPY_PUSH > 0:
         adjusted = _entropy_mix(adjusted, ENTROPY_PUSH)
         parts.append(f"H{ENTROPY_PUSH:.2f}")
@@ -438,56 +423,21 @@ def _antibias_adjust(mix:Dict[int,float])->Tuple[Dict[int,float],dict]:
                  "same_reps":same_reps,"applied":" & ".join(parts) if parts else "none"})
     return adjusted, diag
 
-# ===== Controller FLOW + Regulador =====
+# ===== Controller FLOW =====
 def _ctl_load():
     con=_con(); row=con.execute("SELECT epsilon,min_conf,cool_after_losses,cool_secs,throttle_until,regime FROM neuroctl WHERE id=1").fetchone(); con.close()
-    if not row: return CTL_EPSILON, CTL_MIN_CONF_BASE, 999999, 1, 0, "flow"
+    if not row: return 0.06, 0.58, 2, 180, 0, "neutral"
     return float(row["epsilon"]), float(row["min_conf"]), int(row["cool_after_losses"]), int(row["cool_secs"]), int(row["throttle_until"]), str(row["regime"])
 
-def _ctl_force_flow(new_min_conf: Optional[float]=None):
-    eps, minc, *_ = _ctl_load()
-    if new_min_conf is None: new_min_conf = minc
+def _ctl_force_flow():
+    # sem cooldown
     con=_con()
     con.execute("""INSERT OR REPLACE INTO neuroctl(id,epsilon,min_conf,cool_after_losses,cool_secs,throttle_until,regime)
-                   VALUES(1,?,?,999999,1,
-                          COALESCE((SELECT throttle_until FROM neuroctl WHERE id=1),0),'flow')""",
-                (CTL_EPSILON, float(new_min_conf)))
+                   VALUES(1,?,?,999999,1,0,'flow')""",(CTL_EPSILON, CTL_MIN_CONF))
     con.commit(); con.close()
 
-def _rolling_stats(win:int=REG_WIN):
-    con=_con()
-    row=con.execute("SELECT green,loss,streak_green,streak_loss FROM score WHERE id=1").fetchone()
-    con.close()
-    g = int(row["green"]) if row else 0
-    l = int(row["loss"]) if row else 0
-    ls = int(row["streak_loss"]) if row else 0
-    tot=max(1,g+l)
-    return g/tot, ls, tot
-
-def _regulator_autotune():
-    acc, ls, _ = _rolling_stats(REG_WIN)
-
-    # kill-switch curto
-    if ls >= REG_KILL_AFTER_L:
-        until = int(time.time()) + REG_KILL_SECS
-        con=_con()
-        con.execute("""UPDATE neuroctl SET throttle_until=?, regime='cooldown' WHERE id=1""", (until,))
-        con.commit(); con.close()
-
-    # min_conf dinâmico
-    eps, minc, *_ = _ctl_load()
-    gap = REG_TARGET_ACC - acc  # >0: abaixo do alvo
-    new_minc = min(REG_MIN_CONF_MAX, max(REG_MIN_CONF_BASE, minc + 0.10*gap))
-
-    # peso neural dinâmico
-    wmin, wmax = [float(x) for x in REG_WNEU_MINMAX.split(",")]
-    temp, wneu, _ = _load_neural_params()
-    new_wneu = min(wmax, max(wmin, wneu + 0.30*gap))
-    _save_neural_params(temp=temp, wneu=new_wneu, bias=None)
-
-    _ctl_force_flow(new_minc)
-
 def _ctl_decide_slate(ranked:List[Tuple[int,float]], gap01:float)->Tuple[bool,str,int]:
+    _ctl_force_flow()
     eps, minc, *_ = _ctl_load()
     topn, topc = ranked[0]
     if topc < minc:
@@ -496,45 +446,49 @@ def _ctl_decide_slate(ranked:List[Tuple[int,float]], gap01:float)->Tuple[bool,st
         return True, f"explore ε={eps:.2f} (gap={gap01:.3f})", int(ranked[1][0])
     return True, f"exploit (gap={gap01:.3f})", int(topn)
 
-# ======== Parser robusto de fechamento ========
-RX_ENTRADA = re.compile(r"(💰\s*)?ENTRADA.*CONFIRMADA|ENTRADA\s*OK", re.I)
-RX_ANALISE = re.compile(r"\bANALIS(A|Á)NDO\b|ANALISE|🧩", re.I)
-RX_FECHA   = re.compile(r"APOSTA.*ENCERRADA|RESULTADO|GREEN|RED|✅|❌", re.I)
+# ===== decisão (ensemble + antibias + slate + class cooldown) =====
+def _neural_decide_slate()->Tuple[List[Tuple[int,float]], int, Dict[int,float], float, str, dict]:
+    tail=_timeline_tail(400)
+    # especialistas
+    p_cur=_post_e2_short(tail)
+    p_mid=_post_e3_mid(tail)
+    p_lon=_post_e4_long(tail)
+    p_ng =_post_e1_ngram(tail)
+    p_f5 =_e_fibo5(tail)
+    p_f10=_e_fibo10(tail)
+    p_t30=_e_t30()
+    p_nn =_neural_probs(tail)
+    # pesos
+    _, wneu, _=_load_neural_params()
+    rest=1.0 - wneu
+    w_stat=0.50*rest     # (curto/médio/longo/ngram)
+    w_f   =0.30*rest     # (Fibo5 + Fibo10)
+    w_t   =0.20*rest     # T30
+    mix={}
+    for c in (1,2,3,4):
+        stat = 0.40*p_cur.get(c,0)+0.35*p_mid.get(c,0)+0.15*p_lon.get(c,0)+0.10*p_ng.get(c,0)
+        fibo = 0.55*p_f5.get(c,0)+0.45*p_f10.get(c,0)
+        mix[c] = wneu*p_nn.get(c,0) + w_stat*stat + w_f*fibo + w_t*p_t30.get(c,0)
+    mix=_conf_floor(_norm(mix), 0.30, 0.95)
 
-RX_SEQ     = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
-RX_NUMS    = re.compile(r"[1-4]")
-RX_AFTER   = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
+    # anti-viés
+    adj, ab_diag = _antibias_adjust(mix)
 
-RX_PAREN_ANY = re.compile(r"[\(\[\{（【]([^)\]\}）】]*)[)\]\}）】]")
-RX_LAST_PAREN_END = re.compile(
-    r"[\(\[\{（【]\s*([^)\]\}）】]*?)\s*[)\]\}）】]\s*(?:✅|❌|GREEN|RED)?\s*$",
-    re.I | re.M
-)
+    # ranking + slate
+    ranked = sorted(adj.items(), key=lambda kv: kv[1], reverse=True)
+    ranked = [(int(n), float(p)) for n,p in ranked[:max(1,min(SLATE_K,4))]]
 
-def _strip_noise(s: str) -> str:
-    return (s or "").replace("\u200d","").replace("\u200c","").replace("\ufe0f","").strip()
+    # ClassCooldown: evita grudar no mesmo topo
+    last = _kv_get("last_suggested","")
+    reps = int(_kv_get("same_suggested_reps","0"))
+    if len(ranked) >= 2 and last.isdigit() and int(last) == ranked[0][0] and reps >= CLASS_COOLDOWN_REPS:
+        if (ranked[0][1] - ranked[1][1]) <= CLASS_COOLDOWN_DELTA:
+            ranked[0], ranked[1] = ranked[1], ranked[0]  # promove o 2º
 
-def _extract_last_digit_1_4(chunk: str) -> Optional[int]:
-    nums = re.findall(r"[1-4]", chunk or "")
-    return int(nums[-1]) if nums else None
-
-def _parse_seq_list(text:str)->List[int]:
-    m=RX_SEQ.search(text or "");  return [int(x) for x in RX_NUMS.findall(m.group(1))] if m else []
-
-def _parse_after(text:str)->Optional[int]:
-    m=RX_AFTER.search(text or "");  return int(m.group(1)) if m else None
-
-def _parse_close_digit(text: str) -> Optional[int]:
-    t = _strip_noise(text)
-    tail = list(RX_LAST_PAREN_END.finditer(t))
-    if tail:
-        d = _extract_last_digit_1_4(tail[-1].group(1))
-        if d is not None: return d
-    anyp = list(RX_PAREN_ANY.finditer(t))
-    if anyp:
-        d = _extract_last_digit_1_4(anyp[-1].group(1))
-        if d is not None: return d
-    return None
+    gap01 = (ranked[0][1] - ranked[1][1]) if len(ranked)>=2 else ranked[0][1]
+    temp, wneu_cur, _=_load_neural_params()
+    reason=f"ProfoundSim+Multi(w={wneu_cur:.2f},T={temp:.2f})"
+    return ranked, _timeline_size(), adj, gap01, reason, ab_diag
 
 def _ngram_snapshot(suggested:int)->str:
     tail=_timeline_tail(400); post=_post_e1_ngram(tail)
@@ -542,62 +496,7 @@ def _ngram_snapshot(suggested:int)->str:
     p1,p2,p3,p4=pct(post[1]),pct(post[2]),pct(post[3]),pct(post[4])
     conf=pct(post.get(int(suggested),0.0))
     return (f"📈 Amostra: {_timeline_size()} • Conf: {conf}\n"
-            f"🔎 E1(n-gram proxy): 1 {p1} | 2 {p2} | 3 {p3} | 4 {p4}")
-
-# ===== decisão (ensemble + antibias + slate + class cooldown + CHECK) =====
-def _neural_decide_slate()->Tuple[List[Tuple[int,float]], int, Dict[int,float], float, str, dict]:
-    _regulator_autotune()  # auto-tuning a cada decisão
-
-    tail=_timeline_tail(400)
-    p_cur=_post_e2_short(tail)
-    p_mid=_post_e3_mid(tail)
-    p_lon=_post_e4_long(tail)
-    p_ng =_post_e1_ngram(tail)
-    p_fb =_e_fibo10(tail)
-    p_ff =_e_fibo_multi(tail)   # fino-curta
-    p_t30=_e_t30()
-    p_nn =_neural_probs(tail)
-
-    _, wneu, _=_load_neural_params()
-    rest=1.0 - wneu
-    w_stat=0.55*rest
-    w_f   =0.25*rest
-    w_t   =0.20*rest
-
-    mix={}
-    for c in (1,2,3,4):
-        stat = 0.40*p_cur.get(c,0)+0.35*p_mid.get(c,0)+0.15*p_lon.get(c,0)+0.10*p_ng.get(c,0)
-        fibs = 0.60*p_fb.get(c,0)+0.40*p_ff.get(c,0)   # fibo10 + fino-curta
-        mix[c] = wneu*p_nn.get(c,0) + w_stat*stat + w_f*fibs + w_t*p_t30.get(c,0)
-    mix=_conf_floor(_norm(mix), 0.30, 0.95)
-
-    # --- CHECK Neural×Fibo: boost se concordam; corta leve se divergem
-    nn_top = max(p_nn, key=p_nn.get)
-    ff_top = max(p_ff, key=p_ff.get)
-    agree  = int(nn_top == ff_top)
-    mix2 = {}
-    for c in (1,2,3,4):
-        mix2[c] = mix[c] * (1.10 if (agree and c==nn_top) else 1.0)
-    if not agree:
-        topc = max(mix2, key=mix2.get)
-        mix2[topc] *= 0.92
-    mix = _conf_floor(_norm(mix2), 0.30, 0.95)
-
-    adj, ab_diag = _antibias_adjust(mix)
-
-    ranked = sorted(adj.items(), key=lambda kv: kv[1], reverse=True)
-    ranked = [(int(n), float(p)) for n,p in ranked[:max(1,min(SLATE_K,4))]]
-
-    last = _kv_get("last_suggested","")
-    reps = int(_kv_get("same_suggested_reps","0"))
-    if len(ranked) >= 2 and last.isdigit() and int(last) == ranked[0][0] and reps >= CLASS_COOLDOWN_REPS:
-        if (ranked[0][1] - ranked[1][1]) <= CLASS_COOLDOWN_DELTA:
-            ranked[0], ranked[1] = ranked[1], ranked[0]
-
-    gap01 = (ranked[0][1] - ranked[1][1]) if len(ranked)>=2 else ranked[0][1]
-    temp, wneu_cur, _=_load_neural_params()
-    reason=f"ProfoundSim+Multi(w={wneu_cur:.2f},T={temp:.2f}) · check={'OK' if agree else 'mix'}"
-    return ranked, _timeline_size(), adj, gap01, reason, ab_diag
+            f"🔎 E1(n-gram): 1 {p1} | 2 {p2} | 3 {p3} | 4 {p4}")
 
 # ================== Telegram ==================
 async def tg_send(chat_id: str, text: str, parse="HTML"):
@@ -627,7 +526,30 @@ async def tg_delete(chat_id: str, message_id: int):
                            json={"chat_id": chat_id, "message_id": int(message_id)})
     except Exception: pass
 
-# ================== Webhook ==================
+# ================== Parser ==================
+RX_ENTRADA = re.compile(r"(💰\s*)?ENTRADA.*CONFIRMADA|ENTRADA\s*OK", re.I)
+RX_ANALISE = re.compile(r"\bANALIS(A|Á)NDO\b|ANALISE|🧩", re.I)
+RX_FECHA   = re.compile(r"APOSTA.*ENCERRADA|RESULTADO|GREEN|RED|✅|❌", re.I)
+
+RX_SEQ     = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
+RX_NUMS    = re.compile(r"[1-4]")
+RX_AFTER   = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
+RX_PAREN   = re.compile(r"\(([^\)]*)\)")
+
+def _parse_seq_list(text:str)->List[int]:
+    m=RX_SEQ.search(text or "");  return [int(x) for x in RX_NUMS.findall(m.group(1))] if m else []
+
+def _parse_after(text:str)->Optional[int]:
+    m=RX_AFTER.search(text or "");  return int(m.group(1)) if m else None
+
+def _parse_paren_last_one(text:str)->Optional[int]:
+    nums=[]
+    for m in RX_PAREN.finditer(text or ""):
+        nums_in=[int(x) for x in RX_NUMS.findall(m.group(1))]
+        if nums_in: nums.append(nums_in[-1])
+    return nums[-1] if nums else None
+
+# ================== Rotas básicas ==================
 @app.get("/")
 async def root():
     return {"ok": True, "service": "GuardiAo Auto Bot", "time": datetime.datetime.utcnow().isoformat()+"Z"}
@@ -656,6 +578,7 @@ async def debug_cfg():
         "class_cooldown": {"reps": CLASS_COOLDOWN_REPS, "delta": CLASS_COOLDOWN_DELTA}
     }
 
+# ----- Admin helpers -----
 @app.get("/admin/status")
 async def admin_status():
     pend=_pending_get()
@@ -676,6 +599,7 @@ async def admin_unlock():
     msg_txt=_pending_close("X","LOSS","G0",suggested)
     return {"ok": True, "forced_close": True, "message": msg_txt}
 
+# ================== Webhook ==================
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
     if token != WEBHOOK_TOKEN:
@@ -705,13 +629,13 @@ async def webhook(token: str, request: Request):
 
     # -------- ANALISANDO --------
     if RX_ANALISE.search(text):
-        if _seen_recent("analise", _dedupe_key(text)):
+        if _seen_recent("analise", _dedupe_key(text)):  # evita spam de “analisando…”
             return {"ok": True, "skipped": "analise_dupe"}
         seq=_parse_seq_list(text)
         if seq: _append_seq(seq)
         return {"ok": True, "analise_seq": len(seq)}
 
-    # -------- FECHAMENTO --------
+    # -------- FECHAMENTO (G0 pelo último número entre parênteses) --------
     if RX_FECHA.search(text):
         if _seen_recent("fechamento", _dedupe_key(text)):
             return {"ok": True, "skipped": "fechamento_dupe"}
@@ -719,21 +643,14 @@ async def webhook(token: str, request: Request):
         pend=_pending_get()
         if pend:
             suggested=int(pend["suggested"] or 0)
-            obs=_parse_close_digit(text)
-            if obs is not None:
-                _pending_seen_set(str(obs))
-
+            obs=_parse_paren_last_one(text)   # pega só o último (G0)
+            if obs is not None: _pending_seen_set(str(obs))
             seen=(_pending_get()["seen"] or "").strip()
             outcome="LOSS"; stage_lbl="G0"
             if seen.isdigit() and int(seen)==suggested: outcome="GREEN"
             final_seen=seen if seen else "X"
-
             msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
             if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
-
-            if SHOW_DEBUG:
-                await tg_send(TARGET_CHANNEL, f"DEBUG: fechamento capturado -> {obs} | seen='{final_seen}' | nosso={suggested}")
-
             return {"ok": True, "closed": outcome, "seen": final_seen}
 
         if SHOW_DEBUG: await tg_send(TARGET_CHANNEL, "DEBUG: Fechamento reconhecido — sem pendência.")
@@ -763,13 +680,6 @@ async def webhook(token: str, request: Request):
 
         # “analisando…”
         analyzing_id = await tg_send_return(TARGET_CHANNEL, "⏳ Analisando padrão, aguarde...")
-
-        # kill-switch ativo?
-        _,_,_,_,thr,reg = _ctl_load()
-        if thr > int(time.time()):
-            if analyzing_id is not None: await tg_delete(TARGET_CHANNEL, analyzing_id)
-            await tg_send(TARGET_CHANNEL, "⚠️ Pausa de proteção ativa — aguardando retomada automática.")
-            return {"ok": True, "throttled": True, "until": thr, "regime": reg}
 
         # decisão com slate
         ranked, samples, mix, gap01, reason, ab_diag = _neural_decide_slate()
