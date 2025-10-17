@@ -1,58 +1,96 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import os
+from typing import List, Optional
+
+import httpx
 from fastapi import FastAPI, Request, HTTPException
-import httpx, os
 
-app = FastAPI(title="GuardiAo Auto Bot (espelho Fan Tan)", version="1.1")
+app = FastAPI(title="GuardiAo Auto Bot (webhook+mirror)", version="7.1")
 
-WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "meusegredo123")
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
-TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "")
+# --------- ENV ----------
+WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "meusegredo123").strip()
+TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
+TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "").strip()  # ex: -1003052132833
 
-# --- Envio de mensagem para Telegram ---
-async def tg_send(chat_id: str, text: str):
-    if not TG_BOT_TOKEN:
-        print("⚠️ TG_BOT_TOKEN não configurado.")
+TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
+
+# --------- TELEGRAM ----------
+async def tg_send(chat_id: str, text: str, parse_mode: Optional[str]="HTML"):
+    if not TG_BOT_TOKEN or not chat_id:
+        print("⚠️ Falta TG_BOT_TOKEN ou chat_id.")
         return
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    async with httpx.AsyncClient() as cli:
-        await cli.post(url, json={"chat_id": chat_id, "text": text})
+    try:
+        async with httpx.AsyncClient(timeout=15) as cli:
+            await cli.post(f"{TELEGRAM_API}/sendMessage",
+                           json={"chat_id": chat_id, "text": text, "parse_mode": parse_mode,
+                                 "disable_web_page_preview": True})
+    except Exception as e:
+        print("Erro enviando ao Telegram:", e)
 
-# --- Health ---
-@app.get("/health")
-async def health():
-    return {"ok": True, "status": "GuardiAo Bot ativo"}
-
+# --------- BASICS ----------
 @app.get("/")
 async def root():
-    return {"ok": True, "routes": ["/health", "/mirror/fantan/{token}", "/mirror/ping", "/webhook/{token}"]}
+    return {"ok": True, "service": "GuardiAo Auto Bot", "version": "7.1"}
 
-# --- Modo Espelho Fan Tan ---
-@app.get("/mirror/ping")
-async def mirror_ping():
-    return {"ok": True, "ping": "pong"}
+@app.get("/health")
+async def health():
+    return {"ok": True}
 
-@app.post("/mirror/fantan/{token}")
-async def mirror_fantan(token: str, request: Request):
-    if token != WEBHOOK_TOKEN:
-        raise HTTPException(status_code=403, detail="Forbidden")
+@app.get("/debug_cfg")
+async def debug_cfg():
+    return {"WEBHOOK_TOKEN_set": bool(WEBHOOK_TOKEN),
+            "TG_BOT_TOKEN_set": bool(TG_BOT_TOKEN),
+            "TARGET_CHANNEL": TARGET_CHANNEL}
 
-    data = await request.json()
-    seq = data.get("numbers") or []
-    if not seq:
-        return {"ok": False, "error": "no_numbers"}
-
-    msg = f"📡 Espelho Fan Tan — sequência detectada: {seq}"
-    print(msg)
-
-    if TARGET_CHANNEL:
-        await tg_send(TARGET_CHANNEL, msg)
-
-    return {"ok": True, "mirrored": seq}
-
-# --- Webhook padrão ---
+# --------- WEBHOOK PADRÃO (Telegram) ----------
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
     if token != WEBHOOK_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
     update = await request.json()
-    print("📩 Update recebido (Telegram):", update)
+    # só loga pra não quebrar bot setWebhook
+    print("📩 Update recebido:", update)
     return {"ok": True}
+
+# --------- ESPELHO FAN TAN (POST) ----------
+@app.post("/mirror/fantan/{token}")
+async def mirror_fantan(token: str, request: Request):
+    """
+    Body esperado: {"numbers":[1,3,4]}
+    """
+    if token != WEBHOOK_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    data = await request.json()
+    seq: List[int] = data.get("numbers") or []
+    seq = [int(x) for x in seq if int(x) in (1,2,3,4)]
+
+    if not seq:
+        return {"ok": False, "error": "no_numbers"}
+
+    msg = f"📡 Espelho Fan Tan — sequência detectada: {seq}"
+    print(msg)
+    if TARGET_CHANNEL:
+        await tg_send(TARGET_CHANNEL, msg)
+    return {"ok": True, "mirrored": seq}
+
+# --------- TESTE RÁPIDO (GET pelo navegador) ----------
+@app.get("/mirror/test/{token}")
+async def mirror_test(token: str, seq: str = "2-4-1"):
+    """
+    Use no navegador: /mirror/test/{token}?seq=2-4-1
+    """
+    if token != WEBHOOK_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    try:
+        nums = [int(x) for x in seq.split("-") if int(x) in (1,2,3,4)]
+    except Exception:
+        nums = []
+    if not nums:
+        return {"ok": False, "error": "bad_seq"}
+    msg = f"🧪 TESTE — sequência: {nums}"
+    print(msg)
+    if TARGET_CHANNEL:
+        await tg_send(TARGET_CHANNEL, msg)
+    return {"ok": True, "mirrored": nums}
