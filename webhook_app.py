@@ -2,72 +2,51 @@ from fastapi import FastAPI, Request, HTTPException
 import httpx
 import os
 
-app = FastAPI(title="GuardiAo Auto Bot (espelho FanTan)", version="1.0")
+app = FastAPI(title="GuardiAo Auto Bot (Espelho Fan Tan)", version="1.0")
 
-# ===============================
-# 🔐 Variáveis de ambiente
-# ===============================
-WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "meusegredo123")
-TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "")
+WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "meusegredo123")
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "")
 
-# ===============================
-# 📤 Enviar mensagem pro Telegram
-# ===============================
 async def tg_send(chat_id: str, text: str):
     if not TG_BOT_TOKEN:
         print("⚠️ TG_BOT_TOKEN não configurado.")
         return
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    async with httpx.AsyncClient(timeout=15) as cli:
+    async with httpx.AsyncClient() as cli:
         await cli.post(url, json={"chat_id": chat_id, "text": text})
 
-# ===============================
-# 🩺 Health / Root
-# ===============================
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "GuardiAo (espelho)", "hint": "/docs"}
+    return {"ok": True, "service": "GuardiAo Bot", "status": "online"}
 
 @app.get("/health")
 async def health():
     return {"ok": True, "status": "GuardiAo Bot ativo"}
 
-# ===============================
-# 📡 Modo Espelho (Fan Tan)
-# ===============================
 @app.get("/mirror/ping")
-async def mirror_ping():
+async def ping():
     return {"ok": True, "ping": "pong"}
 
 @app.get("/mirror/fantan/{token}")
-async def mirror_fantan_info(token: str):
-    """Rota GET só pra não dar 404 e mostrar instruções."""
+async def info(token: str):
     if token != WEBHOOK_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
     return {
         "ok": True,
-        "how_to_use": "Envie um POST com JSON {\"numbers\":[2,4]} para esta mesma URL.",
-        "example": f"POST /mirror/fantan/{token}  body: {{\"numbers\":[2,4]}}"
+        "msg": "Use POST /mirror/fantan/{token} com JSON {'numbers':[1,2,3]}",
+        "example": f"/mirror/fantan/{token}"
     }
 
 @app.post("/mirror/fantan/{token}")
 async def mirror_fantan(token: str, request: Request):
-    """
-    Recebe lista de números (ex: {"numbers":[2,4]})
-    e apenas espelha no canal do Telegram definido em TARGET_CHANNEL.
-    """
     if token != WEBHOOK_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    try:
-        data = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="invalid_json")
-
+    data = await request.json()
     seq = data.get("numbers") or []
-    if not isinstance(seq, list) or not all(str(x).isdigit() for x in seq):
-        raise HTTPException(status_code=400, detail="numbers must be a list of ints (1..4)")
+    if not seq:
+        return {"ok": False, "error": "no_numbers"}
 
     msg = f"📡 Espelho Fan Tan — sequência detectada: {seq}"
     print(msg)
@@ -77,9 +56,6 @@ async def mirror_fantan(token: str, request: Request):
 
     return {"ok": True, "mirrored": seq}
 
-# ===============================
-# 🧩 Webhook Padrão (Telegram)
-# ===============================
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
     if token != WEBHOOK_TOKEN:
