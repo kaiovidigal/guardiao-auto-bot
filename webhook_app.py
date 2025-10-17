@@ -2,31 +2,18 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v7.3 (base v7.0 + fechamento () prioritário + pull de resultado por URL Pinbet)
+v7.3 (G1-only, parser canal-fonte, IA compacta, dedupe, fechamento G0/G1, auto-delete,
+      DB SQLite) + DIAGNÓSTICOS (echo-token, diag) + utilitários GET (mock-entry, pull-result-get)
 
-ENV obrigatórias (Render -> Environment):
-- TG_BOT_TOKEN
-- WEBHOOK_TOKEN
-- TARGET_CHANNEL           ex: -1003052132833
-
-ENV opcionais:
-- SOURCE_CHANNEL           ex: -1002810508717  (se quiser filtrar por chat_id)
-- SHOW_DEBUG          (default False)
-- MAX_GALE            (default 1)          # G0/G1
-- OBS_TIMEOUT_SEC     (default 420)
-- DEDUP_WINDOW_SEC    (default 40)
-- DB_PATH             (default /opt/render/project/src/main.sqlite)
-- RESULT_URL          (default https://pinbet.bet/live-casino/evolution/evo-oss-xs-fan-tan)
-
-Start command:
+Start:
   uvicorn webhook_app:app --host 0.0.0.0 --port $PORT
 """
 
-import os, re, json, time, math, sqlite3, datetime, hashlib
+import os, re, time, math, sqlite3, datetime, hashlib
 from typing import List, Dict, Optional, Tuple
 
 import httpx
-from fastapi import FastAPI, Request, HTTPException, Body
+from fastapi import FastAPI, Request, HTTPException, Query
 
 # ------------------------------------------------------
 # ENV & constantes
@@ -45,13 +32,15 @@ if not TG_BOT_TOKEN or not WEBHOOK_TOKEN or not TARGET_CHANNEL:
     raise RuntimeError("Faltam ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN, TARGET_CHANNEL.")
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
-DB_PATH = os.getenv("DB_PATH", "/opt/render/project/src/main.sqlite").strip()
-RESULT_URL = os.getenv("RESULT_URL", "https://pinbet.bet/live-casino/evolution/evo-oss-xs-fan-tan").strip()
+DB_PATH = "/opt/render/project/src/main.sqlite"
+
+# LOG de arranque para diagnosticar ENV
+print("WEBHOOK_TOKEN carregado (repr):", repr(WEBHOOK_TOKEN), "len:", len(WEBHOOK_TOKEN))
 
 # ------------------------------------------------------
 # App
 # ------------------------------------------------------
-app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.3-pinbet")
+app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.3+diag")
 
 # ------------------------------------------------------
 # DB helpers
@@ -97,7 +86,6 @@ def db_init():
     if not con.execute("SELECT 1 FROM score WHERE id=1").fetchone():
         con.execute("INSERT INTO score(id,green,loss) VALUES(1,0,0)")
     con.commit(); con.close()
-
 db_init()
 
 def _mark_processed(upd: str):
@@ -177,7 +165,6 @@ def _pending_close(final_seen: str, outcome: str, stage_lbl: str, suggested:int)
     con.execute("UPDATE pending SET open=0, seen=? WHERE id=?", (final_seen, int(row["id"])))
     con.commit(); con.close()
     _score_add(outcome)
-    # alimentar timeline com observados
     obs = [int(x) for x in final_seen.split("-") if x.isdigit()]
     _append_seq(obs)
     our = suggested if outcome.upper()=="GREEN" else "X"
@@ -196,7 +183,7 @@ def _seen_recent(kind: str, dkey: str) -> bool:
     now = int(time.time())
     con = _con()
     row = con.execute("SELECT ts FROM dedupe WHERE kind=? AND dkey=?", (kind, dkey)).fetchone()
-    if row and now - int(row["ts"]) <= DEDUPE_WINDOW_SEC:
+    if row and now - int(row["ts"]) <= DEDUP_WINDOW_SEC:
         con.close()
         return True
     con.execute("INSERT OR REPLACE INTO dedupe(kind, dkey, ts) VALUES (?,?,?)", (kind, dkey, now))
@@ -204,7 +191,7 @@ def _seen_recent(kind: str, dkey: str) -> bool:
     return False
 
 # ------------------------------------------------------
-# IA “12 camadas” compacta (4 especialistas + ajustes)
+# IA compacta
 # ------------------------------------------------------
 def _norm(d: Dict[int,float])->Dict[int,float]:
     s=sum(d.values()) or 1e-9
@@ -217,7 +204,6 @@ def _post_freq(tail:List[int], k:int)->Dict[int,float]:
     return _norm({c:win.count(c)/tot for c in (1,2,3,4)})
 
 def _post_e1_ngram(tail:List[int])->Dict[int,float]:
-    # proxy simples: mistura de janelas (Fibonacci curto embutido)
     mix={c:0.0 for c in (1,2,3,4)}
     for k,w in ((8,0.25),(21,0.35),(55,0.40)):
         pk=_post_freq(tail,k)
@@ -259,7 +245,6 @@ def _conf_floor(post:Dict[int,float], floor=0.30, cap=0.95):
     return _norm(post)
 
 def _get_ls()->int:
-    # loss streak simples (não persistido nesta versão)
     return 0
 
 def _choose_number()->Tuple[int,float,int,Dict[int,float],float,str]:
@@ -286,7 +271,7 @@ def _ngram_snapshot(suggested:int)->str:
             f"🔎 E1(n-gram proxy): 1 {p1} | 2 {p2} | 3 {p3} | 4 {p4}")
 
 # ------------------------------------------------------
-# Telegram helpers (send + delete)
+# Telegram helpers
 # ------------------------------------------------------
 async def tg_send(chat_id: str, text: str, parse="HTML"):
     try:
@@ -323,8 +308,7 @@ async def tg_delete(chat_id: str, message_id: int):
 # ------------------------------------------------------
 RX_ENTRADA = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
 RX_ANALISE = re.compile(r"\bANALISANDO\b", re.I)
-# aceita "APOSTA ENCERRADA", "FECHADA", "FINALIZADA"
-RX_FECHA   = re.compile(r"(APOSTA\s+ENCERRADA|FECHAD[OA]|FINALIZAD[OA])", re.I)
+RX_FECHA   = re.compile(r"APOSTA\s+ENCERRADA", re.I)
 
 RX_SEQ     = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
 RX_NUMS    = re.compile(r"[1-4]")
@@ -356,40 +340,6 @@ def _parse_paren_pair(text:str, need:int=2)->List[int]:
     return nums[:need]
 
 # ------------------------------------------------------
-# Fetch HTML do resultado (Pinbet Fan Tan) + extração
-# ------------------------------------------------------
-async def _http_get(url: str) -> str:
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; GuardiaoBot/1.0)"}
-    try:
-        async with httpx.AsyncClient(timeout=20, headers=headers, follow_redirects=True) as cli:
-            r = await cli.get(url)
-            r.raise_for_status()
-            return r.text or ""
-    except Exception:
-        return ""
-
-def _extract_pair_from_html(html: str) -> List[int]:
-    """
-    Tenta localizar 2 números 1..4 em formatos comuns:
-      - (3 | 2)  / (3|2)
-      - 3 - 2 / 3 | 2
-      - fallback: dois dígitos 1..4 próximos no HTML
-    """
-    if not html: return []
-    m = re.search(r"\(([^\)]*?\b[1-4]\b[^\)]*?\b[1-4]\b[^\)]*?)\)", html, re.I)
-    if m:
-        nums = re.findall(r"\b[1-4]\b", m.group(1))
-        if len(nums) >= 2:
-            return [int(nums[0]), int(nums[1])]
-    m2 = re.search(r"\b([1-4])\s*[-–>\|]\s*([1-4])\b", html)
-    if m2:
-        return [int(m2.group(1)), int(m2.group(2))]
-    m3 = re.search(r"\b([1-4])\b(?:.{0,20}?)\b([1-4])\b", html, re.S)
-    if m3:
-        return [int(m3.group(1)), int(m3.group(2))]
-    return []
-
-# ------------------------------------------------------
 # Rotas básicas
 # ------------------------------------------------------
 @app.get("/")
@@ -402,53 +352,69 @@ async def health():
 
 @app.get("/debug_cfg")
 async def debug_cfg():
-    return {"MAX_GALE": MAX_GALE, "OBS_TIMEOUT_SEC": OBS_TIMEOUT_SEC, "DEDUP_WINDOW_SEC": DEDUP_WINDOW_SEC, "RESULT_URL": RESULT_URL}
+    return {"MAX_GALE": MAX_GALE, "OBS_TIMEOUT_SEC": OBS_TIMEOUT_SEC, "DEDUP_WINDOW_SEC": DEDUP_WINDOW_SEC}
 
-# ------------------------------------------------------
-# Admin: puxar resultado por link (Pinbet Fan Tan)
-# ------------------------------------------------------
-@app.post("/admin/pull-result/{token}")
-async def admin_pull_result(token: str, body: dict = Body(None)):
+# ---------- DIAGNÓSTICOS ----------
+@app.get("/admin/echo-token/{token}")
+async def echo_token(token: str):
+    return {"path_token": token, "server_token": repr(WEBHOOK_TOKEN), "match": token == WEBHOOK_TOKEN}
+
+@app.get("/admin/diag/{token}")
+async def admin_diag(token: str):
     if token != WEBHOOK_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
+    return {"ok": True, "webhook_token": repr(WEBHOOK_TOKEN), "now": datetime.datetime.utcnow().isoformat()+"Z"}
 
-    url = (body or {}).get("url", "").strip() or RESULT_URL
+# ---------- UTILITÁRIOS GET ----------
+@app.get("/admin/mock-entry/{token}")
+async def mock_entry(token: str, a: int = Query(1, ge=1, le=4), b: int = Query(3, ge=1, le=4)):
+    if token != WEBHOOK_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    fake = {"channel_post": {"text": f"ENTRADA CONFIRMADA\nSequência: {a} | {b}"}}
+    class _Req:  # request fake com .json()
+        async def json(self): return fake
+    return await webhook(token, _Req())
+
+async def _http_get(url:str)->Optional[str]:
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as cli:
+            r=await cli.get(url, headers={"User-Agent":"Mozilla/5.0"})
+            if r.status_code==200: return r.text
+    except Exception:
+        pass
+    return None
+
+def _extract_pair_from_html(html:str)->Optional[List[int]]:
+    if not html: return None
+    pats = [
+        r"\(([ \t]*[1-4])[ \t]*\|[ \t]*([1-4])[ \t]*\)",
+        r"\b([1-4])[ \t]*\|[ \t]*([1-4])\b",
+        r"\b([1-4])[ \t]*-[ \t]*([1-4])\b",
+    ]
+    for p in pats:
+        m=re.search(p, html)
+        if m:
+            try:
+                a,b=int(m.group(1)), int(m.group(2))
+                return [a,b]
+            except: pass
+    return None
+
+@app.get("/admin/pull-result-get/{token}")
+async def pull_result_get(token: str, url: str = ""):
+    if token != WEBHOOK_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    url = (url or os.getenv("RESULT_URL","")).strip()
+    if not url:
+        return {"ok": False, "error": "sem_url"}
     html = await _http_get(url)
     if not html:
         return {"ok": False, "error": "sem_html", "url": url}
-
-    pair = _extract_pair_from_html(html)
+    pair=_extract_pair_from_html(html)
     if not pair:
-        return {"ok": False, "error": "resultado_nao_encontrado", "url": url}
-
-    # escreve nos observados
-    _pending_seen_append(pair, need=min(2, MAX_GALE + 1))
-
-    pend=_pending_get()
-    if not pend:
-        # se não há pendência aberta, só alimenta timeline
-        _append_seq(pair)
-        await tg_send(TARGET_CHANNEL, f"🔎 Resultado via link (sem pendência): {pair} — {url}")
-        return {"ok": True, "pair": pair, "closed": False, "reason": "no_pending"}
-
-    suggested=int(pend["suggested"] or 0)
-    seen = [s for s in (pend["seen"] or "").split("-") if s]
-    need = min(2, MAX_GALE + 1)
-
-    # decisão G0/G1
-    outcome="LOSS"; stage_lbl="G1"
-    if seen and seen[0].isdigit() and int(seen[0])==suggested:
-        outcome="GREEN"; stage_lbl="G0"
-    elif len(seen)>=2 and seen[1].isdigit() and int(seen[1])==suggested and MAX_GALE>=1:
-        outcome="GREEN"; stage_lbl="G1"
-
-    final_seen="-".join(seen[:need]) if seen else "X"
-    if stage_lbl=="G0" or len(seen)>=need:
-        msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
-        if msg_txt: await tg_send(TARGET_CHANNEL, "🔎 Resultado via link:\n"+msg_txt)
-        return {"ok": True, "pair": pair, "closed": True, "outcome": outcome, "final": final_seen}
-
-    return {"ok": True, "pair": pair, "closed": False, "seen": "-".join(seen)}
+        return {"ok": False, "error": "resultado_nao_encontrado"}
+    _pending_seen_append(pair, need=min(2, MAX_GALE+1))
+    return {"ok": True, "pair": pair}
 
 # ------------------------------------------------------
 # Webhook principal
@@ -467,13 +433,12 @@ async def webhook(token: str, request: Request):
     chat_id = str(chat.get("id") or "")
     text = (msg.get("text") or msg.get("caption") or "").strip()
 
-    # filtra fonte se configurado
     if SOURCE_CHANNEL and chat_id and chat_id != SOURCE_CHANNEL:
         if SHOW_DEBUG:
             await tg_send(TARGET_CHANNEL, f"DEBUG: Ignorando chat {chat_id}. Fonte esperada: {SOURCE_CHANNEL}")
         return {"ok": True, "skipped": "wrong_source"}
 
-    # 1) ANALISANDO: apenas alimenta memória (com dedupe)
+    # 1) ANALISANDO -> alimenta memória
     if RX_ANALISE.search(text):
         if _seen_recent("analise", _dedupe_key(text)):
             return {"ok": True, "skipped": "analise_dupe"}
@@ -481,43 +446,35 @@ async def webhook(token: str, request: Request):
         if seq: _append_seq(seq)
         return {"ok": True, "analise_seq": len(seq)}
 
-    # 2) APOSTA ENCERRADA / GREEN / RED (com dedupe + FECHAMENTO CORRETO G0/G1) — prioriza (x | y)
-    if RX_FECHA.search(text) or RX_GREEN.search(text) or RX_RED.search(text):
+    # 2) FECHAMENTO (GREEN/RED/ENCERRADA)
+    if re.search(r"APOSTA\s+ENCERRADA|GREEN|✅|RED|❌", text, re.I):
         if _seen_recent("fechamento", _dedupe_key(text)):
             return {"ok": True, "skipped": "fechamento_dupe"}
 
         pend=_pending_get()
         if pend:
             suggested=int(pend["suggested"] or 0)
+            obs_pair = _parse_seq_pair(text, need=min(2, MAX_GALE+1))
+            if obs_pair:
+                _pending_seen_append(obs_pair, need=min(2, MAX_GALE+1))
+            extra_tail = _parse_paren_pair(text, need=2)
+            if extra_tail:
+                _append_seq(extra_tail)
 
-            # (a) PRIORIDADE: números dentro de parênteses "(x | y)"
-            paren_pair = _parse_paren_pair(text, need=min(2, MAX_GALE+1))
-            if paren_pair:
-                _pending_seen_append(paren_pair, need=min(2, MAX_GALE+1))
-            else:
-                # (b) fallback: linha "Sequência: a | b"
-                obs_pair = _parse_seq_pair(text, need=min(2, MAX_GALE+1))
-                if obs_pair:
-                    _pending_seen_append(obs_pair, need=min(2, MAX_GALE+1))
-
-            # Reavalia pendência
             pend=_pending_get()
             seen = [s for s in (pend["seen"] or "").split("-") if s]
 
-            # Regra: se G0 != sugerido e ainda temos G1, NÃO fecha; aguarda próxima rodada
             if len(seen)==1 and seen[0].isdigit() and int(seen[0]) != suggested and MAX_GALE>=1:
                 if SHOW_DEBUG:
                     await tg_send(TARGET_CHANNEL, f"DEBUG: aguardando G1 (visto G0={seen[0]}, nosso={suggested}).")
                 return {"ok": True, "waiting_g1": True, "seen": "-".join(seen)}
 
-            # Decisão final (se já temos 1 ou 2 observados suficientes)
             outcome="LOSS"; stage_lbl="G1"
             if len(seen)>=1 and seen[0].isdigit() and int(seen[0])==suggested:
                 outcome="GREEN"; stage_lbl="G0"
             elif len(seen)>=2 and seen[1].isdigit() and int(seen[1])==suggested and MAX_GALE>=1:
                 outcome="GREEN"; stage_lbl="G1"
 
-            # fecha se GREEN no G0, ou já temos G1 observado (independente de GREEN/LOSS)
             if stage_lbl=="G0" or len(seen)>=min(2, MAX_GALE+1):
                 final_seen="-".join(seen[:min(2, MAX_GALE+1)]) if seen else "X"
                 msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
@@ -528,7 +485,7 @@ async def webhook(token: str, request: Request):
 
         return {"ok": True, "noted_close": True}
 
-    # 3) ENTRADA CONFIRMADA (com dedupe + “Analisando...” auto-delete)
+    # 3) ENTRADA CONFIRMADA
     if RX_ENTRADA.search(text):
         if _seen_recent("entrada", _dedupe_key(text)):
             if SHOW_DEBUG:
@@ -536,10 +493,9 @@ async def webhook(token: str, request: Request):
             return {"ok": True, "skipped": "entrada_dupe"}
 
         seq=_parse_seq_list(text)
-        if seq: _append_seq(seq)               # memória
-        after = _parse_after(text)             # usado apenas para exibir "após X"
+        if seq: _append_seq(seq)
+        after = _parse_after(text)
 
-        # fecha pendência anterior se esquecida (com X)
         pend=_pending_get()
         if pend:
             seen=[s for s in (pend["seen"] or "").split("-") if s]
@@ -554,10 +510,8 @@ async def webhook(token: str, request: Request):
             msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
             if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
 
-        # “Analisando...” (apaga depois)
         analyzing_id = await tg_send_return(TARGET_CHANNEL, "⏳ Analisando padrão, aguarde...")
 
-        # escolhe nova sugestão
         best, conf, samples, post, gap, reason = _choose_number()
         opened=_pending_open(best)
         if opened:
@@ -580,7 +534,6 @@ async def webhook(token: str, request: Request):
                 await tg_send(TARGET_CHANNEL, "DEBUG: pending já aberto; entrada ignorada.")
             return {"ok": True, "skipped": "pending_open"}
 
-    # Não reconhecido
     if SHOW_DEBUG:
         await tg_send(TARGET_CHANNEL, "DEBUG: Mensagem não reconhecida como ENTRADA/FECHAMENTO/ANALISANDO.")
     return {"ok": True, "skipped": "unmatched"}
