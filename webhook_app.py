@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GuardiAo Auto Bot — webhook_app.py (FULL v7.2)
+GuardiAo Auto Bot — webhook_app.py (v7.3)
 
-Correções:
-- Rota /admin/echo-token/{token} adicionada (diagnóstico do token)
-- Webhook /webhook/{token} validando contra ENV WEBHOOK_TOKEN
-- /health e /debug_cfg para ver status e config
-- Logs claros no stdout para você ver no Render
+- /health, /debug_cfg
+- /admin/echo-token/{token}          -> diagnosticar token
+- /admin/fantan-status               -> status do capturador (site)
+- POST /ingest/fantan/{token}        -> ingestão dos números (site -> webhook)
+- POST /webhook/{token}              -> Telegram
 
-Como usar no Render:
-- Environment:
-    WEBHOOK_TOKEN = meusegredo123
-    TG_BOT_TOKEN  = (seu token do bot Telegram)   # opcional p/ testes
-    TARGET_CHANNEL = -100xxxxxxxxxx               # opcional p/ testes
-- Build Command: pip install -r requirements.txt
-- Start Command: uvicorn webhook_app:app --host 0.0.0.0 --port $PORT
+Render:
+  Build: pip install -r requirements_server.txt
+  Start: uvicorn webhook_app:app --host 0.0.0.0 --port $PORT
+
+ENVs (Render -> Environment):
+  WEBHOOK_TOKEN    = meusegredo123
+  TG_BOT_TOKEN     = 8315...ztK4               (opcional para enviar mensagens)
+  TARGET_CHANNEL   = -100XXXXXXXXXXXX          (opcional para avisos)
+  SOURCE_CHANNEL   = (opcional p/ filtrar)
+  SHOW_DEBUG       = True/False (default False)
+  MAX_GALE         = 1
+  OBS_TIMEOUT_SEC  = 420
+  DEDUP_WINDOW_SEC = 40
 """
 
 import os, re, json, time, sqlite3, datetime, hashlib
@@ -23,6 +29,7 @@ from typing import List, Dict, Optional, Tuple
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
+from pydantic import BaseModel
 
 # ===================== ENV =====================
 TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
@@ -39,7 +46,7 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}" if TG_BOT_TOKEN els
 DB_PATH = "/opt/render/project/src/main.sqlite"
 
 # ===================== APP =====================
-app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.2")
+app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.3")
 
 # ===================== DB ======================
 def _con():
@@ -66,15 +73,6 @@ def db_init():
         con.execute("INSERT INTO score(id,green,loss) VALUES(1,0,0)")
     con.commit(); con.close()
 db_init()
-
-def _mark_processed(upd: str):
-    try:
-        con = _con()
-        con.execute("INSERT OR IGNORE INTO processed(update_id,seen_at) VALUES(?,?)",
-                    (str(upd), int(time.time())))
-        con.commit(); con.close()
-    except Exception:
-        pass
 
 def _timeline_tail(n:int=400)->List[int]:
     con = _con()
@@ -108,51 +106,6 @@ def _score_text()->str:
     g,l = int(row["green"]), int(row["loss"])
     tot = g+l; acc = (g/tot*100.0) if tot>0 else 0.0
     return f"{g} GREEN × {l} LOSS — {acc:.1f}%"
-
-def _pending_get()->Optional[sqlite3.Row]:
-    con = _con(); row = con.execute("SELECT * FROM pending WHERE open=1 ORDER BY id DESC LIMIT 1").fetchone(); con.close()
-    return row
-
-def _pending_open(suggested:int):
-    if _pending_get(): return False
-    con = _con()
-    now = int(time.time())
-    con.execute("INSERT INTO pending(created_at,opened_at,suggested,stage,seen,open) VALUES(?,?,?,?,?,1)",
-                (now, now, int(suggested), 0, ""))
-    con.commit(); con.close()
-    return True
-
-def _pending_set_stage(stage:int):
-    con = _con()
-    con.execute("UPDATE pending SET stage=? WHERE open=1",(int(stage),))
-    con.commit(); con.close()
-
-def _pending_seen_append(nums: List[int], need:int=2):
-    row = _pending_get()
-    if not row: return
-    seen = (row["seen"] or "").strip()
-    arr = [s for s in seen.split("-") if s]
-    for n in nums:
-        if len(arr) >= need: break
-        arr.append(str(int(n)))
-    txt = "-".join(arr[:need])
-    con = _con(); con.execute("UPDATE pending SET seen=? WHERE id=?", (txt, int(row["id"]))); con.commit(); con.close()
-
-def _pending_close(final_seen: str, outcome: str, stage_lbl: str, suggested:int)->str:
-    row = _pending_get()
-    if not row: return ""
-    con = _con()
-    con.execute("UPDATE pending SET open=0, seen=? WHERE id=?", (final_seen, int(row["id"])))
-    con.commit(); con.close()
-    _score_add(outcome)
-    obs = [int(x) for x in final_seen.split("-") if x.isdigit()]
-    _append_seq(obs)
-    our = suggested if outcome.upper()=="GREEN" else "X"
-    snap = _ngram_snapshot(suggested)
-    msg = (f"{'🟢' if outcome.upper()=='GREEN' else '🔴'} <b>{outcome.upper()}</b> — finalizado "
-           f"(<b>{stage_lbl}</b>, nosso={our}, observados={final_seen}).\n"
-           f"📊 Geral: {_score_text()}\n\n{snap}")
-    return msg
 
 # ============ DEDUPE ============
 def _dedupe_key(text: str) -> str:
@@ -190,7 +143,7 @@ def _post_e1_ngram(tail:List[int])->Dict[int,float]:
 
 def _post_e2_short(tail):  return _post_freq(tail, 60)
 def _post_e3_long(tail):   return _post_freq(tail, 300)
-def _post_e4_llm(tail):    return {1:0.25,2:0.25,3:0.25,4:0.25}  # placeholder
+def _post_e4_llm(tail):    return {1:0.25,2:0.25,3:0.25,4:0.25}
 
 def _hedge(p1,p2,p3,p4, w=(0.40,0.25,0.25,0.10)):
     cands=(1,2,3,4)
@@ -222,19 +175,16 @@ def _conf_floor(post:Dict[int,float], floor=0.30, cap=0.95):
             if c!=b: post[c]+=add
     return _norm(post)
 
-def _get_ls()->int:
-    return 0
-
 def _choose_number()->Tuple[int,float,int,Dict[int,float],float,str]:
     tail=_timeline_tail(400)
     p1=_post_e1_ngram(tail); p2=_post_e2_short(tail); p3=_post_e3_long(tail); p4=_post_e4_llm(tail)
     base=_hedge(p1,p2,p3,p4)
-    best, post, reason = _runnerup_ls2(base, loss_streak=_get_ls())
-    post=_conf_floor(post, 0.30, 0.95)
+    # sem runnerup/ls aqui pra simplificar
+    post=_conf_floor(base, 0.30, 0.95)
     best=max(post,key=post.get); conf=float(post[best])
     r=sorted(post.items(), key=lambda kv: kv[1], reverse=True)
     gap=(r[0][1]-r[1][1]) if len(r)>=2 else r[0][1]
-    return best, conf, _timeline_size(), post, gap, reason
+    return best, conf, _timeline_size(), post, gap, "IA"
 
 def _ngram_snapshot(suggested:int)->str:
     tail=_timeline_tail(400)
@@ -258,32 +208,7 @@ async def tg_send(chat_id: str, text: str, parse="HTML"):
     except Exception as e:
         print("tg_send error:", e)
 
-async def tg_send_return(chat_id: str, text: str, parse="HTML") -> Optional[int]:
-    if not TELEGRAM_API:
-        return None
-    try:
-        async with httpx.AsyncClient(timeout=15) as cli:
-            r = await cli.post(f"{TELEGRAM_API}/sendMessage",
-                               json={"chat_id": chat_id, "text": text, "parse_mode": parse,
-                                     "disable_web_page_preview": True})
-            data = r.json()
-            if isinstance(data, dict) and data.get("ok") and data.get("result", {}).get("message_id"):
-                return int(data["result"]["message_id"])
-    except Exception as e:
-        print("tg_send_return error:", e)
-    return None
-
-async def tg_delete(chat_id: str, message_id: int):
-    if not TELEGRAM_API:
-        return
-    try:
-        async with httpx.AsyncClient(timeout=15) as cli:
-            await cli.post(f"{TELEGRAM_API}/deleteMessage",
-                           json={"chat_id": chat_id, "message_id": int(message_id)})
-    except Exception as e:
-        print("tg_delete error:", e)
-
-# ============ Parser do canal-fonte ============
+# ============ Parser ============
 RX_ENTRADA = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
 RX_ANALISE = re.compile(r"\bANALISANDO\b", re.I)
 RX_FECHA   = re.compile(r"APOSTA\s+ENCERRADA", re.I)
@@ -291,9 +216,6 @@ RX_FECHA   = re.compile(r"APOSTA\s+ENCERRADA", re.I)
 RX_SEQ     = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
 RX_NUMS    = re.compile(r"[1-4]")
 RX_AFTER   = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
-
-RX_GREEN   = re.compile(r"GREEN|✅", re.I)
-RX_RED     = re.compile(r"RED|❌", re.I)
 RX_PAREN   = re.compile(r"\(([^\)]*)\)\s*$")
 
 def _parse_seq_list(text:str)->List[int]:
@@ -301,25 +223,10 @@ def _parse_seq_list(text:str)->List[int]:
     if not m: return []
     return [int(x) for x in RX_NUMS.findall(m.group(1))]
 
-def _parse_seq_pair(text:str, need:int=2)->List[int]:
-    arr=_parse_seq_list(text); return arr[:need]
-
-def _parse_after(text:str)->Optional[int]:
-    m=RX_AFTER.search(text or "")
-    if not m: return None
-    try: return int(m.group(1))
-    except: return None
-
-def _parse_paren_pair(text:str, need:int=2)->List[int]:
-    m=RX_PAREN.search(text or "")
-    if not m: return []
-    nums=[int(x) for x in re.findall(r"[1-4]", m.group(1))]
-    return nums[:need]
-
-# ============ Rotas básicas + admin ============
+# ===================== Rotas básicas + admin =====================
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "GuardiAo Auto Bot", "version": "7.2",
+    return {"ok": True, "service": "GuardiAo Auto Bot", "version": "7.3",
             "time": datetime.datetime.utcnow().isoformat()+"Z"}
 
 @app.get("/health")
@@ -332,12 +239,64 @@ async def debug_cfg():
             "DEDUP_WINDOW_SEC": DEDUP_WINDOW_SEC, "SOURCE_CHANNEL": SOURCE_CHANNEL,
             "TARGET_SET": bool(TARGET_CHANNEL)}
 
-# NOVO: rota para validar token carregado no ambiente
 @app.get("/admin/echo-token/{token}")
 async def echo_token(token: str):
     return {"match": token == WEBHOOK_TOKEN, "received": token, "expected": WEBHOOK_TOKEN}
 
-# ============ Webhook principal ============
+# ===================== Ingestão Fan Tan (site -> webhook) =====================
+class FanTanIn(BaseModel):
+    numbers: Optional[List[int]] = None   # ex: [1, 3]
+    text: Optional[str] = None            # ex: "Sequência: 1 | 3"
+
+FAN_TAN_STATUS = {
+    "source": "pinbet-fantan",
+    "last_pull_ts": None,
+    "last_numbers": None,
+    "total_appended": 0,
+}
+
+def _now_iso():
+    return datetime.datetime.utcnow().isoformat() + "Z"
+
+@app.get("/admin/fantan-status")
+async def fantan_status():
+    tail = _timeline_tail(20)
+    return {
+        "ok": True,
+        "source": FAN_TAN_STATUS["source"],
+        "last_pull_ts": FAN_TAN_STATUS["last_pull_ts"],
+        "last_numbers": FAN_TAN_STATUS["last_numbers"],
+        "total_appended": FAN_TAN_STATUS["total_appended"],
+        "timeline_tail": tail,
+        "timeline_size": _timeline_size(),
+        "now": _now_iso(),
+    }
+
+@app.post("/ingest/fantan/{token}")
+async def ingest_fantan(token: str, payload: FanTanIn):
+    if token != WEBHOOK_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    seq: List[int] = []
+    if payload.numbers and isinstance(payload.numbers, list):
+        seq = [int(x) for x in payload.numbers if int(x) in (1,2,3,4)]
+    elif payload.text:
+        seq = _parse_seq_list(payload.text)
+
+    if not seq:
+        return {"ok": False, "error": "no_numbers_found", "hint": "Envie numbers=[1,3] ou text='Sequência: 1 | 3'"}
+
+    _append_seq(seq)
+    FAN_TAN_STATUS["last_pull_ts"] = _now_iso()
+    FAN_TAN_STATUS["last_numbers"] = seq
+    FAN_TAN_STATUS["total_appended"] = int(FAN_TAN_STATUS["total_appended"] or 0) + len(seq)
+
+    if TARGET_CHANNEL:
+        await tg_send(TARGET_CHANNEL, f"🌐 Pinbet (Fan Tan) ingest: {seq} — amostra={_timeline_size()}")
+
+    return {"ok": True, "ingested": seq, "timeline_size": _timeline_size()}
+
+# ===================== Webhook Telegram =====================
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
     if token != WEBHOOK_TOKEN:
@@ -350,37 +309,27 @@ async def webhook(token: str, request: Request):
 
     print("📩 webhook payload:", json.dumps(data)[:600])
 
-    upd_id = str(data.get("update_id", "")); _mark_processed(upd_id)
-
     msg = data.get("channel_post") or data.get("message") \
         or data.get("edited_channel_post") or data.get("edited_message") or {}
     chat = msg.get("chat") or {}
     chat_id = str(chat.get("id") or "")
     text = (msg.get("text") or msg.get("caption") or "").strip()
 
-    # Se quiser filtrar por canal-fonte
     if SOURCE_CHANNEL and chat_id and chat_id != SOURCE_CHANNEL:
-        if SHOW_DEBUG and TARGET_CHANNEL:
-            await tg_send(TARGET_CHANNEL, f"DEBUG: Ignorando chat {chat_id}. Esperado: {SOURCE_CHANNEL}")
         return {"ok": True, "skipped": "wrong_source"}
 
-    # Apenas loga por enquanto (encaixe sua estratégia aqui)
-    if text:
-        print("📝 texto:", text[:300])
+    if not text:
+        return {"ok": True, "skipped": "no_text"}
 
-    # Exemplo: se detectar ENTRADA/FECHAMENTO, aplique suas regras (mantive esqueleto)
-    if RX_ANALISE.search(text):
-        seq=_parse_seq_list(text); 
+    if re.search(r"ANALISANDO", text, re.I):
+        seq=_parse_seq_list(text)
         if seq: _append_seq(seq)
         return {"ok": True, "analise_seq": len(seq)}
 
-    if RX_FECHA.search(text):
-        # fecho simplificado só para não travar fluxo
-        if TARGET_CHANNEL:
-            await tg_send(TARGET_CHANNEL, "🔚 Fechamento notado (simplificado v7.2).")
+    if re.search(r"APOSTA\s+ENCERRADA|GREEN|✅|RED|❌", text, re.I):
         return {"ok": True, "noted_close": True}
 
-    if RX_ENTRADA.search(text):
+    if re.search(r"ENTRADA\s+CONFIRMADA", text, re.I):
         seq=_parse_seq_list(text)
         if seq: _append_seq(seq)
         best, conf, samples, post, gap, reason = _choose_number()
@@ -389,7 +338,6 @@ async def webhook(token: str, request: Request):
                 f"🤖 <b>IA SUGERE</b> — <b>{best}</b>\n"
                 f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples} | <b>gap≈</b>{gap*100:.1f}pp\n"
                 f"🧠 <b>Modo:</b> {reason}\n{_ngram_snapshot(best)}")
-        _pending_open(best)
         return {"ok": True, "entry_opened": True, "best": best, "conf": conf}
 
     return {"ok": True, "skipped": "unmatched"}
