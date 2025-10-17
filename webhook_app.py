@@ -1,13 +1,13 @@
 from fastapi import FastAPI, Request, HTTPException
-import httpx
-import os
+import httpx, os
 
-app = FastAPI(title="GuardiAo Auto Bot (Espelho Fan Tan)", version="1.0")
+app = FastAPI(title="GuardiAo Auto Bot (espelho Fan Tan)", version="1.1")
 
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "meusegredo123")
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "")
 
+# --- Envio de mensagem para Telegram ---
 async def tg_send(chat_id: str, text: str):
     if not TG_BOT_TOKEN:
         print("⚠️ TG_BOT_TOKEN não configurado.")
@@ -16,27 +16,19 @@ async def tg_send(chat_id: str, text: str):
     async with httpx.AsyncClient() as cli:
         await cli.post(url, json={"chat_id": chat_id, "text": text})
 
-@app.get("/")
-async def root():
-    return {"ok": True, "service": "GuardiAo Bot", "status": "online"}
-
+# --- Health ---
 @app.get("/health")
 async def health():
     return {"ok": True, "status": "GuardiAo Bot ativo"}
 
-@app.get("/mirror/ping")
-async def ping():
-    return {"ok": True, "ping": "pong"}
+@app.get("/")
+async def root():
+    return {"ok": True, "routes": ["/health", "/mirror/fantan/{token}", "/mirror/ping", "/webhook/{token}"]}
 
-@app.get("/mirror/fantan/{token}")
-async def info(token: str):
-    if token != WEBHOOK_TOKEN:
-        raise HTTPException(status_code=403, detail="Forbidden")
-    return {
-        "ok": True,
-        "msg": "Use POST /mirror/fantan/{token} com JSON {'numbers':[1,2,3]}",
-        "example": f"/mirror/fantan/{token}"
-    }
+# --- Modo Espelho Fan Tan ---
+@app.get("/mirror/ping")
+async def mirror_ping():
+    return {"ok": True, "ping": "pong"}
 
 @app.post("/mirror/fantan/{token}")
 async def mirror_fantan(token: str, request: Request):
@@ -56,6 +48,7 @@ async def mirror_fantan(token: str, request: Request):
 
     return {"ok": True, "mirrored": seq}
 
+# --- Webhook padrão ---
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
     if token != WEBHOOK_TOKEN:
