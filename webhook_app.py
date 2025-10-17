@@ -2,20 +2,21 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v7.0 (G1-only, parser canal-fonte, IA hierárquica compacta, dedupe por conteúdo,
-      fechamento correto G0/G1, “Analisando...” com auto-delete, DB SQLite)
+v7.3 (base v7.0 + fechamento () prioritário + pull de resultado por URL Pinbet)
 
 ENV obrigatórias (Render -> Environment):
 - TG_BOT_TOKEN
 - WEBHOOK_TOKEN
-- SOURCE_CHANNEL           ex: -1002810508717
 - TARGET_CHANNEL           ex: -1003052132833
 
 ENV opcionais:
+- SOURCE_CHANNEL           ex: -1002810508717  (se quiser filtrar por chat_id)
 - SHOW_DEBUG          (default False)
 - MAX_GALE            (default 1)          # G0/G1
 - OBS_TIMEOUT_SEC     (default 420)
 - DEDUP_WINDOW_SEC    (default 40)
+- DB_PATH             (default /opt/render/project/src/main.sqlite)
+- RESULT_URL          (default https://pinbet.bet/live-casino/evolution/evo-oss-xs-fan-tan)
 
 Start command:
   uvicorn webhook_app:app --host 0.0.0.0 --port $PORT
@@ -25,7 +26,7 @@ import os, re, json, time, math, sqlite3, datetime, hashlib
 from typing import List, Dict, Optional, Tuple
 
 import httpx
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Body
 
 # ------------------------------------------------------
 # ENV & constantes
@@ -44,12 +45,13 @@ if not TG_BOT_TOKEN or not WEBHOOK_TOKEN or not TARGET_CHANNEL:
     raise RuntimeError("Faltam ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN, TARGET_CHANNEL.")
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
-DB_PATH = "/opt/render/project/src/main.sqlite"
+DB_PATH = os.getenv("DB_PATH", "/opt/render/project/src/main.sqlite").strip()
+RESULT_URL = os.getenv("RESULT_URL", "https://pinbet.bet/live-casino/evolution/evo-oss-xs-fan-tan").strip()
 
 # ------------------------------------------------------
 # App
 # ------------------------------------------------------
-app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.0")
+app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.3-pinbet")
 
 # ------------------------------------------------------
 # DB helpers
@@ -194,7 +196,7 @@ def _seen_recent(kind: str, dkey: str) -> bool:
     now = int(time.time())
     con = _con()
     row = con.execute("SELECT ts FROM dedupe WHERE kind=? AND dkey=?", (kind, dkey)).fetchone()
-    if row and now - int(row["ts"]) <= DEDUP_WINDOW_SEC:
+    if row and now - int(row["ts"]) <= DEDUPE_WINDOW_SEC:
         con.close()
         return True
     con.execute("INSERT OR REPLACE INTO dedupe(kind, dkey, ts) VALUES (?,?,?)", (kind, dkey, now))
@@ -321,7 +323,8 @@ async def tg_delete(chat_id: str, message_id: int):
 # ------------------------------------------------------
 RX_ENTRADA = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
 RX_ANALISE = re.compile(r"\bANALISANDO\b", re.I)
-RX_FECHA   = re.compile(r"APOSTA\s+ENCERRADA", re.I)
+# aceita "APOSTA ENCERRADA", "FECHADA", "FINALIZADA"
+RX_FECHA   = re.compile(r"(APOSTA\s+ENCERRADA|FECHAD[OA]|FINALIZAD[OA])", re.I)
 
 RX_SEQ     = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
 RX_NUMS    = re.compile(r"[1-4]")
@@ -353,6 +356,40 @@ def _parse_paren_pair(text:str, need:int=2)->List[int]:
     return nums[:need]
 
 # ------------------------------------------------------
+# Fetch HTML do resultado (Pinbet Fan Tan) + extração
+# ------------------------------------------------------
+async def _http_get(url: str) -> str:
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; GuardiaoBot/1.0)"}
+    try:
+        async with httpx.AsyncClient(timeout=20, headers=headers, follow_redirects=True) as cli:
+            r = await cli.get(url)
+            r.raise_for_status()
+            return r.text or ""
+    except Exception:
+        return ""
+
+def _extract_pair_from_html(html: str) -> List[int]:
+    """
+    Tenta localizar 2 números 1..4 em formatos comuns:
+      - (3 | 2)  / (3|2)
+      - 3 - 2 / 3 | 2
+      - fallback: dois dígitos 1..4 próximos no HTML
+    """
+    if not html: return []
+    m = re.search(r"\(([^\)]*?\b[1-4]\b[^\)]*?\b[1-4]\b[^\)]*?)\)", html, re.I)
+    if m:
+        nums = re.findall(r"\b[1-4]\b", m.group(1))
+        if len(nums) >= 2:
+            return [int(nums[0]), int(nums[1])]
+    m2 = re.search(r"\b([1-4])\s*[-–>\|]\s*([1-4])\b", html)
+    if m2:
+        return [int(m2.group(1)), int(m2.group(2))]
+    m3 = re.search(r"\b([1-4])\b(?:.{0,20}?)\b([1-4])\b", html, re.S)
+    if m3:
+        return [int(m3.group(1)), int(m3.group(2))]
+    return []
+
+# ------------------------------------------------------
 # Rotas básicas
 # ------------------------------------------------------
 @app.get("/")
@@ -365,7 +402,53 @@ async def health():
 
 @app.get("/debug_cfg")
 async def debug_cfg():
-    return {"MAX_GALE": MAX_GALE, "OBS_TIMEOUT_SEC": OBS_TIMEOUT_SEC, "DEDUP_WINDOW_SEC": DEDUP_WINDOW_SEC}
+    return {"MAX_GALE": MAX_GALE, "OBS_TIMEOUT_SEC": OBS_TIMEOUT_SEC, "DEDUP_WINDOW_SEC": DEDUP_WINDOW_SEC, "RESULT_URL": RESULT_URL}
+
+# ------------------------------------------------------
+# Admin: puxar resultado por link (Pinbet Fan Tan)
+# ------------------------------------------------------
+@app.post("/admin/pull-result/{token}")
+async def admin_pull_result(token: str, body: dict = Body(None)):
+    if token != WEBHOOK_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    url = (body or {}).get("url", "").strip() or RESULT_URL
+    html = await _http_get(url)
+    if not html:
+        return {"ok": False, "error": "sem_html", "url": url}
+
+    pair = _extract_pair_from_html(html)
+    if not pair:
+        return {"ok": False, "error": "resultado_nao_encontrado", "url": url}
+
+    # escreve nos observados
+    _pending_seen_append(pair, need=min(2, MAX_GALE + 1))
+
+    pend=_pending_get()
+    if not pend:
+        # se não há pendência aberta, só alimenta timeline
+        _append_seq(pair)
+        await tg_send(TARGET_CHANNEL, f"🔎 Resultado via link (sem pendência): {pair} — {url}")
+        return {"ok": True, "pair": pair, "closed": False, "reason": "no_pending"}
+
+    suggested=int(pend["suggested"] or 0)
+    seen = [s for s in (pend["seen"] or "").split("-") if s]
+    need = min(2, MAX_GALE + 1)
+
+    # decisão G0/G1
+    outcome="LOSS"; stage_lbl="G1"
+    if seen and seen[0].isdigit() and int(seen[0])==suggested:
+        outcome="GREEN"; stage_lbl="G0"
+    elif len(seen)>=2 and seen[1].isdigit() and int(seen[1])==suggested and MAX_GALE>=1:
+        outcome="GREEN"; stage_lbl="G1"
+
+    final_seen="-".join(seen[:need]) if seen else "X"
+    if stage_lbl=="G0" or len(seen)>=need:
+        msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
+        if msg_txt: await tg_send(TARGET_CHANNEL, "🔎 Resultado via link:\n"+msg_txt)
+        return {"ok": True, "pair": pair, "closed": True, "outcome": outcome, "final": final_seen}
+
+    return {"ok": True, "pair": pair, "closed": False, "seen": "-".join(seen)}
 
 # ------------------------------------------------------
 # Webhook principal
@@ -398,7 +481,7 @@ async def webhook(token: str, request: Request):
         if seq: _append_seq(seq)
         return {"ok": True, "analise_seq": len(seq)}
 
-    # 2) APOSTA ENCERRADA / GREEN / RED (com dedupe + FECHAMENTO CORRETO G0/G1)
+    # 2) APOSTA ENCERRADA / GREEN / RED (com dedupe + FECHAMENTO CORRETO G0/G1) — prioriza (x | y)
     if RX_FECHA.search(text) or RX_GREEN.search(text) or RX_RED.search(text):
         if _seen_recent("fechamento", _dedupe_key(text)):
             return {"ok": True, "skipped": "fechamento_dupe"}
@@ -407,23 +490,22 @@ async def webhook(token: str, request: Request):
         if pend:
             suggested=int(pend["suggested"] or 0)
 
-            # (a) Observados do PLACAR: usar a linha "Sequência: a | b"
-            obs_pair = _parse_seq_pair(text, need=min(2, MAX_GALE+1))
-            if obs_pair:
-                _pending_seen_append(obs_pair, need=min(2, MAX_GALE+1))
+            # (a) PRIORIDADE: números dentro de parênteses "(x | y)"
+            paren_pair = _parse_paren_pair(text, need=min(2, MAX_GALE+1))
+            if paren_pair:
+                _pending_seen_append(paren_pair, need=min(2, MAX_GALE+1))
+            else:
+                # (b) fallback: linha "Sequência: a | b"
+                obs_pair = _parse_seq_pair(text, need=min(2, MAX_GALE+1))
+                if obs_pair:
+                    _pending_seen_append(obs_pair, need=min(2, MAX_GALE+1))
 
-            # (b) Memória extra: números finais entre parênteses "(x | y)" -> só para timeline
-            extra_tail = _parse_paren_pair(text, need=2)
-            if extra_tail:
-                _append_seq(extra_tail)
-
-            # Reavalia pendência após update
+            # Reavalia pendência
             pend=_pending_get()
             seen = [s for s in (pend["seen"] or "").split("-") if s]
 
-            # Regra: se G0 != sugerido e ainda temos espaço para G1, NÃO fecha; aguarda próxima rodada
+            # Regra: se G0 != sugerido e ainda temos G1, NÃO fecha; aguarda próxima rodada
             if len(seen)==1 and seen[0].isdigit() and int(seen[0]) != suggested and MAX_GALE>=1:
-                # mantém pendência aberta para o G1
                 if SHOW_DEBUG:
                     await tg_send(TARGET_CHANNEL, f"DEBUG: aguardando G1 (visto G0={seen[0]}, nosso={suggested}).")
                 return {"ok": True, "waiting_g1": True, "seen": "-".join(seen)}
@@ -435,14 +517,13 @@ async def webhook(token: str, request: Request):
             elif len(seen)>=2 and seen[1].isdigit() and int(seen[1])==suggested and MAX_GALE>=1:
                 outcome="GREEN"; stage_lbl="G1"
 
-            # fecha se: GREEN no G0, ou já temos G1 observado (independente de GREEN/LOSS)
+            # fecha se GREEN no G0, ou já temos G1 observado (independente de GREEN/LOSS)
             if stage_lbl=="G0" or len(seen)>=min(2, MAX_GALE+1):
                 final_seen="-".join(seen[:min(2, MAX_GALE+1)]) if seen else "X"
                 msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
                 if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
                 return {"ok": True, "closed": outcome, "seen": final_seen}
             else:
-                # ainda aguardando G1 (cenário raro se MAX_GALE>1 futuramente)
                 return {"ok": True, "waiting_more_obs": True, "seen": "-".join(seen)}
 
         return {"ok": True, "noted_close": True}
