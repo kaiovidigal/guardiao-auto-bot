@@ -2,18 +2,16 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v7.6-flow-combos
+v7.6-flow-combos (ATUALIZADO)
 (FLOW + Multi-horizonte + Anti-bias forte + Slate + ClassCooldown + fechamento robusto)
-(+ Combinações 2/3 dígitos, Anti-inversão, IA reguladora pós-Fibo)
+(+ Combinações 2/3 dígitos, Anti-inversão, IA reguladora pós-Fibo Adaptativa)
 
 - Fecha G0 pelo ÚLTIMO dígito 1..4 no ÚLTIMO par de (), [] ou {} (também （）【】)
-- Ensemble: ProfoundSim + (curto, médio, longo, n-gram) + Fibo10 + Combo2 + Combo3 + T30
-- IA reguladora (pós-Fibo/Combos): ajusta temperatura/peso conforme streak e dominância
+- Ensemble: ProfoundSim + (curto, médio, longo, n-gram) + Fibo10 + Fibo Adaptativa + Combo2 + Combo3 + T30
+- IA reguladora (pós-Fibo/Combos): ajusta pesos conforme streak e dominância
 - Anti-viés (dominância / repetições) + empurrão de entropia
-- Anti-inversão: se heurística detectar virada iminente, rebaixa o topo ou promove runner-up
-- Slate de opções (top-K): primário + alternativas curto/médio
-- ClassCooldown: evita grudar no mesmo número quando gap é pequeno
-- NeuroController FLOW: sem cooldown, corte por confiança; ε explora dentro do slate
+- Anti-inversão: rebaixa topo quando padrão sugere virada imediata
+- Slate de opções (top-K) + FLOW Controller
 - Reforço leve (EMA) por classe
 - Timeout de pendência (anti-trava) e dedupe
 - Admin: /health /debug_cfg /admin/status /admin/unlock
@@ -23,6 +21,12 @@ ENV obrigatórias:
 - WEBHOOK_TOKEN
 - SOURCE_CHANNEL
 - TARGET_CHANNEL
+
+Sugestão de ENV (mais volume):
+- CTL_MIN_CONF=0.70
+- CTL_EPSILON=0.06
+- SLATE_MINCONF=0.18
+- DIVERSITY_MAX_SHARE=0.38
 
 Start:
   uvicorn webhook_app:app --host 0.0.0.0 --port $PORT
@@ -34,6 +38,11 @@ from typing import List, Dict, Optional, Tuple
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 
+# >>> especialistas Fibo/Combos (arquivo complementar)
+from fibo_experts import (
+    fibo10_base, fibo_adaptativa, combo2_probs, combo3_probs
+)
+
 # ================== ENV ==================
 TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
 WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
@@ -41,16 +50,16 @@ SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "").strip()
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "").strip()
 
 SHOW_DEBUG       = os.getenv("SHOW_DEBUG", "False").strip().lower() == "true"
-MAX_GALE         = int(os.getenv("MAX_GALE", "0"))        # G0-only (aqui usamos G0; G1 futuro)
+MAX_GALE         = int(os.getenv("MAX_GALE", "0"))        # G0-only
 OBS_TIMEOUT_SEC  = int(os.getenv("OBS_TIMEOUT_SEC", "420"))
 DEDUP_WINDOW_SEC = int(os.getenv("DEDUP_WINDOW_SEC", "40"))
 
-# Controller FLOW (padrões seguros / sem travar)
+# Controller FLOW
 CTL_MIN_CONF     = float(os.getenv("CTL_MIN_CONF", "0.70"))
 CTL_EPSILON      = float(os.getenv("CTL_EPSILON", "0.06"))
 
-# Slate (opções alternativas)
-SLATE_K          = int(os.getenv("SLATE_K", "3"))          # 1..4
+# Slate
+SLATE_K          = int(os.getenv("SLATE_K", "3"))
 SLATE_GAP_MAX    = float(os.getenv("SLATE_GAP_MAX", "0.15"))
 SLATE_MINCONF    = float(os.getenv("SLATE_MINCONF", "0.18"))
 
@@ -60,7 +69,7 @@ DIV_MAX_SHARE   = float(os.getenv("DIVERSITY_MAX_SHARE", "0.38"))
 DIV_MAX_SAME    = int(os.getenv("DIVERSITY_MAX_SAME", "2"))
 ENTROPY_PUSH    = float(os.getenv("ANTIENTROPY_PUSH", "0.12"))
 
-# ClassCooldown (promove 2º lugar se repetindo e gap pequeno)
+# ClassCooldown
 CLASS_COOLDOWN_REPS  = int(os.getenv("CLASS_COOLDOWN_REPS", "2"))
 CLASS_COOLDOWN_DELTA = float(os.getenv("CLASS_COOLDOWN_DELTA", "0.06"))
 
@@ -245,54 +254,16 @@ def _post_freq(tail:List[int], k:int)->Dict[int,float]:
     tot=max(1,len(win))
     return _norm({c:win.count(c)/tot for c in (1,2,3,4)})
 
-# --- especialistas base
+# --- especialistas estatísticos
 def _post_e1_ngram(tail:List[int])->Dict[int,float]:
     mix={c:0.0 for c in (1,2,3,4)}
     for k,w in ((8,0.25),(21,0.35),(55,0.40)):
         pk=_post_freq(tail,k)
         for c in (1,2,3,4): mix[c]+=w*pk[c]
     return _norm(mix)
-
-def _post_e2_short(tail):  return _post_freq(tail, 40)    # curto
-def _post_e3_mid(tail):    return _post_freq(tail, 120)   # médio
-def _post_e4_long(tail):   return _post_freq(tail, 300)   # longo
-
-# --- Fibo10 (janelas curtas estilo fibo)
-def _e_fibo10(tail:List[int])->Dict[int,float]:
-    if not tail: return {1:0.25,2:0.25,3:0.25,4:0.25}
-    wins=(10,21,34,55)
-    mix={c:0.0 for c in (1,2,3,4)}
-    for k in wins:
-        win=tail[-k:] if len(tail)>=k else tail
-        best=max((1,2,3,4), key=lambda c: win.count(c))
-        mix[best]+=1.0
-    return _norm(mix)
-
-# --- Combinação 2 dígitos (transição)
-def _e_combo2(tail:List[int])->Dict[int,float]:
-    if len(tail)<2: return {1:0.25,2:0.25,3:0.25,4:0.25}
-    a,b = tail[-2], tail[-1]
-    counts={c:1.0 for c in (1,2,3,4)}  # laplace suave
-    for x,y in zip(tail[:-1], tail[1:]):
-        if x==a and y==b and (y in (1,2,3,4)):
-            pass # apenas marca ocorrência do par; distribuição será da posição seguinte
-    # coletar após pares iguais a (a,b)
-    for i in range(len(tail)-2):
-        if tail[i]==a and tail[i+1]==b:
-            nxt=tail[i+2]
-            if nxt in (1,2,3,4): counts[nxt]+=1
-    return _norm(counts)
-
-# --- Combinação 3 dígitos (padrão composto)
-def _e_combo3(tail:List[int])->Dict[int,float]:
-    if len(tail)<3: return {1:0.25,2:0.25,3:0.25,4:0.25}
-    a,b,c = tail[-3], tail[-2], tail[-1]
-    counts={c_:1.0 for c_ in (1,2,3,4)}
-    for i in range(len(tail)-3):
-        if tail[i]==a and tail[i+1]==b and tail[i+2]==c:
-            nxt=tail[i+3]
-            if nxt in (1,2,3,4): counts[nxt]+=1
-    return _norm(counts)
+def _post_e2_short(tail):  return _post_freq(tail, 40)
+def _post_e3_mid(tail):    return _post_freq(tail, 120)
+def _post_e4_long(tail):   return _post_freq(tail, 300)
 
 # --- clock pseudo-estacional (30 min)
 def _e_t30()->Dict[int,float]:
@@ -458,11 +429,9 @@ def _antibias_adjust(mix:Dict[int,float])->Tuple[Dict[int,float],dict]:
                  "same_reps":same_reps,"applied":" & ".join(parts) if parts else "none"})
     return adjusted, diag
 
-# ===== Anti-inversão (virada antecipada) =====
+# ===== Anti-inversão =====
 def _anti_inversion_filter(ranked:List[Tuple[int,float]], tail:List[int])->List[Tuple[int,float]]:
     if len(tail)<4 or len(ranked)<2: return ranked
-    # Heurística: se últimos 3 são iguais ou padrão AB A, e o top == último,
-    # mas combos2/3 favorecem runner-up, promove leve
     last=tail[-1]
     a,b,c = tail[-3], tail[-2], tail[-1]
     cond_triplo = (a==b==c)
@@ -546,37 +515,39 @@ def _ngram_snapshot(suggested:int)->str:
 # ===== decisão (ensemble + combos + regulador + antibias + slate + cooldown) =====
 def _neural_decide_slate()->Tuple[List[Tuple[int,float]], int, Dict[int,float], float, str, dict]:
     tail=_timeline_tail(400)
+
     # especialistas estatísticos
     p_cur=_post_e2_short(tail)
     p_mid=_post_e3_mid(tail)
     p_lon=_post_e4_long(tail)
     p_ng =_post_e1_ngram(tail)
-    p_fb =_e_fibo10(tail)
-    p_c2 =_e_combo2(tail)
-    p_c3 =_e_combo3(tail)
+
+    # especialistas do módulo fibo_experts
+    p_fb = fibo10_base(tail)            # base fibo
+    p_c2 = combo2_probs(tail)           # 2 dígitos
+    p_c3 = combo3_probs(tail)           # 3 dígitos
+    p_fa = fibo_adaptativa(tail)        # fibo adaptativa (usa c2/c3)
+
     p_t30=_e_t30()
     p_nn =_neural_probs(tail)
 
-    # pesos base (com IA reguladora pós-fibo)
+    # pesos (IA reguladora pós-fibo)
     temp, wneu, _=_load_neural_params()
-    rest=max(0.0, 1.0 - wneu)
-    # partição dentro do "rest"
-    W_STAT = 0.45*rest     # curto/médio/long/ngram
-    W_FIBO = 0.22*rest     # pedido seu: 0.22
-    W_COMB = 0.23*rest     # combos 2/3
+    rest = max(0.0, 1.0 - wneu)
+    W_STAT = 0.40*rest       # curto/médio/long/ngram
+    W_FIBO = 0.12*rest       # fibo base
+    W_FADP = 0.20*rest       # fibo adaptativa (principal extra)
+    W_COMB = 0.18*rest       # combos 2/3
     W_TCLK = 0.10*rest
 
-    # regulador leve: se último repete muito ou loss_streak alto, aumenta combos
-    sg=int(_kv_get("streak_green","0") or 0)
-    sl=int(_kv_get("streak_loss","0") or 0)
-    rep_last = 0
-    if len(tail)>=2 and tail[-1]==tail[-2]: rep_last=1
-    boost = min(0.08, 0.03*sl + (0.03 if rep_last else 0.0))
-    W_COMB = min(0.35, W_COMB + boost)
+    # regulagem (se streak de loss crescer, reforça FADP/COMB)
+    sl = int(_kv_get("streak_loss","0") or 0)
+    boost = min(0.10, 0.025*sl)
+    W_FADP = min(0.35, W_FADP + boost*0.6)
+    W_COMB = min(0.30, W_COMB + boost*0.4)
     take = boost
-    W_STAT = max(0.10, W_STAT - take*0.5)
-    W_FIBO = max(0.10, W_FIBO - take*0.3)
-    W_TCLK = max(0.05, W_TCLK - take*0.2)
+    W_STAT = max(0.12, W_STAT - take*0.7)
+    W_TCLK = max(0.05, W_TCLK - take*0.3)
 
     mix={}
     for c in (1,2,3,4):
@@ -585,6 +556,7 @@ def _neural_decide_slate()->Tuple[List[Tuple[int,float]], int, Dict[int,float], 
         mix[c] = (wneu*p_nn.get(c,0)
                   + W_STAT*stat
                   + W_FIBO*p_fb.get(c,0)
+                  + W_FADP*p_fa.get(c,0)
                   + W_COMB*comb
                   + W_TCLK*p_t30.get(c,0))
     mix=_conf_floor(_norm(mix), 0.30, 0.95)
@@ -607,7 +579,7 @@ def _neural_decide_slate()->Tuple[List[Tuple[int,float]], int, Dict[int,float], 
             ranked[0], ranked[1] = ranked[1], ranked[0]
 
     gap01 = (ranked[0][1] - ranked[1][1]) if len(ranked)>=2 else ranked[0][1]
-    reason=f"ProfoundSim+Multi+Combos(w={wneu:.2f},T={temp:.2f})"
+    reason=f"ProfoundSim+Multi+FiboAdapt/Combos(w={wneu:.2f},T={temp:.2f})"
     return ranked, _timeline_size(), adj, gap01, reason, ab_diag
 
 # ================== Telegram ==================
@@ -716,7 +688,7 @@ async def webhook(token: str, request: Request):
 
     # -------- ANALISANDO --------
     if RX_ANALISE.search(text):
-        if _seen_recent("analise", _dedupe_key(text)):  # evita spam de “analisando…”
+        if _seen_recent("analise", _dedupe_key(text)):
             return {"ok": True, "skipped": "analise_dupe"}
         seq=_parse_seq_list(text)
         if seq: _append_seq(seq)
@@ -733,14 +705,18 @@ async def webhook(token: str, request: Request):
             obs=_parse_close_digit(text)   # último dígito 1..4 no último par de (),[],{}
             if obs is not None:
                 _pending_seen_set(str(obs))
+
             seen=(_pending_get()["seen"] or "").strip()
             outcome="LOSS"; stage_lbl="G0"
             if seen.isdigit() and int(seen)==suggested: outcome="GREEN"
             final_seen=seen if seen else "X"
+
             msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
             if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
+
             if SHOW_DEBUG:
                 await tg_send(TARGET_CHANNEL, f"DEBUG: fechamento capturado -> {obs} | seen='{final_seen}' | nosso={suggested}")
+
             return {"ok": True, "closed": outcome, "seen": final_seen}
 
         if SHOW_DEBUG: await tg_send(TARGET_CHANNEL, "DEBUG: Fechamento reconhecido — sem pendência.")
