@@ -2,8 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v7.0 (G1-only, parser canal-fonte, IA hierárquica compacta, dedupe por conteúdo,
-      fechamento correto G0/G1, “Analisando...” com auto-delete, DB SQLite)
+v7.0.1 (G1-only + fechamento por () do canal-fonte + GREEN/LOSS com () + dedupe)
+
+- Fecha G0/G1 como antes, mas agora:
+  • capta o ÚLTIMO dígito 1..4 no ÚLTIMO par de parênteses na linha final
+  • se existir, usa como observação do fechamento (seen) — prioridade > "Sequência:"
+  • exibe o fechamento entre parênteses logo após GREEN/LOSS no aviso
 
 ENV obrigatórias (Render -> Environment):
 - TG_BOT_TOKEN
@@ -17,7 +21,7 @@ ENV opcionais:
 - OBS_TIMEOUT_SEC     (default 420)
 - DEDUP_WINDOW_SEC    (default 40)
 
-Start command:
+Start:
   uvicorn webhook_app:app --host 0.0.0.0 --port $PORT
 """
 
@@ -49,7 +53,7 @@ DB_PATH = "/opt/render/project/src/main.sqlite"
 # ------------------------------------------------------
 # App
 # ------------------------------------------------------
-app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.0")
+app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.0.1")
 
 # ------------------------------------------------------
 # DB helpers
@@ -168,6 +172,11 @@ def _pending_seen_append(nums: List[int], need:int=2):
     txt = "-".join(arr[:need])
     con = _con(); con.execute("UPDATE pending SET seen=? WHERE id=?", (txt, int(row["id"]))); con.commit(); con.close()
 
+def _pending_seen_set(v:str):
+    row = _pending_get()
+    if not row: return
+    con = _con(); con.execute("UPDATE pending SET seen=? WHERE id=?", (v, int(row["id"]))); con.commit(); con.close()
+
 def _pending_close(final_seen: str, outcome: str, stage_lbl: str, suggested:int)->str:
     row = _pending_get()
     if not row: return ""
@@ -180,7 +189,9 @@ def _pending_close(final_seen: str, outcome: str, stage_lbl: str, suggested:int)
     _append_seq(obs)
     our = suggested if outcome.upper()=="GREEN" else "X"
     snap = _ngram_snapshot(suggested)
-    msg = (f"{'🟢' if outcome.upper()=='GREEN' else '🔴'} <b>{outcome.upper()}</b> — finalizado "
+    # >>> MOSTRAR () APÓS GREEN/LOSS
+    paren = f" ({final_seen})" if final_seen else ""
+    msg = (f"{'🟢' if outcome.upper()=='GREEN' else '🔴'} <b>{outcome.upper()}</b>{paren} — finalizado "
            f"(<b>{stage_lbl}</b>, nosso={our}, observados={final_seen}).\n"
            f"📊 Geral: {_score_text()}\n\n{snap}")
     return msg
@@ -215,7 +226,6 @@ def _post_freq(tail:List[int], k:int)->Dict[int,float]:
     return _norm({c:win.count(c)/tot for c in (1,2,3,4)})
 
 def _post_e1_ngram(tail:List[int])->Dict[int,float]:
-    # proxy simples: mistura de janelas (Fibonacci curto embutido)
     mix={c:0.0 for c in (1,2,3,4)}
     for k,w in ((8,0.25),(21,0.35),(55,0.40)):
         pk=_post_freq(tail,k)
@@ -317,11 +327,11 @@ async def tg_delete(chat_id: str, message_id: int):
         pass
 
 # ------------------------------------------------------
-# Parser do canal-fonte
+# Parser do canal-fonte (+ fechamento por ())
 # ------------------------------------------------------
 RX_ENTRADA = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
 RX_ANALISE = re.compile(r"\bANALISANDO\b", re.I)
-RX_FECHA   = re.compile(r"APOSTA\s+ENCERRADA", re.I)
+RX_FECHA   = re.compile(r"APOSTA\s+ENCERRADA|RESULTADO|GREEN|RED|✅|❌", re.I)
 
 RX_SEQ     = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
 RX_NUMS    = re.compile(r"[1-4]")
@@ -330,6 +340,16 @@ RX_AFTER   = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
 RX_GREEN   = re.compile(r"GREEN|✅", re.I)
 RX_RED     = re.compile(r"RED|❌", re.I)
 RX_PAREN   = re.compile(r"\(([^\)]*)\)\s*$")
+
+# pega o ÚLTIMO parêntese da linha final (preferível para G0)
+RX_LAST_PAREN_END = re.compile(r"\(([^\)]*)\)\s*(?:✅|❌|GREEN|RED)?\s*$", re.I | re.M)
+
+def _strip_noise(s: str) -> str:
+    return (s or "").replace("\u200d","").replace("\u200c","").replace("\ufe0f","").strip()
+
+def _extract_last_digit_1_4(chunk: str) -> Optional[int]:
+    nums = re.findall(r"[1-4]", chunk or "")
+    return int(nums[-1]) if nums else None
 
 def _parse_seq_list(text:str)->List[int]:
     m=RX_SEQ.search(text or "")
@@ -351,6 +371,12 @@ def _parse_paren_pair(text:str, need:int=2)->List[int]:
     if not m: return []
     nums=[int(x) for x in re.findall(r"[1-4]", m.group(1))]
     return nums[:need]
+
+def _parse_close_digit(text: str) -> Optional[int]:
+    t = _strip_noise(text)
+    m = RX_LAST_PAREN_END.search(t)
+    if not m: return None
+    return _extract_last_digit_1_4(m.group(1))
 
 # ------------------------------------------------------
 # Rotas básicas
@@ -407,12 +433,17 @@ async def webhook(token: str, request: Request):
         if pend:
             suggested=int(pend["suggested"] or 0)
 
-            # (a) Observados do PLACAR: usar a linha "Sequência: a | b"
+            # (a) Observados do PLACAR via "Sequência: a | b"
             obs_pair = _parse_seq_pair(text, need=min(2, MAX_GALE+1))
             if obs_pair:
                 _pending_seen_append(obs_pair, need=min(2, MAX_GALE+1))
 
-            # (b) Memória extra: números finais entre parênteses "(x | y)" -> só para timeline
+            # (b) Dígito no ÚLTIMO parêntese na linha final -> prioriza G0
+            close_digit = _parse_close_digit(text)
+            if close_digit is not None:
+                _pending_seen_set(str(close_digit))
+
+            # (c) Memória extra: quaisquer parênteses finais (timeline)
             extra_tail = _parse_paren_pair(text, need=2)
             if extra_tail:
                 _append_seq(extra_tail)
@@ -421,28 +452,26 @@ async def webhook(token: str, request: Request):
             pend=_pending_get()
             seen = [s for s in (pend["seen"] or "").split("-") if s]
 
-            # Regra: se G0 != sugerido e ainda temos espaço para G1, NÃO fecha; aguarda próxima rodada
+            # Regra: se G0 != sugerido e ainda temos espaço para G1, aguarda
             if len(seen)==1 and seen[0].isdigit() and int(seen[0]) != suggested and MAX_GALE>=1:
-                # mantém pendência aberta para o G1
                 if SHOW_DEBUG:
                     await tg_send(TARGET_CHANNEL, f"DEBUG: aguardando G1 (visto G0={seen[0]}, nosso={suggested}).")
                 return {"ok": True, "waiting_g1": True, "seen": "-".join(seen)}
 
-            # Decisão final (se já temos 1 ou 2 observados suficientes)
+            # Decisão final
             outcome="LOSS"; stage_lbl="G1"
             if len(seen)>=1 and seen[0].isdigit() and int(seen[0])==suggested:
                 outcome="GREEN"; stage_lbl="G0"
             elif len(seen)>=2 and seen[1].isdigit() and int(seen[1])==suggested and MAX_GALE>=1:
                 outcome="GREEN"; stage_lbl="G1"
 
-            # fecha se: GREEN no G0, ou já temos G1 observado (independente de GREEN/LOSS)
+            # fecha se GREEN no G0, ou se já temos G1 observado
             if stage_lbl=="G0" or len(seen)>=min(2, MAX_GALE+1):
                 final_seen="-".join(seen[:min(2, MAX_GALE+1)]) if seen else "X"
                 msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
                 if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
                 return {"ok": True, "closed": outcome, "seen": final_seen}
             else:
-                # ainda aguardando G1 (cenário raro se MAX_GALE>1 futuramente)
                 return {"ok": True, "waiting_more_obs": True, "seen": "-".join(seen)}
 
         return {"ok": True, "noted_close": True}
@@ -456,9 +485,9 @@ async def webhook(token: str, request: Request):
 
         seq=_parse_seq_list(text)
         if seq: _append_seq(seq)               # memória
-        after = _parse_after(text)             # usado apenas para exibir "após X"
+        after = _parse_after(text)             # apenas para exibir "após X"
 
-        # fecha pendência anterior se esquecida (com X)
+        # fecha pendência esquecida (X)
         pend=_pending_get()
         if pend:
             seen=[s for s in (pend["seen"] or "").split("-") if s]
@@ -473,10 +502,8 @@ async def webhook(token: str, request: Request):
             msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
             if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
 
-        # “Analisando...” (apaga depois)
         analyzing_id = await tg_send_return(TARGET_CHANNEL, "⏳ Analisando padrão, aguarde...")
 
-        # escolhe nova sugestão
         best, conf, samples, post, gap, reason = _choose_number()
         opened=_pending_open(best)
         if opened:
@@ -487,10 +514,8 @@ async def webhook(token: str, request: Request):
                  f"🧠 <b>Modo:</b> {reason}\n"
                  f"{_ngram_snapshot(best)}")
             await tg_send(TARGET_CHANNEL, txt)
-
             if analyzing_id is not None:
                 await tg_delete(TARGET_CHANNEL, analyzing_id)
-
             return {"ok": True, "entry_opened": True, "best": best, "conf": conf}
         else:
             if analyzing_id is not None:
