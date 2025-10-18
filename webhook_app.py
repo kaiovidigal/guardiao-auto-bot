@@ -2,15 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v7.4.0-fibo-pro+  (G0-only; ProfoundSim + NeuroController + Fibonacci reforçado)
-- Fecha G0 pelo último número entre parênteses (ex.: GREEN (3)/RED (4))
-- IA Profunda Híbrida (ProfoundSim) DOMINANTE + especialistas estatísticos
-- Especialista Fibonacci reforçado (8,21,55 com peso alto) + janelas profundas 233/377 na neural
-- Neuro IA Controladora: calibra risco (epsilon, min_conf, cool-down, regime)
-- Aprendizado leve por reforço (EMA) a cada GREEN/LOSS
-- Anti-trava: timeout de pendência (fecha LOSS G0 X)
-- Admin: /admin/status, /admin/unlock, /debug_cfg
-- Dedupe + SQLite (CPU-only)
+v7.4.0-antibias  (G0-only; ProfoundSim-Fibo10+T30 + NeuroController + AntiBias)
+- Fecha G0 pelo último número entre parênteses
+- ProfoundSim DOMINANTE + especialistas estatísticos (Fibo10 + T30)
+- NeuroController (epsilon/min_conf/cooldown/regime)
+- **AntiBias**: trava dominância, corta confiança e empurra contra vícios do histórico
+- Reforço leve (EMA) por GREEN/LOSS
+- Endpoints admin p/ ajustes sem shell
 """
 
 import os, re, time, sqlite3, datetime, hashlib, math, json, random
@@ -35,8 +33,7 @@ if not TG_BOT_TOKEN or not WEBHOOK_TOKEN or not TARGET_CHANNEL:
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 DB_PATH = "/opt/render/project/src/main.sqlite"
 
-# ================== APP ==================
-app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.4.0-fibo-pro+")
+app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.4.0-antibias")
 
 # ================== DB ==================
 def _con():
@@ -47,73 +44,61 @@ def _con():
     return con
 
 def db_init():
-    con = _con(); cur = con.cursor()
+    con=_con(); cur=con.cursor()
     cur.execute("""CREATE TABLE IF NOT EXISTS processed(
-        update_id TEXT PRIMARY KEY,
-        seen_at   INTEGER NOT NULL
-    )""")
+        update_id TEXT PRIMARY KEY, seen_at INTEGER NOT NULL)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS timeline(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        created_at INTEGER NOT NULL,
-        number INTEGER NOT NULL
-    )""")
+        id INTEGER PRIMARY KEY AUTOINCREMENT, created_at INTEGER NOT NULL, number INTEGER NOT NULL)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS pending(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        created_at INTEGER,
-        opened_at  INTEGER,
-        suggested  INTEGER,
-        seen       TEXT     DEFAULT '',
-        open       INTEGER  DEFAULT 1
-    )""")
+        id INTEGER PRIMARY KEY AUTOINCREMENT, created_at INTEGER, opened_at INTEGER,
+        suggested INTEGER, seen TEXT DEFAULT '', open INTEGER DEFAULT 1)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS score(
-        id INTEGER PRIMARY KEY CHECK(id=1),
-        green INTEGER DEFAULT 0,
-        loss  INTEGER DEFAULT 0,
-        streak_green INTEGER DEFAULT 0,
-        streak_loss  INTEGER DEFAULT 0
-    )""")
+        id INTEGER PRIMARY KEY CHECK(id=1), green INTEGER DEFAULT 0, loss INTEGER DEFAULT 0,
+        streak_green INTEGER DEFAULT 0, streak_loss INTEGER DEFAULT 0)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS dedupe(
-        kind TEXT NOT NULL,
-        dkey TEXT NOT NULL,
-        ts   INTEGER NOT NULL,
-        PRIMARY KEY (kind, dkey)
-    )""")
-    # parâmetros ProfoundSim
+        kind TEXT NOT NULL, dkey TEXT NOT NULL, ts INTEGER NOT NULL,
+        PRIMARY KEY (kind, dkey))""")
     cur.execute("""CREATE TABLE IF NOT EXISTS neural(
         id INTEGER PRIMARY KEY CHECK(id=1),
-        temp REAL DEFAULT 0.85,
-        bias_json TEXT DEFAULT '{"1":0.0,"2":0.0,"3":0.0,"4":0.0}',
-        weight_neural REAL DEFAULT 0.72
-    )""")
+        temp REAL DEFAULT 0.85, bias_json TEXT DEFAULT '{"1":0,"2":0,"3":0,"4":0}',
+        weight_neural REAL DEFAULT 0.70)""")
     # controlador
     cur.execute("""CREATE TABLE IF NOT EXISTS neuroctl(
         id INTEGER PRIMARY KEY CHECK(id=1),
-        epsilon REAL DEFAULT 0.06,
-        min_conf REAL DEFAULT 0.58,
-        cool_after_losses INTEGER DEFAULT 2,
-        cool_secs INTEGER DEFAULT 180,
-        throttle_until INTEGER DEFAULT 0,
-        regime TEXT DEFAULT 'neutral'
+        epsilon REAL DEFAULT 0.06, min_conf REAL DEFAULT 0.58,
+        cool_after_losses INTEGER DEFAULT 2, cool_secs INTEGER DEFAULT 180,
+        throttle_until INTEGER DEFAULT 0, regime TEXT DEFAULT 'neutral')""")
+    # AntiBias + log de sugestões
+    cur.execute("""CREATE TABLE IF NOT EXISTS antibias(
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        enabled INTEGER DEFAULT 1,
+        dom_cap REAL DEFAULT 0.60,     -- nenhuma classe pode passar disso no mix
+        conf_cap REAL DEFAULT 0.82,    -- teto de confiança exibida
+        decay REAL DEFAULT 0.92        -- força do empurrão (0..1), menor = mais forte
     )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS suggestions(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at INTEGER NOT NULL, suggested INTEGER NOT NULL, conf REAL NOT NULL,
+        outcome TEXT DEFAULT NULL)""")
     if not con.execute("SELECT 1 FROM score WHERE id=1").fetchone():
         con.execute("INSERT INTO score(id,green,loss,streak_green,streak_loss) VALUES(1,0,0,0,0)")
     if not con.execute("SELECT 1 FROM neural WHERE id=1").fetchone():
-        con.execute("INSERT INTO neural(id,temp,bias_json,weight_neural) VALUES(1,0.85,'{\"1\":0.0,\"2\":0.0,\"3\":0.0,\"4\":0.0}',0.72)")
+        con.execute("INSERT INTO neural(id,temp,bias_json,weight_neural) VALUES(1,0.85,'{\"1\":0,\"2\":0,\"3\":0,\"4\":0}',0.70)")
     if not con.execute("SELECT 1 FROM neuroctl WHERE id=1").fetchone():
         con.execute("INSERT INTO neuroctl(id,epsilon,min_conf,cool_after_losses,cool_secs,throttle_until,regime) VALUES(1,0.06,0.58,2,180,0,'neutral')")
+    if not con.execute("SELECT 1 FROM antibias WHERE id=1").fetchone():
+        con.execute("INSERT INTO antibias(id,enabled,dom_cap,conf_cap,decay) VALUES(1,1,0.60,0.82,0.92)")
     con.commit(); con.close()
 db_init()
 
+# -------- util db básicos --------
 def _mark_processed(upd: str):
     try:
-        con = _con()
-        con.execute("INSERT OR IGNORE INTO processed(update_id,seen_at) VALUES(?,?)",
-                    (str(upd), int(time.time())))
+        con=_con()
+        con.execute("INSERT OR IGNORE INTO processed(update_id,seen_at) VALUES(?,?)",(str(upd), int(time.time())))
         con.commit(); con.close()
-    except Exception:
-        pass
+    except Exception: pass
 
-# ========= timeline util =========
 def _timeline_tail(n:int=400)->List[int]:
     con=_con()
     rows=con.execute("SELECT number FROM timeline ORDER BY id DESC LIMIT ?",(n,)).fetchall()
@@ -123,33 +108,30 @@ def _timeline_tail(n:int=400)->List[int]:
 def _append_seq(seq: List[int]):
     if not seq: return
     con=_con(); now=int(time.time())
-    con.executemany("INSERT INTO timeline(created_at,number) VALUES(?,?)",
-                    [(now,int(x)) for x in seq])
+    con.executemany("INSERT INTO timeline(created_at,number) VALUES(?,?)",[(now,int(x)) for x in seq])
     con.commit(); con.close()
 
 def _timeline_size()->int:
     con=_con(); row=con.execute("SELECT COUNT(*) c FROM timeline").fetchone(); con.close()
     return int(row["c"] or 0)
 
-# ========= score/performance =========
+# -------- score/performance --------
 def _score_add(outcome:str):
     con=_con()
     row=con.execute("SELECT green,loss,streak_green,streak_loss FROM score WHERE id=1").fetchone()
-    g,l,sg,sl = (int(row["green"]), int(row["loss"]), int(row["streak_green"]), int(row["streak_loss"])) if row else (0,0,0,0)
-    if outcome.upper()=="GREEN":
-        g+=1; sg+=1; sl=0
-    elif outcome.upper()=="LOSS":
-        l+=1; sl+=1; sg=0
+    g,l,sg,sl=(int(row["green"]),int(row["loss"]),int(row["streak_green"]),int(row["streak_loss"])) if row else (0,0,0,0)
+    if outcome.upper()=="GREEN": g+=1; sg+=1; sl=0
+    elif outcome.upper()=="LOSS": l+=1; sl+=1; sg=0
     con.execute("INSERT OR REPLACE INTO score(id,green,loss,streak_green,streak_loss) VALUES(1,?,?,?,?)",(g,l,sg,sl))
     con.commit(); con.close()
 
 def _score_text()->str:
-    con = _con(); row = con.execute("SELECT green,loss FROM score WHERE id=1").fetchone(); con.close()
+    con=_con(); row=con.execute("SELECT green,loss FROM score WHERE id=1").fetchone(); con.close()
     g,l = (int(row["green"]), int(row["loss"])) if row else (0,0)
     tot=g+l; acc=(g/tot*100.0) if tot>0 else 0.0
     return f"{g} GREEN × {l} LOSS — {acc:.1f}%"
 
-# ========= pending =========
+# -------- pending --------
 def _pending_get()->Optional[sqlite3.Row]:
     con=_con(); row=con.execute("SELECT * FROM pending WHERE open=1 ORDER BY id DESC LIMIT 1").fetchone(); con.close()
     return row
@@ -157,8 +139,7 @@ def _pending_get()->Optional[sqlite3.Row]:
 def _pending_open(suggested:int):
     if _pending_get(): return False
     con=_con(); now=int(time.time())
-    con.execute("""INSERT INTO pending(created_at,opened_at,suggested,seen,open)
-                   VALUES(?,?,?,?,1)""",(now, now, int(suggested), ""))
+    con.execute("INSERT INTO pending(created_at,opened_at,suggested,seen,open) VALUES(?,?,?,?,1)",(now, now, int(suggested), ""))
     con.commit(); con.close()
     return True
 
@@ -172,8 +153,11 @@ def _pending_close(final_seen: str, outcome: str, stage_lbl: str, suggested:int)
     if not row: return ""
     con=_con()
     con.execute("UPDATE pending SET open=0, seen=? WHERE id=?", (final_seen, int(row["id"])))
+    # loga outcome na última sugestão aberta
+    try:
+        con.execute("UPDATE suggestions SET outcome=? WHERE id=(SELECT id FROM suggestions ORDER BY id DESC LIMIT 1)", (outcome,))
+    except Exception: pass
     con.commit(); con.close()
-    # feedback
     _update_neural_feedback(suggested, outcome)
     _score_add(outcome)
     obs=[int(x) for x in final_seen.split("-") if x.isdigit()]
@@ -186,22 +170,19 @@ def _pending_close(final_seen: str, outcome: str, stage_lbl: str, suggested:int)
 
 # ============== ANTI-TRAVA (timeout) ==============
 def _pending_timeout_check() -> Optional[dict]:
-    row = _pending_get()
+    row=_pending_get()
     if not row: return None
-    opened_at = int(row["opened_at"] or 0)
-    now = int(time.time())
+    opened_at=int(row["opened_at"] or 0); now=int(time.time())
     if now - opened_at >= OBS_TIMEOUT_SEC:
-        suggested = int(row["suggested"] or 0)
-        final_seen = "X"
-        outcome = "LOSS"
-        stage_lbl = "G0"
-        msg_txt = _pending_close(final_seen, outcome, stage_lbl, suggested)
+        suggested=int(row["suggested"] or 0)
+        final_seen="X"; outcome="LOSS"; stage_lbl="G0"
+        msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
         return {"timeout_closed": True, "final_seen": final_seen, "suggested": suggested, "msg": msg_txt}
     return None
 
 # ============== DEDUPE ==============
 def _dedupe_key(text: str) -> str:
-    base = re.sub(r"\s+", " ", (text or "")).strip().lower()
+    base=re.sub(r"\s+", " ", (text or "")).strip().lower()
     return hashlib.sha1(base.encode("utf-8")).hexdigest()
 
 def _seen_recent(kind: str, dkey: str) -> bool:
@@ -225,29 +206,24 @@ def _post_freq(tail:List[int], k:int)->Dict[int,float]:
     tot=max(1,len(win))
     return _norm({c:win.count(c)/tot for c in (1,2,3,4)})
 
-# >>>>>>>>>>>>>> FIBONACCI REFORÇADO (E1 PRO+) <<<<<<<<<<<<<<
-def _e_fibo(tail:List[int])->Dict[int,float]:
-    """
-    Especialista principal: reforça janelas Fibonacci, priorizando 55 (mais forte).
-    Pesos: 8=0.20, 21=0.30, 55=0.50
-    """
+# Fibo10 = janelas curtas com pesos (8,13,21,34,55)
+def _post_e1_ngram(tail:List[int])->Dict[int,float]:
     mix={c:0.0 for c in (1,2,3,4)}
-    for k,w in ((8,0.20),(21,0.30),(55,0.50)):
+    for k,w in ((8,0.15),(13,0.18),(21,0.22),(34,0.22),(55,0.23)):
         pk=_post_freq(tail,k)
-        for c in (1,2,3,4): 
-            mix[c]+=w*pk[c]
+        for c in (1,2,3,4): mix[c]+=w*pk[c]
     return _norm(mix)
 
-def _post_e2_short(tail):  return _post_freq(tail, 60)
-def _post_e3_long(tail):   return _post_freq(tail, 300)
-def _post_e4_llm(tail):    return {1:0.25,2:0.25,3:0.25,4:0.25}
+# T30 = tendência curta 30 últimos
+def _post_e2_t30(tail):  return _post_freq(tail, 30)
+def _post_e3_long(tail): return _post_freq(tail, 300)
+def _post_e4_llm(tail):  return {1:0.25,2:0.25,3:0.25,4:0.25}
 
 def _conf_floor(post:Dict[int,float], floor=0.30, cap=0.95):
     post=_norm({c:float(post.get(c,0)) for c in (1,2,3,4)})
     b=max(post,key=post.get); mx=post[b]
     if mx<floor:
-        others=[c for c in (1,2,3,4) if c!=b]
-        s=sum(post[c] for c in others)
+        others=[c for c in (1,2,3,4) if c!=b]; s=sum(post[c] for c in others)
         take=min(floor-mx, s)
         if s>0:
             scale=(s-take)/s
@@ -263,131 +239,152 @@ def _conf_floor(post:Dict[int,float], floor=0.30, cap=0.95):
 # ============== IA Profunda Híbrida (ProfoundSim) ==============
 def _load_neural_params():
     con=_con(); row=con.execute("SELECT temp,bias_json,weight_neural FROM neural WHERE id=1").fetchone(); con.close()
-    temp = float(row["temp"] if row else 0.85)
-    wneu = float(row["weight_neural"] if row else 0.72)
-    try:
-        bias = json.loads(row["bias_json"]) if row and row["bias_json"] else {"1":0.0,"2":0.0,"3":0.0,"4":0.0}
-    except Exception:
-        bias = {"1":0.0,"2":0.0,"3":0.0,"4":0.0}
+    temp=float(row["temp"] if row else 0.85)
+    wneu=float(row["weight_neural"] if row else 0.70)
+    try: bias=json.loads(row["bias_json"]) if row and row["bias_json"] else {"1":0.0,"2":0.0,"3":0.0,"4":0.0}
+    except Exception: bias={"1":0.0,"2":0.0,"3":0.0,"4":0.0}
     return temp, wneu, {int(k):float(v) for k,v in bias.items()}
 
 def _save_neural_params(temp:float=None, wneu:float=None, bias:Dict[int,float]=None):
     con=_con(); row=con.execute("SELECT temp,bias_json,weight_neural FROM neural WHERE id=1").fetchone()
-    cur_temp = float(row["temp"] if row else 0.85)
-    cur_w    = float(row["weight_neural"] if row else 0.72)
-    cur_bias = json.loads(row["bias_json"]) if row and row["bias_json"] else {"1":0.0,"2":0.0,"3":0.0,"4":0.0}
-    if temp is not None: cur_temp = float(temp)
-    if wneu is not None: cur_w    = float(wneu)
-    if bias is not None: cur_bias = {str(k):float(v) for k,v in bias.items()}
+    cur_temp=float(row["temp"] if row else 0.85)
+    cur_w=float(row["weight_neural"] if row else 0.70)
+    cur_bias=json.loads(row["bias_json"]) if row and row["bias_json"] else {"1":0.0,"2":0.0,"3":0.0,"4":0.0}
+    if temp is not None: cur_temp=float(temp)
+    if wneu is not None: cur_w=float(wneu)
+    if bias is not None: cur_bias={str(k):float(v) for k,v in bias.items()}
     con.execute("INSERT OR REPLACE INTO neural(id,temp,bias_json,weight_neural) VALUES(1,?,?,?)",
                 (cur_temp, json.dumps(cur_bias), cur_w))
     con.commit(); con.close()
 
 def _features_from_tail(tail:List[int])->List[float]:
-    """
-    ~32+ features; agora com janelas Fibonacci profundas 233 e 377.
-    """
     if not tail: return [0.25,0.25,0.25,0.25] + [0.0]*28
-    L = len(tail)
-    freq = [tail.count(c)/L for c in (1,2,3,4)]
-    wins = []
-    for k in (8,13,21,34,55,89,144,233,377):  # <<< adição pro+
-        win = tail[-k:] if L>=k else tail
+    L=len(tail)
+    freq=[tail.count(c)/L for c in (1,2,3,4)]
+    wins=[]
+    for k in (8,13,21,34,55,89,144):
+        win=tail[-k:] if L>=k else tail
         wins.extend([win.count(c)/max(1,len(win)) for c in (1,2,3,4)])
-    trans = [[0]*4 for _ in range(4)]
+    trans=[[0]*4 for _ in range(4)]
     for a,b in zip(tail[:-1], tail[1:]): trans[a-1][b-1]+=1
     trans_norm=[]
     for i in range(4):
         s=sum(trans[i]) or 1
         trans_norm.extend([trans[i][j]/s for j in range(4)])
-    streaks=[0,0,0,0]
-    cur=tail[-1]; s=0
+    streaks=[0,0,0,0]; cur=tail[-1]; s=0
     for x in reversed(tail):
         if x==cur: s+=1
         else: break
-    streaks[cur-1]=s/max(1, min(20,L))
-    mean = sum(tail)/L
-    var  = sum((x-mean)**2 for x in tail)/L
-    ent  = 0.0
+    streaks[cur-1]=s/max(1,min(20,L))
+    mean=sum(tail)/L; var=sum((x-mean)**2 for x in tail)/L
+    ent=0.0
     for p in freq:
-        if p>0: ent -= p*math.log(p+1e-12)
+        if p>0: ent-= p*math.log(p+1e-12)
     return freq + wins + trans_norm + streaks + [var/3.0, ent/1.4]
 
 def _profoundsim_logits(feat:List[float], seed_base:int)->List[float]:
-    H = 512
-    h = [0.0]*H
+    H=512
+    h=[0.0]*H
     for i in range(H):
-        s = 0.0
-        for j, f in enumerate(feat):
-            seed = seed_base + i*131 + j*17
-            w = math.sin(seed*0.000113) * math.cos(seed*0.000071)
-            s += f * w
-        h[i] = math.tanh(1.2*s + 0.15*math.sin(s*3.0))
-    logits = [0.0,0.0,0.0,0.0]
+        s=0.0
+        for j,f in enumerate(feat):
+            seed=seed_base + i*131 + j*17
+            w=math.sin(seed*0.000113) * math.cos(seed*0.000071)
+            s+= f*w
+        h[i]=math.tanh(1.2*s + 0.15*math.sin(s*3.0))
+    logits=[0.0,0.0,0.0,0.0]
     for c in range(4):
         s=0.0
-        for i, val in enumerate(h):
-            seed = seed_base + (c+1)*997 + i*29
-            w = math.sin(seed*0.000091) * math.cos(seed*0.000067)
-            s += val * w
-        logits[c] = s
+        for i,val in enumerate(h):
+            seed=seed_base + (c+1)*997 + i*29
+            w=math.sin(seed*0.000091) * math.cos(seed*0.000067)
+            s+= val*w
+        logits[c]=s
     return logits
 
 def _softmax(x:List[float], temp:float)->List[float]:
-    m = max(x)
-    ex = [math.exp((xi-m)/max(0.15, temp)) for xi in x]
-    s = sum(ex) or 1e-9
+    m=max(x); ex=[math.exp((xi-m)/max(0.15,temp)) for xi in x]; s=sum(ex) or 1e-9
     return [e/s for e in ex]
 
 def _neural_probs(tail:List[int])->Dict[int,float]:
-    temp, _, bias = _load_neural_params()
-    feat = _features_from_tail(tail)
-    seed_base = len(tail)*1009 + (sum(tail)%997)
-    logits = _profoundsim_logits(feat, seed_base)
-    for idx,c in enumerate((1,2,3,4)):
-        logits[idx] += float(bias.get(c,0.0))
-    probs = _softmax(logits, temp)
+    temp,_,bias=_load_neural_params()
+    feat=_features_from_tail(tail)
+    seed_base=len(tail)*1009 + (sum(tail)%997)
+    logits=_profoundsim_logits(feat, seed_base)
+    for idx,c in enumerate((1,2,3,4)): logits[idx]+= float(bias.get(c,0.0))
+    probs=_softmax(logits, temp)
     return {c: float(probs[c-1]) for c in (1,2,3,4)}
 
 def _calibrate_from_score():
-    con=_con()
-    row=con.execute("SELECT green,loss FROM score WHERE id=1").fetchone()
-    con.close()
+    con=_con(); row=con.execute("SELECT green,loss FROM score WHERE id=1").fetchone(); con.close()
     if not row: return
-    g,l = int(row["green"]), int(row["loss"])
-    tot = g+l
-    if tot < 50: return
-    acc = g/max(1,tot)
-    temp, wneu, bias = _load_neural_params()
-    new_temp = max(0.55, min(1.10, 1.00 - 0.35*(acc-0.50)))
-    new_wneu = max(0.58, min(0.88, 0.62 + 0.52*(acc-0.50)))  # ligeiro buff no peso neural
+    g,l=int(row["green"]),int(row["loss"]); tot=g+l
+    if tot<50: return
+    acc=g/max(1,tot)
+    temp,wneu,_bias=_load_neural_params()
+    new_temp=max(0.55, min(1.10, 1.00 - 0.35*(acc-0.50)))
+    new_wneu=max(0.55, min(0.85, 0.60 + 0.50*(acc-0.50)))
     _save_neural_params(temp=new_temp, wneu=new_wneu, bias=None)
 
 def _update_neural_feedback(suggested:int, outcome:str):
-    temp, wneu, bias = _load_neural_params()
-    delta = 0.10 if outcome.upper()=="GREEN" else -0.07
-    ema   = 0.90
-    cur = float(bias.get(suggested,0.0))
-    new = ema*cur + (1-ema)*delta
-    bias[suggested] = new
+    temp,wneu,bias=_load_neural_params()
+    delta=0.10 if outcome.upper()=="GREEN" else -0.07
+    ema=0.90
+    cur=float(bias.get(suggested,0.0)); new=ema*cur + (1-ema)*delta
+    bias[suggested]=new
     _save_neural_params(bias=bias)
     _calibrate_from_score()
+
+# ============== AntiBias ==============
+def _ab_load():
+    con=_con(); row=con.execute("SELECT enabled,dom_cap,conf_cap,decay FROM antibias WHERE id=1").fetchone(); con.close()
+    if not row: return 1,0.60,0.82,0.92
+    return int(row["enabled"]), float(row["dom_cap"]), float(row["conf_cap"]), float(row["decay"])
+
+def _antibias_adjust(mix:Dict[int,float], conf:float)->Tuple[Dict[int,float], float, str]:
+    enabled, dom_cap, conf_cap, decay = _ab_load()
+    if not enabled: return mix, conf, "AntiBias:off"
+    tail=_timeline_tail(200)
+    if len(tail)<40:
+        # ainda pouco dado; só limita dominância/conf
+        mm=_norm(mix.copy()); b=max(mm,key=mm.get)
+        if mm[b]>dom_cap:
+            extra=mm[b]-dom_cap; mm[b]=dom_cap
+            add=extra/3.0
+            for c in (1,2,3,4):
+                if c!=b: mm[c]+=add
+        return _norm(mm), min(conf, conf_cap), f"AntiBias:cap(dom≤{dom_cap:.2f},conf≤{conf_cap:.2f})"
+    # empurra contra “vício” (freq-0.25)
+    L=len(tail)
+    freq={c: tail.count(c)/L for c in (1,2,3,4)}
+    mm=_norm(mix.copy())
+    for c in (1,2,3,4):
+        bias = freq[c]-0.25
+        mm[c] = max(1e-6, mm[c] * (decay if bias>0 else 1.0/(decay)))  # se está “viciado”, reduz
+    mm=_norm(mm)
+    # tampa dominância
+    b=max(mm,key=mm.get)
+    if mm[b]>dom_cap:
+        extra=mm[b]-dom_cap; mm[b]=dom_cap
+        add=extra/3.0
+        for c in (1,2,3,4):
+            if c!=b: mm[c]+=add
+    return _norm(mm), min(conf, conf_cap), f"AntiBias:on(dom≤{dom_cap:.2f},conf≤{conf_cap:.2f},decay={decay:.2f})"
 
 # ============== Neuro IA Controladora ==============
 def _ctl_load():
     con=_con(); row=con.execute("SELECT epsilon,min_conf,cool_after_losses,cool_secs,throttle_until,regime FROM neuroctl WHERE id=1").fetchone(); con.close()
-    if not row:
-        return 0.06, 0.58, 2, 180, 0, "neutral"
+    if not row: return 0.06,0.58,2,180,0,"neutral"
     return float(row["epsilon"]), float(row["min_conf"]), int(row["cool_after_losses"]), int(row["cool_secs"]), int(row["throttle_until"]), str(row["regime"])
 
 def _ctl_save(eps=None, minc=None, coolN=None, coolS=None, thr=None, reg=None):
-    e,mn,cn,cs,th,rg = _ctl_load()
-    if eps is not None: e = float(eps)
-    if minc is not None: mn = float(minc)
-    if coolN is not None: cn = int(coolN)
-    if coolS is not None: cs = int(coolS)
-    if thr is not None: th = int(thr)
-    if reg is not None: rg = str(reg)
+    e,mn,cn,cs,th,rg=_ctl_load()
+    if eps is not None: e=float(eps)
+    if minc is not None: mn=float(minc)
+    if coolN is not None: cn=int(coolN)
+    if coolS is not None: cs=int(coolS)
+    if thr is not None: th=int(thr)
+    if reg is not None: rg=str(reg)
     con=_con()
     con.execute("""INSERT OR REPLACE INTO neuroctl(id,epsilon,min_conf,cool_after_losses,cool_secs,throttle_until,regime)
                    VALUES(1,?,?,?,?,?,?)""",(e,mn,cn,cs,th,rg))
@@ -402,97 +399,84 @@ def _ctl_regime_update():
     tail=_timeline_tail(200)
     if len(tail)<50:
         _ctl_save(reg="neutral"); return "neutral"
-    freq = [tail.count(c)/len(tail) for c in (1,2,3,4)]
-    ent = 0.0
+    freq=[tail.count(c)/len(tail) for c in (1,2,3,4)]
+    ent=0.0
     for p in freq:
         if p>0: ent -= p*math.log(p+1e-12)
-    mean = sum(tail)/len(tail)
-    var  = sum((x-mean)**2 for x in tail)/len(tail)
-    _,_,_, streak_loss = _ctl_perf()
-    if ent < 1.15 or var > 1.70 or streak_loss>=2:
-        _ctl_save(reg="volatile")
-        return "volatile"
-    if ent > 1.30 and var < 1.40:
-        _ctl_save(reg="stable")
-        return "stable"
+    mean=sum(tail)/len(tail); var=sum((x-mean)**2 for x in tail)/len(tail)
+    _,_,_,streak_loss=_ctl_perf()
+    if ent<1.15 or var>1.70 or streak_loss>=2:
+        _ctl_save(reg="volatile"); return "volatile"
+    if ent>1.30 and var<1.40:
+        _ctl_save(reg="stable"); return "stable"
     _ctl_save(reg="neutral"); return "neutral"
 
 def _ctl_decide(best:int, conf:float, mix:Dict[int,float], gap:float)->Tuple[bool,str,int]:
-    now = int(time.time())
-    eps, minc, coolN, coolS, thr, reg = _ctl_load()
-    g,l,sg,sl = _ctl_perf()
-
-    if now < thr:
-        return False, f"cooldown até {thr} (loss_streak={sl})", -1
-
-    regime = _ctl_regime_update()
-    dyn_min = minc
-    if regime=="volatile":
-        dyn_min = min(0.68, max(minc, 0.62))
-    elif regime=="stable":
-        dyn_min = max(0.54, minc-0.02)
-
-    if conf < dyn_min:
-        return False, f"conf {conf:.2f} < min {dyn_min:.2f} (regime={regime})", -1
-
-    second = sorted(mix.items(), key=lambda kv: kv[1], reverse=True)[1][0]
-    if gap < 0.03 and random.random() < eps:
+    now=int(time.time())
+    eps, minc, coolN, coolS, thr, reg=_ctl_load()
+    g,l,sg,sl=_ctl_perf()
+    if now<thr: return False, f"cooldown até {thr} (loss_streak={sl})", -1
+    regime=_ctl_regime_update()
+    dyn_min=minc
+    if regime=="volatile": dyn_min=min(0.68, max(minc,0.62))
+    elif regime=="stable": dyn_min=max(0.54, minc-0.02)
+    if conf<dyn_min: return False, f"conf {conf:.2f} < min {dyn_min:.2f} (regime={regime})", -1
+    second=sorted(mix.items(), key=lambda kv: kv[1], reverse=True)[1][0]
+    if gap<0.03 and random.random()<eps:
         return True, f"explore ε={eps:.2f} (gap={gap:.3f})", int(second)
-
     return True, f"exploit (gap={gap:.3f}, regime={regime})", int(best)
 
 def _ctl_on_feedback(outcome:str):
-    eps, minc, coolN, coolS, thr, reg = _ctl_load()
-    g,l,sg,sl = _ctl_perf()
+    eps,minc,coolN,coolS,thr,reg=_ctl_load()
+    g,l,sg,sl=_ctl_perf()
     total=g+l
     if total>=50:
-        acc = g/max(1,total)
-        new_eps = max(0.01, min(0.12, 0.10 - 0.15*(acc-0.50)))
-        eps = 0.9*eps + 0.1*new_eps
-    if sl>=2:
-        minc = min(0.74, minc+0.01)
-    elif sg>=3:
-        minc = max(0.54, minc-0.01)
+        acc=g/max(1,total)
+        new_eps=max(0.01, min(0.12, 0.10 - 0.15*(acc-0.50)))
+        eps=0.9*eps + 0.1*new_eps
+    if sl>=2: minc=min(0.74, minc+0.01)
+    elif sg>=3: minc=max(0.54, minc-0.01)
     now=int(time.time())
-    if sl>=coolN:
-        thr = now + coolS
+    if sl>=coolN: thr=now+coolS
     else:
-        if now > thr: thr = 0
+        if now>thr: thr=0
     _ctl_save(eps=eps, minc=minc, thr=thr)
 
-# ============== Decisão final (neural + especialistas) ==============
+# ============== Decisão final (neural + especialistas + AntiBias) ==============
 def _neural_decide()->Tuple[int,float,int,Dict[int,float],float,str]:
-    tail = _timeline_tail(400)
-    p1=_e_fibo(tail)          # << usa Fibonacci PRO+ como especialista 1
-    p2=_post_e2_short(tail)
+    tail=_timeline_tail(400)
+    p1=_post_e1_ngram(tail)   # Fibo10
+    p2=_post_e2_t30(tail)     # T30
     p3=_post_e3_long(tail)
     p4=_post_e4_llm(tail)
     pn=_neural_probs(tail)
-
-    _, wneu, _ = _load_neural_params()
-    rest = 1.0 - wneu
-    # dá ênfase maior ao E1 (Fibo) dentro da fatia não-neural
-    w = {"neural": wneu, "e1":0.55*rest, "e2":0.25*rest, "e3":0.15*rest, "e4":0.05*rest}
-
-    mix = {}
+    _, wneu, _=_load_neural_params()
+    rest=1.0 - wneu
+    w={"neural":wneu, "e1":0.40*rest, "e2":0.30*rest, "e3":0.20*rest, "e4":0.10*rest}
+    mix={}
     for c in (1,2,3,4):
-        mix[c] = w["neural"]*pn.get(c,0) + w["e1"]*p1.get(c,0) + w["e2"]*p2.get(c,0) + w["e3"]*p3.get(c,0) + w["e4"]*p4.get(c,0)
-    mix = _conf_floor(_norm(mix), 0.30, 0.95)
-    best = max(mix,key=mix.get)
-    conf = float(mix[best])
-    r = sorted(mix.items(), key=lambda kv: kv[1], reverse=True)
-    gap = (r[0][1]-r[1][1]) if len(r)>=2 else r[0][1]
-    temp, wneu_cur, _ = _load_neural_params()
-    reason = f"ProfoundSim-FiboPro(w={wneu_cur:.2f},T={temp:.2f})"
+        mix[c]= w["neural"]*pn.get(c,0) + w["e1"]*p1.get(c,0) + w["e2"]*p2.get(c,0) + w["e3"]*p3.get(c,0) + w["e4"]*p4.get(c,0)
+    mix=_conf_floor(_norm(mix), 0.30, 0.95)
+    # AntiBias
+    best_pre=max(mix,key=mix.get)
+    conf_pre=float(mix[best_pre])
+    mix, conf_adj, ab_reason = _antibias_adjust(mix, conf_pre)
+    best=max(mix,key=mix.get); conf=float(mix[best])
+    r=sorted(mix.items(), key=lambda kv: kv[1], reverse=True)
+    gap=(r[0][1]-r[1][1]) if len(r)>=2 else r[0][1]
+    temp,wneu_cur,_=_load_neural_params()
+    reason=f"ProfoundSim-Fibo10+T30(w={wneu_cur:.2f},T={temp:.2f}) · {ab_reason}"
+    # conf_final é o menor entre o ajustado e o do mix final
+    conf=min(conf, conf_adj)
     return best, conf, _timeline_size(), mix, gap, reason
 
 def _ngram_snapshot(suggested:int)->str:
-    tail=_timeline_tail(400); post=_e_fibo(tail)
+    tail=_timeline_tail(400); post=_post_e1_ngram(tail)
     pct=lambda x:f"{x*100:.1f}%"
     p1,p2,p3,p4=pct(post[1]), pct(post[2]), pct(post[3]), pct(post[4])
     conf=pct(post.get(int(suggested),0.0))
     return (f"📈 Amostra: {_timeline_size()} • Conf: {conf}\n"
-            f"🔎 E1(FiboPro): 1 {p1} | 2 {p2} | 3 {p3} | 4 {p4}")
+            f"🔎 E1(Fibo10): 1 {p1} | 2 {p2} | 3 {p3} | 4 {p4}")
 
 # ================== Telegram ==================
 async def tg_send(chat_id: str, text: str, parse="HTML"):
@@ -501,8 +485,7 @@ async def tg_send(chat_id: str, text: str, parse="HTML"):
             await cli.post(f"{TELEGRAM_API}/sendMessage",
                            json={"chat_id": chat_id, "text": text, "parse_mode": parse,
                                  "disable_web_page_preview": True})
-    except Exception:
-        pass
+    except Exception: pass
 
 async def tg_send_return(chat_id: str, text: str, parse="HTML") -> Optional[int]:
     try:
@@ -513,8 +496,7 @@ async def tg_send_return(chat_id: str, text: str, parse="HTML") -> Optional[int]
             data = r.json()
             if isinstance(data, dict) and data.get("ok") and data.get("result", {}).get("message_id"):
                 return int(data["result"]["message_id"])
-    except Exception:
-        pass
+    except Exception: pass
     return None
 
 async def tg_delete(chat_id: str, message_id: int):
@@ -522,14 +504,12 @@ async def tg_delete(chat_id: str, message_id: int):
         async with httpx.AsyncClient(timeout=15) as cli:
             await cli.post(f"{TELEGRAM_API}/deleteMessage",
                            json={"chat_id": chat_id, "message_id": int(message_id)})
-    except Exception:
-        pass
+    except Exception: pass
 
 # ================== Parser ==================
 RX_ENTRADA = re.compile(r"(💰\s*)?ENTRADA.*CONFIRMADA|ENTRADA\s*OK", re.I)
 RX_ANALISE = re.compile(r"\bANALIS(A|Á)NDO\b|ANALISE|🧩", re.I)
 RX_FECHA   = re.compile(r"APOSTA.*ENCERRADA|RESULTADO|GREEN|RED|✅|❌", re.I)
-
 RX_SEQ     = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
 RX_NUMS    = re.compile(r"[1-4]")
 RX_AFTER   = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
@@ -537,18 +517,16 @@ RX_PAREN   = re.compile(r"\(([^\)]*)\)")
 
 def _parse_seq_list(text:str)->List[int]:
     m=RX_SEQ.search(text or "");  return [int(x) for x in RX_NUMS.findall(m.group(1))] if m else []
-
 def _parse_after(text:str)->Optional[int]:
     m=RX_AFTER.search(text or "");  return int(m.group(1)) if m else None
-
 def _parse_paren_last_one(text:str)->Optional[int]:
     nums=[]
     for m in RX_PAREN.finditer(text or ""):
-        nums_in = [int(x) for x in RX_NUMS.findall(m.group(1))]
+        nums_in=[int(x) for x in RX_NUMS.findall(m.group(1))]
         if nums_in: nums.append(nums_in[-1])
     return nums[-1] if nums else None
 
-# ================== Rotas básicas ==================
+# ================== Rotas ==================
 @app.get("/")
 async def root():
     return {"ok": True, "service": "GuardiAo Auto Bot", "time": datetime.datetime.utcnow().isoformat()+"Z"}
@@ -559,108 +537,107 @@ async def health():
 
 @app.get("/debug_cfg")
 async def debug_cfg():
-    temp, wneu, bias = _load_neural_params()
-    eps, minc, coolN, coolS, thr, reg = _ctl_load()
+    temp,wneu,bias=_load_neural_params()
+    eps,minc,coolN,coolS,thr,reg=_ctl_load()
+    ab_on,ab_dom,ab_conf,ab_decay=_ab_load()
     return {
         "MAX_GALE": MAX_GALE, "OBS_TIMEOUT_SEC": OBS_TIMEOUT_SEC, "DEDUP_WINDOW_SEC": DEDUP_WINDOW_SEC,
         "neural_temp": temp, "neural_weight": wneu, "neural_bias": bias,
         "ctl_epsilon": eps, "ctl_min_conf": minc, "ctl_cool_after_losses": coolN,
-        "ctl_cool_secs": coolS, "ctl_throttle_until": thr, "ctl_regime": reg
+        "ctl_cool_secs": coolS, "ctl_throttle_until": thr, "ctl_regime": reg,
+        "antibias_enabled": bool(ab_on), "antibias_dom_cap": ab_dom,
+        "antibias_conf_cap": ab_conf, "antibias_decay": ab_decay
     }
 
 # ----- Admin helpers -----
 @app.get("/admin/status")
 async def admin_status():
-    pend = _pending_get()
-    if not pend:
-        return {"open": False}
-    return {
-        "open": True,
-        "id": int(pend["id"]),
-        "opened_at": int(pend["opened_at"] or 0),
-        "age_sec": int(time.time()) - int(pend["opened_at"] or 0),
-        "suggested": int(pend["suggested"] or 0),
-        "seen": (pend["seen"] or "")
-    }
+    pend=_pending_get()
+    if not pend: return {"open": False}
+    return {"open": True, "id": int(pend["id"]), "opened_at": int(pend["opened_at"] or 0),
+            "age_sec": int(time.time()) - int(pend["opened_at"] or 0),
+            "suggested": int(pend["suggested"] or 0), "seen": (pend["seen"] or "")}
+
+# cria/atualiza tabelas AntiBias sem shell
+@app.get("/admin/init_antibias")
+async def init_antibias():
+    db_init()
+    return {"ok": True, "message": "antibias inicializado/ok"}
+
+@app.get("/admin/antibias_on")
+async def antibias_on():
+    con=_con(); con.execute("UPDATE antibias SET enabled=1 WHERE id=1"); con.commit(); con.close()
+    return {"ok": True, "antibias": "on"}
+
+@app.get("/admin/antibias_off")
+async def antibias_off():
+    con=_con(); con.execute("UPDATE antibias SET enabled=0 WHERE id=1"); con.commit(); con.close()
+    return {"ok": True, "antibias": "off"}
+
+@app.get("/admin/antibias_cfg")
+async def antibias_cfg(dom:float=None, conf:float=None, decay:float=None):
+    en, d, c, dc = _ab_load()
+    if dom is not None: d=float(dom)
+    if conf is not None: c=float(conf)
+    if decay is not None: dc=float(decay)
+    con=_con(); con.execute("UPDATE antibias SET dom_cap=?, conf_cap=?, decay=? WHERE id=1",(d,c,dc)); con.commit(); con.close()
+    return {"ok": True, "dom_cap": d, "conf_cap": c, "decay": dc}
 
 @app.post("/admin/unlock")
 async def admin_unlock():
-    pend = _pending_get()
-    if not pend:
-        return {"ok": True, "message": "nenhuma pendência aberta"}
-    suggested = int(pend["suggested"] or 0)
-    msg_txt = _pending_close("X", "LOSS", "G0", suggested)
+    pend=_pending_get()
+    if not pend: return {"ok": True, "message": "nenhuma pendência aberta"}
+    suggested=int(pend["suggested"] or 0)
+    msg_txt=_pending_close("X", "LOSS", "G0", suggested)
+    try: _ctl_on_feedback("LOSS")
+    except Exception: pass
     return {"ok": True, "forced_close": True, "message": msg_txt}
 
 # ================== Webhook ==================
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
-    if token != WEBHOOK_TOKEN:
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    data = await request.json()
-    upd_id = str(data.get("update_id", "")); _mark_processed(upd_id)
-
-    msg = data.get("channel_post") or data.get("message") \
-        or data.get("edited_channel_post") or data.get("edited_message") or {}
-    chat = msg.get("chat") or {}
-    chat_id = str(chat.get("id") or "")
-    text = (msg.get("text") or msg.get("caption") or "").strip()
+    if token != WEBHOOK_TOKEN: raise HTTPException(status_code=403, detail="Forbidden")
+    data=await request.json()
+    upd_id=str(data.get("update_id","")); _mark_processed(upd_id)
+    msg = data.get("channel_post") or data.get("message") or data.get("edited_channel_post") or data.get("edited_message") or {}
+    chat=msg.get("chat") or {}; chat_id=str(chat.get("id") or ""); text=(msg.get("text") or msg.get("caption") or "").strip()
 
     # watchdog anti-trava
     try:
-        watchdog = _pending_timeout_check()
+        watchdog=_pending_timeout_check()
         if watchdog and SHOW_DEBUG:
-            if watchdog.get("msg"):
-                await tg_send(TARGET_CHANNEL, f"DEBUG: Timeout pendência — fechado automático.\n{watchdog['msg']}")
-            else:
-                await tg_send(TARGET_CHANNEL, "DEBUG: Timeout pendência — fechado automático (LOSS G0 X).")
-    except Exception:
-        pass
+            if watchdog.get("msg"): await tg_send(TARGET_CHANNEL, f"DEBUG: Timeout pendência — fechado automático.\n{watchdog['msg']}")
+            else: await tg_send(TARGET_CHANNEL, "DEBUG: Timeout pendência — fechado automático (LOSS G0 X).")
+    except Exception: pass
 
     if SOURCE_CHANNEL and chat_id and chat_id != SOURCE_CHANNEL:
-        if SHOW_DEBUG:
-            await tg_send(TARGET_CHANNEL, f"DEBUG: Ignorando chat {chat_id}. Fonte esperada: {SOURCE_CHANNEL}")
+        if SHOW_DEBUG: await tg_send(TARGET_CHANNEL, f"DEBUG: Ignorando chat {chat_id}. Fonte esperada: {SOURCE_CHANNEL}")
         return {"ok": True, "skipped": "wrong_source"}
 
     # -------- ANALISANDO --------
     if RX_ANALISE.search(text):
-        if _seen_recent("analise", _dedupe_key(text)):
-            return {"ok": True, "skipped": "analise_dupe"}
-        seq=_parse_seq_list(text)
-        if seq: _append_seq(seq)
+        if _seen_recent("analise", _dedupe_key(text)): return {"ok": True, "skipped": "analise_dupe"}
+        seq=_parse_seq_list(text);  if seq: _append_seq(seq)
         if SHOW_DEBUG: await tg_send(TARGET_CHANNEL, "DEBUG: Análise reconhecida ✅")
         return {"ok": True, "analise_seq": len(seq)}
 
-    # -------- FECHAMENTO (G0 pelo parênteses) --------
+    # -------- FECHAMENTO --------
     if RX_FECHA.search(text):
-        if _seen_recent("fechamento", _dedupe_key(text)):
-            return {"ok": True, "skipped": "fechamento_dupe"}
-
+        if _seen_recent("fechamento", _dedupe_key(text)): return {"ok": True, "skipped": "fechamento_dupe"}
         pend=_pending_get()
         if pend:
             suggested=int(pend["suggested"] or 0)
-
-            # Só usamos o ÚLTIMO número entre parênteses para decidir
-            obs = _parse_paren_last_one(text)   # 1..4 ou None
-            if obs is not None:
-                _pending_seen_set(str(obs))
-
-            seen = (_pending_get()["seen"] or "").strip()
+            obs=_parse_paren_last_one(text)
+            if obs is not None: _pending_seen_set(str(obs))
+            seen=(_pending_get()["seen"] or "").strip()
             outcome="LOSS"; stage_lbl="G0"
-            if seen.isdigit() and int(seen)==suggested:
-                outcome="GREEN"
-
+            if seen.isdigit() and int(seen)==suggested: outcome="GREEN"
             final_seen = seen if seen else "X"
             msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
             if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
-
-            # controlador recebe feedback (ajusta epsilon/min_conf/throttle automaticamente)
             try: _ctl_on_feedback(outcome)
             except Exception: pass
-
             return {"ok": True, "closed": outcome, "seen": final_seen}
-
         if SHOW_DEBUG: await tg_send(TARGET_CHANNEL, "DEBUG: Fechamento reconhecido ✅ — sem pendência aberta")
         return {"ok": True, "noted_close": True}
 
@@ -670,19 +647,17 @@ async def webhook(token: str, request: Request):
             if SHOW_DEBUG: await tg_send(TARGET_CHANNEL, "DEBUG: Entrada duplicada ignorada (conteúdo repetido).")
             return {"ok": True, "skipped": "entrada_dupe"}
 
-        seq=_parse_seq_list(text)
-        if seq: _append_seq(seq)
+        seq=_parse_seq_list(text);  if seq: _append_seq(seq)
         after=_parse_after(text)
 
-        # fecha pendência esquecida (como X)
+        # fecha pendência esquecida (X)
         pend=_pending_get()
         if pend:
             suggested=int(pend["suggested"] or 0)
             seen=(pend["seen"] or "").strip()
-            final_seen = seen if seen else "X"
+            final_seen= seen if seen else "X"
             outcome="LOSS"; stage_lbl="G0"
-            if seen.isdigit() and int(seen)==suggested:
-                outcome="GREEN"
+            if seen.isdigit() and int(seen)==suggested: outcome="GREEN"
             msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
             if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
             try: _ctl_on_feedback(outcome)
@@ -690,12 +665,10 @@ async def webhook(token: str, request: Request):
 
         analyzing_id = await tg_send_return(TARGET_CHANNEL, "⏳ Analisando padrão, aguarde...")
 
-        # sugestão (neural+especialistas com FiboPro)
         best, conf, samples, mix, gap, reason = _neural_decide()
 
-        # controlador decide operar/ajustar
+        # AntiBias e controller já integrados na decisão; agora decidir abrir:
         play, why, chosen = _ctl_decide(best, conf, mix, gap)
-
         if not play:
             if analyzing_id is not None: await tg_delete(TARGET_CHANNEL, analyzing_id)
             await tg_send(TARGET_CHANNEL, f"⛔ <b>NeuroController:</b> pulando entrada — {why}")
@@ -704,6 +677,10 @@ async def webhook(token: str, request: Request):
         suggested = chosen if chosen>0 else best
         opened=_pending_open(suggested)
         if opened:
+            # loga sugestão
+            try:
+                con=_con(); con.execute("INSERT INTO suggestions(created_at,suggested,conf) VALUES(?,?,?)",(int(time.time()), int(suggested), float(conf))); con.commit(); con.close()
+            except Exception: pass
             aft_txt = f" após {after}" if after else ""
             label = "explore" if (chosen>0 and chosen!=best) else "exploit"
             txt=(f"🤖 <b>IA SUGERE</b> — <b>{suggested}</b>\n"
@@ -720,7 +697,6 @@ async def webhook(token: str, request: Request):
             if SHOW_DEBUG: await tg_send(TARGET_CHANNEL, "DEBUG: pending já aberto; entrada ignorada.")
             return {"ok": True, "skipped": "pending_open"}
 
-    # -------- Não reconhecido --------
     if SHOW_DEBUG:
         await tg_send(TARGET_CHANNEL, "DEBUG: Mensagem não reconhecida como ENTRADA/FECHAMENTO/ANALISANDO.")
     return {"ok": True, "skipped": "unmatched"}
