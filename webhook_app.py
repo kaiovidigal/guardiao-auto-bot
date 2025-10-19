@@ -2,12 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v7.0-prob-fast (G0-only destravado + prob no texto + fechamento estrito por ())
+v7.0-prob-combos (G0-only destravado + prob no texto + fechamento estrito por ())
++ Fibo10, Combo2, Combo3 e Fibo50 (cópia)
 
-- Fechamento IMEDIATO (G0) lendo o ÚLTIMO número 1..4 dentro do ÚLTIMO par de parênteses "()" no FINAL da mensagem do canal-fonte.
+- Fechamento IMEDIATO (G0) lendo o ÚLTIMO número 1..4 dentro do ÚLTIMO par "()" no FINAL da mensagem do canal-fonte.
   Exemplos que FECHAM: "✅ GREEN (3)" | "RED ❌ (4)"  (e nada depois do ")").
-- “Destravado”: pensado para fluxo rápido (MAX_GALE=0, SEND_ANALYZING=False recomendado via ENV).
+- “Destravado”: fluxo rápido (MAX_GALE=0, SEND_ANALYZING=False recomendados via ENV).
 - Sugestão inclui as probabilidades por dígito (1..4).
+- Ensemble leve: n-gram curto, janelas (60/300), Fibo10, Combo2, Combo3 e Fibo50.
 
 ENV sugeridas p/ destravar (no painel):
   SHOW_DEBUG=True
@@ -44,7 +46,7 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 DB_PATH = "/opt/render/project/src/main.sqlite"
 
 # ================= APP =================
-app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.0-prob-fast")
+app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.0-prob-combos")
 
 # ================= DB =================
 def _con():
@@ -151,7 +153,6 @@ def _pending_close(final_seen: str, outcome: str, stage_lbl: str, suggested:int)
     con.execute("UPDATE pending SET open=0, seen=? WHERE id=?", (final_seen, int(row["id"])))
     con.commit(); con.close()
     _score_add(outcome)
-    # alimentar timeline
     obs=[int(x) for x in final_seen.split("-") if x.isdigit()]
     _append_seq(obs)
     our=suggested if outcome.upper()=="GREEN" else "X"
@@ -172,38 +173,72 @@ def _seen_recent(kind:str,dkey:str)->bool:
     con.execute("INSERT OR REPLACE INTO dedupe(kind,dkey,ts) VALUES (?,?,?)",(kind,dkey,now))
     con.commit(); con.close(); return False
 
-# ================= IA compacta (com prob) =================
+# ================= IA compacta (com prob + Fibo/Combos) =================
+CANDS=(1,2,3,4)
+
 def _norm(d: Dict[int,float])->Dict[int,float]:
     s=sum(d.values()) or 1e-9
     return {k:max(0.0,v)/s for k,v in d.items()}
 
-def _post_freq(tail:List[int], k:int)->Dict[int,float]:
-    if not tail: return {1:0.25,2:0.25,3:0.25,4:0.25}
+def _freq(tail:List[int], k:int)->Dict[int,float]:
+    if not tail: return {c:0.25 for c in CANDS}
     win = tail[-k:] if len(tail)>=k else tail
     tot=max(1,len(win))
-    return _norm({c:win.count(c)/tot for c in (1,2,3,4)})
+    return _norm({c:win.count(c)/tot for c in CANDS})
 
 def _post_e1_ngram(tail:List[int])->Dict[int,float]:
-    mix={c:0.0 for c in (1,2,3,4)}
+    mix={c:0.0 for c in CANDS}
     for k,w in ((8,0.25),(21,0.35),(55,0.40)):
-        pk=_post_freq(tail,k)
-        for c in (1,2,3,4): mix[c]+=w*pk[c]
+        pk=_freq(tail,k)
+        for c in CANDS: mix[c]+=w*pk[c]
     return _norm(mix)
 
-def _post_e2_short(tail):  return _post_freq(tail, 60)
-def _post_e3_long(tail):   return _post_freq(tail, 300)
-def _post_e4_llm(tail):    return {1:0.25,2:0.25,3:0.25,4:0.25}  # placeholder
+def _post_e2_short(tail):  return _freq(tail, 60)
+def _post_e3_long(tail):   return _freq(tail, 300)
 
-def _hedge(p1,p2,p3,p4, w=(0.40,0.25,0.25,0.10)):
-    cands=(1,2,3,4)
-    out={c: w[0]*p1.get(c,0)+w[1]*p2.get(c,0)+w[2]*p3.get(c,0)+w[3]*p4.get(c,0) for c in cands}
-    return _norm(out)
+# ---------- Fibo10 ----------
+def _fibo10(tail: List[int]) -> Dict[int, float]:
+    if not tail: return {c:0.25 for c in CANDS}
+    wins=(10,21,34,55)
+    mix={c:0.0 for c in CANDS}
+    for k in wins:
+        win=tail[-k:] if len(tail)>=k else tail
+        best=max(CANDS, key=lambda c: win.count(c))
+        mix[best]+=1.0
+    return _norm(mix)
+
+# ---------- Combinação 2 dígitos ----------
+def _combo2(tail: List[int]) -> Dict[int, float]:
+    if len(tail) < 2: return {c:0.25 for c in CANDS}
+    a,b=tail[-2],tail[-1]
+    counts={c:1.0 for c in CANDS}   # Laplace +1
+    for i in range(len(tail)-2):
+        if tail[i]==a and tail[i+1]==b:
+            nxt=tail[i+2]
+            if nxt in CANDS: counts[nxt]+=1.0
+    return _norm(counts)
+
+# ---------- Combinação 3 dígitos ----------
+def _combo3(tail: List[int]) -> Dict[int, float]:
+    if len(tail) < 3: return {c:0.25 for c in CANDS}
+    a,b,c=tail[-3],tail[-2],tail[-1]
+    counts={x:1.0 for x in CANDS}   # Laplace +1
+    for i in range(len(tail)-3):
+        if tail[i]==a and tail[i+1]==b and tail[i+2]==c:
+            nxt=tail[i+3]
+            if nxt in CANDS: counts[nxt]+=1.0
+    return _norm(counts)
+
+# ---------- Fibo 50 (cópia/leitura por “copie”) ----------
+def _fibo50(tail: List[int]) -> Dict[int, float]:
+    # leitura simples da frequência na janela 50 (estável e barata)
+    return _freq(tail, 50)
 
 def _conf_floor(post:Dict[int,float], floor=0.30, cap=0.95):
-    post=_norm({c:float(post.get(c,0)) for c in (1,2,3,4)})
+    post=_norm({c:float(post.get(c,0)) for c in CANDS})
     b=max(post,key=post.get); mx=post[b]
     if mx<floor:
-        others=[c for c in (1,2,3,4) if c!=b]
+        others=[c for c in CANDS if c!=b]
         s=sum(post[c] for c in others); take=min(floor-mx,s)
         if s>0:
             scale=(s-take)/s
@@ -212,22 +247,45 @@ def _conf_floor(post:Dict[int,float], floor=0.30, cap=0.95):
     if post[b]>cap:
         ex=post[b]-cap; post[b]=cap
         add=ex/3.0
-        for c in (1,2,3,4):
+        for c in CANDS:
             if c!=b: post[c]+=add
     return _norm(post)
 
 def _choose_number()->Tuple[int,float,int,Dict[int,float],float,str]:
     tail=_timeline_tail(400)
-    p1=_post_e1_ngram(tail)
-    p2=_post_e2_short(tail)
-    p3=_post_e3_long(tail)
-    p4=_post_e4_llm(tail)
-    post=_hedge(p1,p2,p3,p4)
-    post=_conf_floor(post, 0.30, 0.95)
+
+    p_ng  = _post_e1_ngram(tail)
+    p_s60 = _post_e2_short(tail)
+    p_l300= _post_e3_long(tail)
+    p_fb10= _fibo10(tail)
+    p_c2  = _combo2(tail)
+    p_c3  = _combo3(tail)
+    p_f50 = _fibo50(tail)
+
+    # pesos leve/balanceados (somam 1):
+    W_NG   = 0.18
+    W_S60  = 0.18
+    W_L300 = 0.09
+    W_FB10 = 0.20
+    W_C2   = 0.18
+    W_C3   = 0.12
+    W_F50  = 0.05
+
+    post={}
+    for c in CANDS:
+        post[c] = (W_NG  * p_ng.get(c,0)   +
+                   W_S60 * p_s60.get(c,0)  +
+                   W_L300* p_l300.get(c,0) +
+                   W_FB10* p_fb10.get(c,0) +
+                   W_C2  * p_c2.get(c,0)   +
+                   W_C3  * p_c3.get(c,0)   +
+                   W_F50 * p_f50.get(c,0))
+    post=_conf_floor(_norm(post), 0.30, 0.95)
+
     best=max(post,key=post.get); conf=float(post[best])
     r=sorted(post.items(), key=lambda kv: kv[1], reverse=True)
     gap=(r[0][1]-r[1][1]) if len(r)>=2 else r[0][1]
-    reason="IA"
+    reason="ngram+win(60/300)+fibo10+combo2/3+fibo50"
     return best, conf, _timeline_size(), post, gap, reason
 
 def _fmt_probs(post:Dict[int,float])->str:
