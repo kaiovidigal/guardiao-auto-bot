@@ -17,6 +17,11 @@ ENV opcionais:
 - OBS_TIMEOUT_SEC     (default 420)
 - DEDUP_WINDOW_SEC    (default 40)
 
+# >>> Novo (especialistas curtos) <<<
+# pesos dos novos especialistas (podem ser ajustados via ENV)
+- W_FIBO50           (default 0.20)  # reforço da janela curta (50)
+- W_COMBO3           (default 0.25)  # reforço de padrão composto (3 dígitos)
+
 Start command:
   uvicorn webhook_app:app --host 0.0.0.0 --port $PORT
 """
@@ -39,6 +44,10 @@ SHOW_DEBUG       = os.getenv("SHOW_DEBUG", "False").strip().lower() == "true"
 MAX_GALE         = int(os.getenv("MAX_GALE", "1"))
 OBS_TIMEOUT_SEC  = int(os.getenv("OBS_TIMEOUT_SEC", "420"))
 DEDUP_WINDOW_SEC = int(os.getenv("DEDUP_WINDOW_SEC", "40"))
+
+# >>> Novo: pesos dos especialistas adicionais (podem ser 0.0..1.0)
+W_FIBO50  = float(os.getenv("W_FIBO50", "0.20"))
+W_COMBO3  = float(os.getenv("W_COMBO3", "0.25"))
 
 if not TG_BOT_TOKEN or not WEBHOOK_TOKEN or not TARGET_CHANNEL:
     raise RuntimeError("Faltam ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN, TARGET_CHANNEL.")
@@ -260,19 +269,57 @@ def _get_ls()->int:
     # loss streak simples (não persistido nesta versão)
     return 0
 
+# >>> NOVOS ESPECIALISTAS (curto/cópia) <<<
+def _e_fibo50(tail: List[int]) -> Dict[int, float]:
+    """Frequência em janela 50 (Fibo curta, 'copie')."""
+    return _post_freq(tail, 50)
+
+def _e_combo3(tail: List[int]) -> Dict[int, float]:
+    """
+    P(n | a,b,c) com (a,b,c)=últimos 3; Laplace +1.
+    Ajuda a evitar virada imediata e captura padrões compostos.
+    """
+    if len(tail) < 3: 
+        return {1:0.25, 2:0.25, 3:0.25, 4:0.25}
+    a, b, c = tail[-3], tail[-2], tail[-1]
+    counts = {1:1.0, 2:1.0, 3:1.0, 4:1.0}
+    for i in range(len(tail) - 3):
+        if tail[i]==a and tail[i+1]==b and tail[i+2]==c:
+            nxt = tail[i+3]
+            if nxt in (1,2,3,4):
+                counts[nxt]+=1.0
+    return _norm(counts)
+
+# --------- (APENAS) SUBSTITUIÇÃO DO _choose_number ---------
 def _choose_number()->Tuple[int,float,int,Dict[int,float],float,str]:
     tail=_timeline_tail(400)
+
+    # IA base (seus 4 especialistas originais)
     p1=_post_e1_ngram(tail)
     p2=_post_e2_short(tail)
     p3=_post_e3_long(tail)
     p4=_post_e4_llm(tail)
     base=_hedge(p1,p2,p3,p4)
-    best, post, reason = _runnerup_ls2(base, loss_streak=_get_ls())
-    post=_conf_floor(post, 0.30, 0.95)
-    best=max(post,key=post.get); conf=float(post[best])
-    r=sorted(post.items(), key=lambda kv: kv[1], reverse=True)
-    gap=(r[0][1]-r[1][1]) if len(r)>=2 else r[0][1]
+
+    # novos curtos
+    p_f50 = _e_fibo50(tail)
+    p_c3  = _e_combo3(tail)
+
+    # mistura com pesos (base recebe o restante)
+    wf = max(0.0, min(1.0, W_FIBO50))
+    wc = max(0.0, min(1.0, W_COMBO3))
+    rest = max(0.0, 1.0 - (wf + wc))
+
+    post = {c: rest*base.get(c,0.0) + wf*p_f50.get(c,0.0) + wc*p_c3.get(c,0.0) for c in (1,2,3,4)}
+    post = _conf_floor(_norm(post), 0.30, 0.95)
+
+    best = max(post, key=post.get)
+    conf = float(post[best])
+    r = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
+    gap = (r[0][1]-r[1][1]) if len(r)>=2 else r[0][1]
+    reason = f"IA+Fibo50({wf:.2f})+Combo3({wc:.2f})"
     return best, conf, _timeline_size(), post, gap, reason
+# --------- FIM da substituição ---------
 
 def _ngram_snapshot(suggested:int)->str:
     tail=_timeline_tail(400)
@@ -329,18 +376,6 @@ RX_AFTER   = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
 
 RX_GREEN   = re.compile(r"GREEN|✅", re.I)
 RX_RED     = re.compile(r"RED|❌", re.I)
-
-# ===== NOVO: leitor do último parêntese do texto (pega último dígito 1..4) =====
-RX_PAREN_ANY = re.compile(r"\(([^()]*)\)")
-def _parse_close_digit(text: str) -> Optional[int]:
-    chunks = RX_PAREN_ANY.findall((text or "").strip())
-    if not chunks: return None
-    last = chunks[-1]
-    nums = re.findall(r"[1-4]", last)
-    return int(nums[-1]) if nums else None
-# ===============================================================================
-
-# (mantido para memória/timeline, mas não é mais usado para decidir fechamento)
 RX_PAREN   = re.compile(r"\(([^\)]*)\)\s*$")
 
 def _parse_seq_list(text:str)->List[int]:
@@ -410,7 +445,7 @@ async def webhook(token: str, request: Request):
         if seq: _append_seq(seq)
         return {"ok": True, "analise_seq": len(seq)}
 
-    # 2) APOSTA ENCERRADA / GREEN / RED  (AGORA: fecha pelo número do último "()")
+    # 2) APOSTA ENCERRADA / GREEN / RED (com dedupe + FECHAMENTO CORRETO G0/G1)
     if RX_FECHA.search(text) or RX_GREEN.search(text) or RX_RED.search(text):
         if _seen_recent("fechamento", _dedupe_key(text)):
             return {"ok": True, "skipped": "fechamento_dupe"}
@@ -419,26 +454,43 @@ async def webhook(token: str, request: Request):
         if pend:
             suggested=int(pend["suggested"] or 0)
 
-            # >>> NOVO núcleo de fechamento:
-            obs = _parse_close_digit(text)  # pega último dígito 1..4 no último parêntese
-            if obs is not None:
-                _pending_seen_append([obs], need=1)  # registra como visto (somente G0)
+            # (a) Observados do PLACAR: usar a linha "Sequência: a | b"
+            obs_pair = _parse_seq_pair(text, need=min(2, MAX_GALE+1))
+            if obs_pair:
+                _pending_seen_append(obs_pair, need=min(2, MAX_GALE+1))
 
-            # decisão (sempre G0 com base no "()")
+            # (b) Memória extra: números finais entre parênteses "(x | y)" -> só para timeline
+            extra_tail = _parse_paren_pair(text, need=2)
+            if extra_tail:
+                _append_seq(extra_tail)
+
+            # Reavalia pendência após update
             pend=_pending_get()
-            seen = (pend["seen"] or "").strip()
-            outcome="LOSS"; stage_lbl="G0"
-            if seen.isdigit() and int(seen)==suggested:
-                outcome="GREEN"
-            final_seen = seen if seen else "X"
+            seen = [s for s in (pend["seen"] or "").split("-") if s]
 
-            msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
-            if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
+            # Regra: se G0 != sugerido e ainda temos espaço para G1, NÃO fecha; aguarda próxima rodada
+            if len(seen)==1 and seen[0].isdigit() and int(seen[0]) != suggested and MAX_GALE>=1:
+                # mantém pendência aberta para o G1
+                if SHOW_DEBUG:
+                    await tg_send(TARGET_CHANNEL, f"DEBUG: aguardando G1 (visto G0={seen[0]}, nosso={suggested}).")
+                return {"ok": True, "waiting_g1": True, "seen": "-".join(seen)}
 
-            if SHOW_DEBUG:
-                await tg_send(TARGET_CHANNEL, f"DEBUG: fechamento '(' capturado -> {obs} | seen='{final_seen}' | nosso={suggested}")
+            # Decisão final (se já temos 1 ou 2 observados suficientes)
+            outcome="LOSS"; stage_lbl="G1"
+            if len(seen)>=1 and seen[0].isdigit() and int(seen[0])==suggested:
+                outcome="GREEN"; stage_lbl="G0"
+            elif len(seen)>=2 and len(seen)>=2 and seen[1].isdigit() and int(seen[1])==suggested and MAX_GALE>=1:
+                outcome="GREEN"; stage_lbl="G1"
 
-            return {"ok": True, "closed": outcome, "seen": final_seen}
+            # fecha se: GREEN no G0, ou já temos G1 observado (independente de GREEN/LOSS)
+            if stage_lbl=="G0" or len(seen)>=min(2, MAX_GALE+1):
+                final_seen="-".join(seen[:min(2, MAX_GALE+1)]) if seen else "X"
+                msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
+                if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
+                return {"ok": True, "closed": outcome, "seen": final_seen}
+            else:
+                # ainda aguardando G1 (cenário raro se MAX_GALE>1 futuramente)
+                return {"ok": True, "waiting_more_obs": True, "seen": "-".join(seen)}
 
         return {"ok": True, "noted_close": True}
 
