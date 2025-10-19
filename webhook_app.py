@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v7.1 (G1-only, fechamento estrito, IA Fibo-Mix dinâmica, estudo TOP-3, dedupe,
-      fechamento correto G0/G1, “Analisando...” com auto-delete, DB SQLite)
+v8.0 (Entrada única, sem G0/G1, fechamento estrito, NEUTRO por filtros,
+      IA FiboMix dinâmica, dedupe por conteúdo, “Analisando...” auto-delete, DB SQLite)
 
 ENV obrigatórias (Render -> Environment):
 - TG_BOT_TOKEN
@@ -12,12 +12,15 @@ ENV obrigatórias (Render -> Environment):
 - TARGET_CHANNEL           ex: -1003052132833
 
 ENV opcionais:
-- SHOW_DEBUG          (default False)
-- MAX_GALE            (default 1)          # G0/G1
-- OBS_TIMEOUT_SEC     (default 420)
-- DEDUP_WINDOW_SEC    (default 40)
-- FIBO_WINDOWS        (default "8,13,21,34,55")
-- SHOW_TOP3           (default "True")
+- SHOW_DEBUG           (default False)
+- OBS_TIMEOUT_SEC      (default 420)       # janela de espera pelo "fecha" (informativo)
+- DEDUP_WINDOW_SEC     (default 40)
+- FIBO_WINDOWS         (default "8,13,21,34,55")
+- SHOW_TOP3            (default "True")
+- MIN_CONF             (default "0.52")
+- MIN_GAP              (default "0.06")    # gap = p(top1) - p(top2)
+- ENTROPY_CUTOFF       (default "1.35")    # H alto -> cenário uniforme -> NEUTRO
+- ABSTAIN_ON_TIMEOUT   (default "True")    # se não vier "fecha" e surgir nova ENTRADA: descarta sem pontuar
 
 Start command:
   uvicorn webhook_app:app --host 0.0.0.0 --port $PORT
@@ -37,12 +40,10 @@ WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
 SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "").strip()
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "").strip()
 
-SHOW_DEBUG       = os.getenv("SHOW_DEBUG", "False").strip().lower() == "true"
-MAX_GALE         = int(os.getenv("MAX_GALE", "1"))
-OBS_TIMEOUT_SEC  = int(os.getenv("OBS_TIMEOUT_SEC", "420"))
-DEDUP_WINDOW_SEC = int(os.getenv("DEDUP_WINDOW_SEC", "40"))
+SHOW_DEBUG         = os.getenv("SHOW_DEBUG", "False").strip().lower() == "true"
+OBS_TIMEOUT_SEC    = int(os.getenv("OBS_TIMEOUT_SEC", "420"))
+DEDUP_WINDOW_SEC   = int(os.getenv("DEDUP_WINDOW_SEC", "40"))
 
-# >>> Novas ENVs
 def _parse_fibo_env(txt: str) -> List[int]:
     out=[]
     for p in (txt or "").split(","):
@@ -53,11 +54,17 @@ def _parse_fibo_env(txt: str) -> List[int]:
             if k>0: out.append(k)
         except:
             pass
-    # fallback seguro
     return out or [8,13,21,34,55]
 
-FIBO_WINDOWS = _parse_fibo_env(os.getenv("FIBO_WINDOWS", "8,13,21,34,55"))
-SHOW_TOP3    = os.getenv("SHOW_TOP3", "True").strip().lower() == "true"
+FIBO_WINDOWS       = _parse_fibo_env(os.getenv("FIBO_WINDOWS", "8,13,21,34,55"))
+SHOW_TOP3          = os.getenv("SHOW_TOP3", "True").strip().lower() == "true"
+MIN_CONF           = float(os.getenv("MIN_CONF", "0.52"))
+MIN_GAP            = float(os.getenv("MIN_GAP", "0.06"))
+ENTROPY_CUTOFF     = float(os.getenv("ENTROPY_CUTOFF", "1.35"))
+ABSTAIN_ON_TIMEOUT = os.getenv("ABSTAIN_ON_TIMEOUT", "True").strip().lower() == "true"
+
+# Entrada única (sem gale)
+NEED_OBS = 1
 
 if not TG_BOT_TOKEN or not WEBHOOK_TOKEN or not TARGET_CHANNEL:
     raise RuntimeError("Faltam ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN, TARGET_CHANNEL.")
@@ -68,7 +75,7 @@ DB_PATH = "/opt/render/project/src/main.sqlite"
 # ------------------------------------------------------
 # App
 # ------------------------------------------------------
-app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.1")
+app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="8.0")
 
 # ------------------------------------------------------
 # DB helpers
@@ -96,7 +103,6 @@ def db_init():
         created_at INTEGER,
         opened_at  INTEGER,
         suggested  INTEGER,
-        stage      INTEGER DEFAULT 0,
         seen       TEXT     DEFAULT '',
         open       INTEGER  DEFAULT 1
     )""")
@@ -172,17 +178,12 @@ def _pending_open(suggested:int):
     if _pending_get(): return False
     con = _con()
     now = int(time.time())
-    con.execute("INSERT INTO pending(created_at,opened_at,suggested,stage,seen,open) VALUES(?,?,?,?,?,1)",
-                (now, now, int(suggested), 0, ""))
+    con.execute("INSERT INTO pending(created_at,opened_at,suggested,seen,open) VALUES(?,?,?,?,1)",
+                (now, now, int(suggested), ""))
     con.commit(); con.close()
     return True
 
-def _pending_set_stage(stage:int):
-    con = _con()
-    con.execute("UPDATE pending SET stage=? WHERE open=1",(int(stage),))
-    con.commit(); con.close()
-
-def _pending_seen_append(nums: List[int], need:int=2):
+def _pending_seen_append(nums: List[int], need:int=NEED_OBS):
     row = _pending_get()
     if not row: return
     seen = (row["seen"] or "").strip()
@@ -193,7 +194,7 @@ def _pending_seen_append(nums: List[int], need:int=2):
     txt = "-".join(arr[:need])
     con = _con(); con.execute("UPDATE pending SET seen=? WHERE id=?", (txt, int(row["id"]))); con.commit(); con.close()
 
-def _pending_close(final_seen: str, outcome: str, stage_lbl: str, suggested:int)->str:
+def _pending_close(final_seen: str, outcome: str, suggested:int)->str:
     row = _pending_get()
     if not row: return ""
     con = _con()
@@ -201,12 +202,12 @@ def _pending_close(final_seen: str, outcome: str, stage_lbl: str, suggested:int)
     con.commit(); con.close()
     _score_add(outcome)
     # alimentar timeline com observados
-    obs = [int(x) for x in final_seen.split("-") if x.isdigit()]
+    obs = [int(x) for x in str(final_seen).split("-") if str(x).isdigit()]
     _append_seq(obs)
     our = suggested if outcome.upper()=="GREEN" else "X"
     snap = _ngram_snapshot(suggested)
     msg = (f"{'🟢' if outcome.upper()=='GREEN' else '🔴'} <b>{outcome.upper()}</b> — finalizado "
-           f"(<b>{stage_lbl}</b>, nosso={our}, observados={final_seen}).\n"
+           f"(nosso={our}, observado={final_seen}).\n"
            f"📊 Geral: {_score_text()}\n\n{snap}")
     return msg
 
@@ -227,20 +228,23 @@ def _seen_recent(kind: str, dkey: str) -> bool:
     return False
 
 # ------------------------------------------------------
-# IA — Fibo Mix + Short/Long + ajustes
+# IA — FiboMix + Short/Long + filtros (entrada única)
 # ------------------------------------------------------
 def _norm(d: Dict[int,float])->Dict[int,float]:
     s=sum(d.values()) or 1e-9
     return {k:(v/s) for k,v in d.items()}
 
-def _post_freq(tail:List[int], k:int)->Dict[int,float]:
-    if not tail: return {1:0.25,2:0.25,3:0.25,4:0.25}
-    win = tail[-k:] if len(tail)>=k else tail
-    tot=max(1,len(win))
-    return _norm({c:win.count(c)/tot for c in (1,2,3,4)})
+def _post_freq(tail:List[int], k:int, alpha:float=1.0)->Dict[int,float]:
+    # Dirichlet smoothing (alpha) para estabilidade
+    counts={c:alpha for c in (1,2,3,4)}
+    if tail:
+        win = tail[-k:] if len(tail)>=k else tail
+        for x in win:
+            if x in counts: counts[x]+=1
+    return _norm(counts)
 
 def _weights_for_fibo(ws: List[int])->Dict[int,float]:
-    # peso = 1/sqrt(k) (suaviza preferência por janelas menores sem colapsar as grandes)
+    # peso = 1/sqrt(k) (suaviza preferência por janelas curtas sem ignorar as longas)
     raw={k:1.0/math.sqrt(k) for k in ws}
     s=sum(raw.values()) or 1e-9
     return {k:v/s for k,v in raw.items()}
@@ -249,72 +253,58 @@ def _post_e1_fibo_mix(tail: List[int], windows: List[int]) -> Dict[int,float]:
     mix={c:0.0 for c in (1,2,3,4)}
     wts=_weights_for_fibo(windows)
     for k, wk in wts.items():
-        pk=_post_freq(tail,k)
+        pk=_post_freq(tail,k,alpha=1.0)
         for c in (1,2,3,4):
             mix[c]+=wk*pk[c]
     return _norm(mix)
 
-def _post_e2_short(tail):  return _post_freq(tail, 60)
-def _post_e3_long(tail):   return _post_freq(tail, 300)
+def _post_e2_short(tail):  return _post_freq(tail, 60, alpha=1.0)
+def _post_e3_long(tail):   return _post_freq(tail, 300, alpha=1.0)
 def _post_e4_llm(tail):    return {1:0.25,2:0.25,3:0.25,4:0.25}  # placeholder offline
 
 def _hedge(p1,p2,p3,p4, w=(0.45,0.25,0.20,0.10)):
-    # leve aumento do peso do E1 (Fibo-Mix) para refletir o pedido de “vários fibo”
     cands=(1,2,3,4)
     out={c: w[0]*p1.get(c,0)+w[1]*p2.get(c,0)+w[2]*p3.get(c,0)+w[3]*p4.get(c,0) for c in cands}
     return _norm(out)
 
-def _runnerup_ls2(post:Dict[int,float], loss_streak:int)->Tuple[int,Dict[int,float],str]:
-    rank=sorted(post.items(), key=lambda kv: kv[1], reverse=True)
-    best=rank[0][0]
-    if loss_streak>=2 and len(rank)>=2 and (rank[0][1]-rank[1][1])<0.05:
-        return rank[1][0], post, "IA_runnerup_ls2"
-    return best, post, "IA"
-
-def _conf_floor(post:Dict[int,float], floor=0.30, cap=0.95):
-    post=_norm({c:float(post.get(c,0)) for c in (1,2,3,4)})
-    b=max(post,key=post.get); mx=post[b]
-    if mx<floor:
-        others=[c for c in (1,2,3,4) if c!=b]
-        s=sum(post[c] for c in others)
-        take=min(floor-mx, s)
-        if s>0:
-            scale=(s-take)/s
-            for c in others: post[c]*=scale
-        post[b]=min(cap, mx+take)
-    if post[b]>cap:
-        ex=post[b]-cap; post[b]=cap
-        add=ex/3.0
-        for c in (1,2,3,4):
-            if c!=b: post[c]+=add
-    return _norm(post)
+def _entropy(p: Dict[int,float])->float:
+    eps=1e-12
+    return -sum(max(p.get(c,0.0),eps)*math.log(max(p.get(c,0.0),eps)) for c in (1,2,3,4))
 
 def _top_k(post: Dict[int,float], k:int=3)->List[Tuple[int,float]]:
     return sorted(post.items(), key=lambda kv: kv[1], reverse=True)[:k]
 
-def _choose_number()->Tuple[int,float,int,Dict[int,float],float,str,List[Tuple[int,float]],Dict[int,float]]:
+def _choose_number()->Tuple[Optional[int],float,int,Dict[int,float],float,str,List[Tuple[int,float]],Dict[int,float],float]:
+    """
+    Retorna:
+      best (ou None se NEUTRO), conf, samples, post, gap, reason, top3, e1mix, entropia
+    """
     tail=_timeline_tail(400)
-    p1=_post_e1_fibo_mix(tail, FIBO_WINDOWS)  # << FIBO MIX dinâmico
+    p1=_post_e1_fibo_mix(tail, FIBO_WINDOWS)
     p2=_post_e2_short(tail)
     p3=_post_e3_long(tail)
     p4=_post_e4_llm(tail)
     base=_hedge(p1,p2,p3,p4)
-    best, post, reason = _runnerup_ls2(base, loss_streak=0)
-    post=_conf_floor(post, 0.30, 0.95)
-    best=max(post,key=post.get); conf=float(post[best])
-    r=sorted(post.items(), key=lambda kv: kv[1], reverse=True)
-    gap=(r[0][1]-r[1][1]) if len(r)>=2 else r[0][1]
-    top3=_top_k(post, 3)
-    return best, conf, _timeline_size(), post, gap, reason, top3, p1  # p1 para snapshot E1
+    # filtros
+    rank=sorted(base.items(), key=lambda kv: kv[1], reverse=True)
+    best=rank[0][0]; conf=float(rank[0][1])
+    gap=float(rank[0][1]-rank[1][1]) if len(rank)>=2 else float(rank[0][1])
+    ent=_entropy(base)
 
-def _ngram_snapshot(suggested:int)->str:
-    # agora mostrando snapshot do E1 (Fibo-Mix)
+    # Regra de NEUTRO (não abre entrada)
+    if ent>ENTROPY_CUTOFF or conf<MIN_CONF or gap<MIN_GAP:
+        return None, conf, _timeline_size(), base, gap, "NEUTRO", _top_k(base,3), p1, ent
+
+    top3=_top_k(base, 3)
+    return best, conf, _timeline_size(), base, gap, "IA", top3, p1, ent
+
+def _snapshot_e1(suggested:Optional[int])->str:
     tail=_timeline_tail(400)
     post=_post_e1_fibo_mix(tail, FIBO_WINDOWS)
     pct=lambda x:f"{x*100:.1f}%"
     p1,p2,p3,p4 = pct(post[1]), pct(post[2]), pct(post[3]), pct(post[4])
     wtxt=",".join(str(k) for k in FIBO_WINDOWS)
-    conf=pct(post.get(int(suggested),0.0))
+    conf=pct(post.get(int(suggested),0.0)) if suggested else "—"
     return (f"📈 Amostra: {_timeline_size()} • Conf(E1): {conf}\n"
             f"🌀 E1(FiboMix {wtxt}): 1 {p1} | 2 {p2} | 3 {p3} | 4 {p4}")
 
@@ -357,7 +347,7 @@ async def tg_delete(chat_id: str, message_id: int):
 RX_ENTRADA = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
 RX_ANALISE = re.compile(r"\bANALISANDO\b", re.I)
 
-# compat (não fecha mais por estes, fechamento agora é estrito)
+# compat (não fecham sozinhos)
 RX_FECHA   = re.compile(r"APOSTA\s+ENCERRADA", re.I)
 RX_GREEN   = re.compile(r"GREEN|✅", re.I)
 RX_RED     = re.compile(r"RED|❌", re.I)
@@ -367,7 +357,7 @@ RX_NUMS    = re.compile(r"[1-4]")
 RX_AFTER   = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
 RX_PAREN   = re.compile(r"\(([^\)]*)\)\s*$")
 
-# >>> FECHAMENTO ESTRITO: "GREEN/RED (...) fecha"
+# FECHAMENTO ESTRITO: "GREEN/RED (...) fecha"
 RX_CLOSE_STRICT = re.compile(
     r"(?:✅\s*)?\b(GREEN|RED)\b.*?\(([1-4])\).*?(?:✅\s*)?fecha\b",
     re.I | re.S
@@ -378,17 +368,13 @@ def _parse_seq_list(text:str)->List[int]:
     if not m: return []
     return [int(x) for x in RX_NUMS.findall(m.group(1))]
 
-def _parse_seq_pair(text:str, need:int=2)->List[int]:
-    arr=_parse_seq_list(text)
-    return arr[:need]
-
 def _parse_after(text:str)->Optional[int]:
     m=RX_AFTER.search(text or "")
     if not m: return None
     try: return int(m.group(1))
     except: return None
 
-def _parse_paren_pair(text:str, need:int=2)->List[int]:
+def _parse_paren_pair(text:str, need:int=NEED_OBS)->List[int]:
     m=RX_PAREN.search(text or "")
     if not m: return []
     nums=[int(x) for x in re.findall(r"[1-4]", m.group(1))]
@@ -408,11 +394,14 @@ async def health():
 @app.get("/debug_cfg")
 async def debug_cfg():
     return {
-        "MAX_GALE": MAX_GALE,
         "OBS_TIMEOUT_SEC": OBS_TIMEOUT_SEC,
         "DEDUP_WINDOW_SEC": DEDUP_WINDOW_SEC,
         "FIBO_WINDOWS": FIBO_WINDOWS,
-        "SHOW_TOP3": SHOW_TOP3
+        "SHOW_TOP3": SHOW_TOP3,
+        "MIN_CONF": MIN_CONF,
+        "MIN_GAP": MIN_GAP,
+        "ENTROPY_CUTOFF": ENTROPY_CUTOFF,
+        "ABSTAIN_ON_TIMEOUT": ABSTAIN_ON_TIMEOUT
     }
 
 # ------------------------------------------------------
@@ -438,7 +427,7 @@ async def webhook(token: str, request: Request):
             await tg_send(TARGET_CHANNEL, f"DEBUG: Ignorando chat {chat_id}. Fonte esperada: {SOURCE_CHANNEL}")
         return {"ok": True, "skipped": "wrong_source"}
 
-    # 1) ANALISANDO: apenas alimenta memória (com dedupe)
+    # 1) ANALISANDO: alimenta memória (com dedupe)
     if RX_ANALISE.search(text):
         if _seen_recent("analise", _dedupe_key(text)):
             return {"ok": True, "skipped": "analise_dupe"}
@@ -456,21 +445,21 @@ async def webhook(token: str, request: Request):
         if pend:
             suggested=int(pend["suggested"] or 0)
 
-            # observado/hit entre parênteses
+            # observado/hit dentro de parênteses
             hit = None
             try:
                 hit = int(m_close.group(2))
             except:
                 pass
 
-            # memória extra: quaisquer números entre parênteses -> timeline
-            extra_tail = _parse_paren_pair(text, need=2)
+            # memória extra: números nos parênteses -> timeline
+            extra_tail = _parse_paren_pair(text, need=NEED_OBS)
             if extra_tail:
                 _append_seq(extra_tail)
 
-            # atualizar 'seen' com o hit
+            # atualizar 'seen' com o hit (1 observado basta)
             if hit is not None:
-                _pending_seen_append([hit], need=min(2, MAX_GALE+1))
+                _pending_seen_append([hit], need=NEED_OBS)
 
             pend=_pending_get()
             seen = [s for s in (pend["seen"] or "").split("-") if s]
@@ -479,13 +468,10 @@ async def webhook(token: str, request: Request):
             raw_outcome = (m_close.group(1) or "").strip().upper()
             outcome = "GREEN" if raw_outcome == "GREEN" else "LOSS"
 
-            # estágio inferido
-            stage_lbl = "G0" if (seen and seen[0].isdigit() and int(seen[0])==suggested) else "G1"
-
-            final_seen="-".join(seen[:min(2, MAX_GALE+1)]) if seen else (str(hit) if hit is not None else "X")
-            msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
+            final_seen = seen[0] if seen else (str(hit) if hit is not None else "X")
+            msg_txt=_pending_close(str(final_seen), outcome, suggested)
             if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
-            return {"ok": True, "closed": outcome, "seen": final_seen}
+            return {"ok": True, "closed": outcome, "seen": str(final_seen)}
 
         return {"ok": True, "noted_close": True}
 
@@ -500,39 +486,66 @@ async def webhook(token: str, request: Request):
         if seq: _append_seq(seq)               # memória
         after = _parse_after(text)             # usado apenas para exibir "após X"
 
-        # fecha pendência anterior esquecida (marca X)
+        # fecha pendência anterior esquecida
         pend=_pending_get()
         if pend:
             seen=[s for s in (pend["seen"] or "").split("-") if s]
-            while len(seen)<min(2,MAX_GALE+1): seen.append("X")
-            final_seen="-".join(seen[:min(2,MAX_GALE+1)])
-            suggested=int(pend["suggested"] or 0)
-            outcome="LOSS"; stage_lbl="G1"
-            if len(seen)>=1 and seen[0].isdigit() and int(seen[0])==suggested:
-                outcome="GREEN"; stage_lbl="G0"
-            elif len(seen)>=2 and seen[1].isdigit() and int(seen[1])==suggested and MAX_GALE>=1:
-                outcome="GREEN"; stage_lbl="G1"
-            msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
-            if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
+
+            # se não houve "fecha" e vamos iniciar outra ENTRADA:
+            if ABSTAIN_ON_TIMEOUT and not seen:
+                # descarta sem pontuar
+                con = _con()
+                con.execute("UPDATE pending SET open=0 WHERE id=?", (int(pend["id"]),))
+                con.commit(); con.close()
+            else:
+                # houve observado, fecha normalmente com GREEN/LOSS conforme correspondente
+                suggested=int(pend["suggested"] or 0)
+                outcome="LOSS"
+                if seen and seen[0].isdigit() and int(seen[0])==suggested:
+                    outcome="GREEN"
+                final_seen = seen[0] if seen else "X"
+                msg_txt=_pending_close(str(final_seen), outcome, suggested)
+                if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
 
         # “Analisando...” (apaga depois)
         analyzing_id = await tg_send_return(TARGET_CHANNEL, "⏳ Analisando padrão, aguarde...")
 
-        # escolhe nova sugestão (com estudo TOP-3)
-        best, conf, samples, post, gap, reason, top3, e1mix = _choose_number()
+        # escolhe nova sugestão (com filtros NEUTRO)
+        best, conf, samples, post, gap, reason, top3, e1mix, ent = _choose_number()
+
+        if best is None:
+            # NEUTRO — não abre pendência
+            def pct(x): return f"{x*100:.2f}%"
+            wtxt=",".join(str(k) for k in FIBO_WINDOWS)
+            txt=(f"🤖 <b>NEUTRO</b>\n"
+                 f"🧩 <b>Padrão:</b> GEN{(' após '+str(after)) if after else ''}\n"
+                 f"📊 Conf={pct(conf)} | gap≈{gap*100:.1f}pp | H={ent:.2f} (corte={ENTROPY_CUTOFF})\n"
+                 f"🧠 Critérios: conf≥{int(MIN_CONF*100)}% • gap≥{int(MIN_GAP*100)}pp • entropia≤{ENTROPY_CUTOFF}\n")
+            if SHOW_TOP3 and top3:
+                top3_txt = " | ".join(f"{n} ({pct(p)})" for n,p in top3)
+                txt += f"🔬 <b>Estudo 3 números:</b> {top3_txt}\n"
+            txt += _snapshot_e1(None)
+            await tg_send(TARGET_CHANNEL, txt)
+
+            if analyzing_id is not None:
+                await tg_delete(TARGET_CHANNEL, analyzing_id)
+
+            return {"ok": True, "neutral": True, "conf": conf, "gap": gap, "entropy": ent}
+
+        # caso válido: abrir pendência
         opened=_pending_open(best)
         if opened:
-            aft_txt = f" após {after}" if after else ""
             def pct(x): return f"{x*100:.2f}%"
-            top3_txt = " | ".join(f"{n} ({pct(p)})" for n,p in top3)
             wtxt=",".join(str(k) for k in FIBO_WINDOWS)
+            aft_txt = f" após {after}" if after else ""
+            top3_txt = " | ".join(f"{n} ({pct(p)})" for n,p in (top3 or []))
             txt=(f"🤖 <b>IA SUGERE</b> — <b>{best}</b>\n"
                  f"🧩 <b>Padrão:</b> GEN{aft_txt}\n"
-                 f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples} | <b>gap≈</b>{gap*100:.1f}pp\n"
-                 f"🧠 <b>Modo:</b> IA (E1=FiboMix[{wtxt}] + Short/Long)\n")
+                 f"📊 <b>Conf:</b> {pct(conf)} | <b>Amostra≈</b>{samples} | <b>gap≈</b>{gap*100:.1f}pp | H={ent:.2f}\n"
+                 f"🧠 <b>Modelo:</b> FiboMix[{wtxt}] + Short/Long\n")
             if SHOW_TOP3 and top3:
                 txt += f"🔬 <b>Estudo 3 números:</b> {top3_txt}\n"
-            txt += _ngram_snapshot(best)
+            txt += _snapshot_e1(best)
             await tg_send(TARGET_CHANNEL, txt)
 
             if analyzing_id is not None:
