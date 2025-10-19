@@ -329,6 +329,18 @@ RX_AFTER   = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
 
 RX_GREEN   = re.compile(r"GREEN|✅", re.I)
 RX_RED     = re.compile(r"RED|❌", re.I)
+
+# ===== NOVO: leitor do último parêntese do texto (pega último dígito 1..4) =====
+RX_PAREN_ANY = re.compile(r"\(([^()]*)\)")
+def _parse_close_digit(text: str) -> Optional[int]:
+    chunks = RX_PAREN_ANY.findall((text or "").strip())
+    if not chunks: return None
+    last = chunks[-1]
+    nums = re.findall(r"[1-4]", last)
+    return int(nums[-1]) if nums else None
+# ===============================================================================
+
+# (mantido para memória/timeline, mas não é mais usado para decidir fechamento)
 RX_PAREN   = re.compile(r"\(([^\)]*)\)\s*$")
 
 def _parse_seq_list(text:str)->List[int]:
@@ -398,7 +410,7 @@ async def webhook(token: str, request: Request):
         if seq: _append_seq(seq)
         return {"ok": True, "analise_seq": len(seq)}
 
-    # 2) APOSTA ENCERRADA / GREEN / RED (com dedupe + FECHAMENTO CORRETO G0/G1)
+    # 2) APOSTA ENCERRADA / GREEN / RED  (AGORA: fecha pelo número do último "()")
     if RX_FECHA.search(text) or RX_GREEN.search(text) or RX_RED.search(text):
         if _seen_recent("fechamento", _dedupe_key(text)):
             return {"ok": True, "skipped": "fechamento_dupe"}
@@ -407,43 +419,26 @@ async def webhook(token: str, request: Request):
         if pend:
             suggested=int(pend["suggested"] or 0)
 
-            # (a) Observados do PLACAR: usar a linha "Sequência: a | b"
-            obs_pair = _parse_seq_pair(text, need=min(2, MAX_GALE+1))
-            if obs_pair:
-                _pending_seen_append(obs_pair, need=min(2, MAX_GALE+1))
+            # >>> NOVO núcleo de fechamento:
+            obs = _parse_close_digit(text)  # pega último dígito 1..4 no último parêntese
+            if obs is not None:
+                _pending_seen_append([obs], need=1)  # registra como visto (somente G0)
 
-            # (b) Memória extra: números finais entre parênteses "(x | y)" -> só para timeline
-            extra_tail = _parse_paren_pair(text, need=2)
-            if extra_tail:
-                _append_seq(extra_tail)
-
-            # Reavalia pendência após update
+            # decisão (sempre G0 com base no "()")
             pend=_pending_get()
-            seen = [s for s in (pend["seen"] or "").split("-") if s]
+            seen = (pend["seen"] or "").strip()
+            outcome="LOSS"; stage_lbl="G0"
+            if seen.isdigit() and int(seen)==suggested:
+                outcome="GREEN"
+            final_seen = seen if seen else "X"
 
-            # Regra: se G0 != sugerido e ainda temos espaço para G1, NÃO fecha; aguarda próxima rodada
-            if len(seen)==1 and seen[0].isdigit() and int(seen[0]) != suggested and MAX_GALE>=1:
-                # mantém pendência aberta para o G1
-                if SHOW_DEBUG:
-                    await tg_send(TARGET_CHANNEL, f"DEBUG: aguardando G1 (visto G0={seen[0]}, nosso={suggested}).")
-                return {"ok": True, "waiting_g1": True, "seen": "-".join(seen)}
+            msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
+            if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
 
-            # Decisão final (se já temos 1 ou 2 observados suficientes)
-            outcome="LOSS"; stage_lbl="G1"
-            if len(seen)>=1 and seen[0].isdigit() and int(seen[0])==suggested:
-                outcome="GREEN"; stage_lbl="G0"
-            elif len(seen)>=2 and seen[1].isdigit() and int(seen[1])==suggested and MAX_GALE>=1:
-                outcome="GREEN"; stage_lbl="G1"
+            if SHOW_DEBUG:
+                await tg_send(TARGET_CHANNEL, f"DEBUG: fechamento '(' capturado -> {obs} | seen='{final_seen}' | nosso={suggested}")
 
-            # fecha se: GREEN no G0, ou já temos G1 observado (independente de GREEN/LOSS)
-            if stage_lbl=="G0" or len(seen)>=min(2, MAX_GALE+1):
-                final_seen="-".join(seen[:min(2, MAX_GALE+1)]) if seen else "X"
-                msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
-                if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
-                return {"ok": True, "closed": outcome, "seen": final_seen}
-            else:
-                # ainda aguardando G1 (cenário raro se MAX_GALE>1 futuramente)
-                return {"ok": True, "waiting_more_obs": True, "seen": "-".join(seen)}
+            return {"ok": True, "closed": outcome, "seen": final_seen}
 
         return {"ok": True, "noted_close": True}
 
