@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v7.3 (INTEGRAÇÃO GEMINI - FOCO GREEN G0 / CORREÇÃO DE FECHAMENTO)
+v7.6 (INTEGRAÇÃO GEMINI - FOCO GREEN G0 / CORREÇÃO DE FECHAMENTO (X | Y) / MODELO 2)
 
 ENV obrigatórias (Render -> Environment):
 - TG_BOT_TOKEN
@@ -20,7 +20,7 @@ from typing import List, Dict, Optional, Tuple
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 
-# >>> IMPORTS DO GEMINI (CORREÇÃO: SÓ NO ARQUIVO PYTHON) <<<
+# >>> IMPORTS DO GEMINI <<<
 from google import genai
 from google.genai import types
 
@@ -63,7 +63,7 @@ if GEMINI_API_KEY:
 # ------------------------------------------------------
 # App
 # ------------------------------------------------------
-app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.3")
+app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.6")
 
 # ------------------------------------------------------
 # DB helpers
@@ -351,7 +351,7 @@ async def _choose_number()->Tuple[int,float,int,Dict[int,float],float,str]:
     # Retorna o post processado
     return best, conf, _timeline_size(), post, gap, reason
 
-# >>> FUNÇÃO DE SNAPSHOT <<<
+# >>> FUNÇÃO DE SNAPSHOT (Mantida para consistência, mas não usada na mensagem principal) <<<
 def _ia_snapshot(suggested:int, post:Dict[int,float], reason:str)->str:
     pct=lambda x:f"{x*100:.1f}%"
     p1_final,p2_final,p3_final,p4_final = post[1], post[2], post[3], post[4]
@@ -415,8 +415,9 @@ RX_GREEN   = re.compile(r"GREEN|✅", re.I)
 RX_RED     = re.compile(r"RED|❌", re.I)
 RX_PAREN   = re.compile(r"\(([^\)]*)\)\s*$")
 
-# >>> NOVO PARSER PARA RESULTADO FINAL <<<
-RX_CLOSING_NUM = re.compile(r"\(([1-4])\)\s*$", re.I)
+# >>> PARSER CORRIGIDO para ler (X | Y) ou (X) no final da mensagem <<<
+# Ele busca o primeiro número (1-4) dentro do último parêntese.
+RX_CLOSING_NUM = re.compile(r"\(([^\)]*?)([1-4]).*?\)\s*$", re.I)
 
 def _parse_seq_list(text:str)->List[int]:
     m=RX_SEQ.search(text or "")
@@ -442,7 +443,9 @@ def _parse_paren_pair(text:str, need:int=2)->List[int]:
 def _parse_closing_number(text:str)->Optional[int]:
     m=RX_CLOSING_NUM.search(text or "")
     if not m: return None
-    try: return int(m.group(1))
+    try: 
+        # m.group(2) é o primeiro número [1-4] capturado dentro do parêntese.
+        return int(m.group(2)) 
     except: return None
 # ------------------------------------------------------
 # Rotas básicas
@@ -499,7 +502,7 @@ async def webhook(token: str, request: Request):
         if pend:
             suggested=int(pend["suggested"] or 0)
             
-            # NOVO: TENTA EXTRAIR O NÚMERO FINAL DO PARÊNTESE (Ex: RED (3))
+            # NOVO: TENTA EXTRAIR O NÚMERO FINAL DO PARÊNTESE (Ex: GREEN!!! (3 | 4))
             observed_result = _parse_closing_number(text)
             
             # (a) Observados do PLACAR: (Mantido para alimentar 'seen' e timeline, caso haja a linha de Sequência)
@@ -529,14 +532,13 @@ async def webhook(token: str, request: Request):
                     return {"ok": True, "closed": outcome, "seen": final_seen}
                 else:
                     # Se não encontramos o número no parêntese, ignoramos o fechamento de G0 por segurança.
-                    # Isso deve ser raro se o formato for consistente.
                     if SHOW_DEBUG:
                         await tg_send(TARGET_CHANNEL, f"DEBUG: Fechamento G0 ignorado. Não encontrou número final no parêntese. Texto: '{text}'")
                     return {"ok": True, "waiting_obs_g0_miss": True}
 
             # LÓGICA COMPLETA PARA MAX_GALE > 0 (caso você mude a ENV) - SEM ALTERAÇÕES AQUI
             else:
-                # O restante da lógica para GALE > 0 é mantida aqui (omitida por brevidade, mas está no código)
+                # Lógica completa de GALE > 0 é mantida aqui (porém ignorada se MAX_GALE=0)
                 
                 pend=_pending_get()
                 seen = [s for s in (pend["seen"] or "").split("-") if s]
@@ -598,12 +600,25 @@ async def webhook(token: str, request: Request):
         
         opened=_pending_open(best)
         if opened:
-            aft_txt = f" após {after}" if after else ""
-            txt=(f"🤖 <b>IA SUGERE</b> — <b>{best}</b>\n"
-                 f"🧩 <b>Padrão:</b> GEN{aft_txt}\n"
-                 f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples} | <b>gap≈</b>{gap*100:.1f}pp\n"
-                 f"🧠 <b>Modo:</b> {reason}\n"
-                 f"{_ia_snapshot(best, post, reason)}")
+            aft_txt = f"{after}" if after else "X"
+            
+            # --- NOVO MODELO DE MENSAGEM (Modelo 2: Foco em Ação e Risco) ---
+            
+            pct=lambda x:f"{x*100:.1f}"
+            
+            # Tenta obter o post cru do E4 (Gemini) para exibir.
+            e4_post = getattr(_post_e4_llm, 'last_run', {1:0.25,2:0.25,3:0.25,4:0.25})
+            e4_sug_pct = pct(e4_post.get(int(best), 0.0))
+            
+            # A mensagem reformulada (Modelo 2)
+            txt=(f"🚀 **ENTRADA IMEDIATA:** Número **{best}** (G0)\n"
+                 f"🌟 **CONFIANÇA** — **{conf*100:.1f}%**\n"
+                 f"🧠 **IA Leader:** Gemini ({e4_sug_pct}%)\n"
+                 f"📊 **Base:** Padrão {aft_txt} | Amostra ≈{samples}\n"
+                 f"💡 **Modo:** {reason} (Gap {gap*100:.1f}pp)")
+            
+            # --- FIM DO NOVO MODELO DE MENSAGEM ---
+            
             await tg_send(TARGET_CHANNEL, txt)
 
             if analyzing_id is not None:
