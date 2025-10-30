@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v7.9 (FINALIZAÇÃO OTIMIZAÇÃO - PASSO 3: OTIMIZAÇÃO DINÂMICA)
+v7.9.3 (FINALIZADO: Otimização, Persistência e Correção de Erro)
 
 ENV obrigatórias (Render -> Environment):
 - TG_BOT_TOKEN
@@ -39,14 +39,15 @@ SHOW_DEBUG       = os.getenv("SHOW_DEBUG", "False").strip().lower() == "true"
 MAX_GALE         = int(os.getenv("MAX_GALE", "0")) 
 OBS_TIMEOUT_SEC  = int(os.getenv("OBS_TIMEOUT_SEC", "420"))
 DEDUP_WINDOW_SEC = int(os.getenv("DEDUP_WINDOW_SEC", "40"))
-# NOVO: Janela de dados para otimização (100-200 é um bom equilíbrio)
+# Janela de dados para otimização (100-200 é um bom equilíbrio)
 OPTIMIZATION_WINDOW = 150 
 
 if not TG_BOT_TOKEN or not WEBHOOK_TOKEN or not TARGET_CHANNEL:
     raise RuntimeError("Faltam ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN, TARGET_CHANNEL.")
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
-DB_PATH = "/opt/render/project/src/main.sqlite"
+# >>> AJUSTE CRUCIAL: Apontando para o disco persistente do Render (/var/data) <<<
+DB_PATH = "/var/data/main.sqlite"
 
 # ------------------------------------------------------
 # Cliente Gemini (Inicialização)
@@ -65,12 +66,17 @@ if GEMINI_API_KEY:
 # ------------------------------------------------------
 # App
 # ------------------------------------------------------
-app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.9")
+app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.9.3")
 
 # ------------------------------------------------------
 # DB helpers
 # ------------------------------------------------------
 def _con():
+    # Garante que a pasta do disco exista antes de tentar criar o DB
+    db_dir = os.path.dirname(DB_PATH)
+    if not os.path.exists(db_dir):
+        os.makedirs(db_dir, exist_ok=True)
+        
     con = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL;")
@@ -252,6 +258,7 @@ def _pending_close(final_seen: str, outcome: str, stage_lbl: str, suggested:int)
 # ------------------ DEDUPE por conteúdo ------------------
 def _dedupe_key(text: str) -> str:
     base = re.sub(r"\s+", " ", (text or "")).strip().lower()
+    # >>> CORREÇÃO: heigest -> hexdigest <<<
     return hashlib.sha1(base.encode("utf-8")).hexdigest()
 
 def _seen_recent(kind: str, dkey: str) -> bool:
@@ -341,28 +348,25 @@ async def _post_e4_llm(tail:List[int])->Dict[int,float]:
         if SHOW_DEBUG: print(f"DEBUG Gemini Error (E4): {e}")
         return _post_e4_llm.last_run # Retorna 25% fixo em caso de erro
 
-# ALTERADO: Removemos o argumento 'w' fixo e lemos do DB (PASSO 1)
+# LÊ OS PESOS DINAMICAMENTE
 def _hedge(p1,p2,p3,p4):
-    w1, w2, w3, w4 = _db_get_weights() # LÊ OS PESOS DINAMICAMENTE
+    w1, w2, w3, w4 = _db_get_weights() 
     w = (w1, w2, w3, w4) 
     cands=(1,2,3,4)
-    # A fórmula agora usa os pesos lidos: w[0]=w1, w[1]=w2, etc.
     out={c: w[0]*p1.get(c,0)+w[1]*p2.get(c,0)+w[2]*p3.get(c,0)+w[3]*p4.get(c,0) for c in cands}
     return _norm(out)
 
 def _runnerup_ls2(post:Dict[int,float], loss_streak:int)->Tuple[int,Dict[int,float],str]:
-    # Lógica mantida, mas como MAX_GALE=0, a intenção de G1 é ignorada
     rank=sorted(post.items(), key=lambda kv: kv[1], reverse=True)
     best=rank[0][0]
     
-    # Mantemos a lógica IA_runnerup_ls2 por segurança, mas ela terá pouco efeito com GALE=0
     if loss_streak>=2 and len(rank)>=2 and (rank[0][1]-rank[1][1])<0.05:
         return rank[1][0], post, "IA_runnerup_ls2"
         
     return best, post, "IA"
 
-def _conf_floor(post:Dict[int,float], floor=0.30, cap=0.95):
-    # Lógica mantida para garantir uma confiança mínima/máxima
+def _conf_floor(post:Dict[int,float], floor=0.35, cap=0.95):
+    # Aumentando o piso de confiança para 35% (0.35)
     post=_norm({c:float(post.get(c,0)) for c in (1,2,3,4)})
     b=max(post,key=post.get); mx=post[b]
     if mx<floor:
@@ -394,9 +398,8 @@ async def _choose_number()->Tuple[int,float,int,Dict[int,float],float,str,Dict[i
     p4=await _post_e4_llm(tail) 
     
     base=_hedge(p1,p2,p3,p4)
-    best, post_raw, reason = _runnerup_ls2(base, loss_streak=_get_ls()) # Renomeado post para post_raw
+    best, post_raw, reason = _runnerup_ls2(base, loss_streak=_get_ls())
     
-    # ALTERADO: Aumentando o piso de confiança para 35% (0.35)
     post_final=_conf_floor(post_raw, 0.35, 0.95) # O resultado final (após o floor)
     
     best=max(post_final,key=post_final.get); conf=float(post_final[best])
@@ -433,17 +436,11 @@ def _analyze_performance(rows: List[sqlite3.Row])->Dict[str, Any]:
 
         # 2. Avaliação da performance de cada especialista (E1, E2, E3, E4)
         for e_key, conf_col in conf_cols.items():
-            # A métrica principal: "O número que o especialista *mais* confiava (maior 'pX_conf')
-            # no momento do palpite foi o resultado final?"
-            # OBS: No v7.8, registramos a confiança *no número sugerido*, não *no mais confiável*.
-            # Vamos usar a métrica: "A confiança do especialista no número sugerido estava correta?"
-            
-            # Aqui, pX_conf é a confiança do especialista no 'suggested'
-            # O especialista só acertou se o 'suggested' (que ele apoiou) foi o 'result'.
-            if suggested == result and row[conf_col] > 0.30: # Acertou e tinha uma confiança minimamente decente
+            # Métrica: O especialista acertou se o número sugerido (que ele apoiou) foi o resultado.
+            if suggested == result and row[conf_col] > 0.30: 
                  hits[e_key] += 1
-            elif suggested != result and row[conf_col] <= 0.30: # Errou, mas não confiava muito (Neutro)
-                 hits[e_key] += 0.5 # Dá um pequeno bônus por não confiar no perdedor (ajusta o peso)
+            elif suggested != result and row[conf_col] <= 0.30: 
+                 hits[e_key] += 0.5 # Bônus neutro por não apoiar o perdedor
 
 
     # Calcula as taxas de acerto
@@ -594,7 +591,6 @@ RX_GREEN   = re.compile(r"GREEN|✅", re.I)
 RX_RED     = re.compile(r"RED|❌", re.I)
 RX_PAREN   = re.compile(r"\(([^\)]*)\)\s*$")
 
-# >>> PARSER CORRIGIDO para ler (X | Y) ou (X) no final da mensagem <<<
 # Ele busca o primeiro número (1-4) dentro do último parêntese.
 RX_CLOSING_NUM = re.compile(r"\(([^\)]*?)([1-4]).*?\)\s*$", re.I)
 
@@ -710,7 +706,7 @@ async def webhook(token: str, request: Request):
         if pend:
             suggested=int(pend["suggested"] or 0)
             
-            # NOVO: TENTA EXTRAIR O NÚMERO FINAL DO PARÊNTESE (Ex: GREEN!!! (3 | 4))
+            # TENTA EXTRAIR O NÚMERO FINAL DO PARÊNTESE
             observed_result = _parse_closing_number(text)
             
             # (a) Observados do PLACAR: (Mantido para alimentar 'seen' e timeline, caso haja a linha de Sequência)
@@ -731,7 +727,6 @@ async def webhook(token: str, request: Request):
                     outcome="LOSS"; stage_lbl="G0"
                     if observed_result == suggested: outcome="GREEN"
                     
-                    # Usa o resultado observado como final_seen
                     final_seen=str(observed_result)
                     
                     # PASSO 2: ATUALIZA O RESULTADO FINAL NO detailed_history
@@ -739,7 +734,7 @@ async def webhook(token: str, request: Request):
                     con.execute("UPDATE detailed_history SET result=? WHERE id=?", (observed_result, int(pend["id"])))
                     con.commit(); con.close()
                     
-                    # Fechamento: (já alimenta o timeline com final_seen e adiciona o score)
+                    # Fechamento: 
                     msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
                     if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
                     return {"ok": True, "closed": outcome, "seen": final_seen}
@@ -750,7 +745,6 @@ async def webhook(token: str, request: Request):
 
             # LÓGICA COMPLETA PARA MAX_GALE > 0 (caso você mude a ENV) - SEM ALTERAÇÕES AQUI
             else:
-                # Lógica completa de GALE > 0 é mantida aqui (porém ignorada se MAX_GALE=0)
                 
                 pend=_pending_get()
                 seen = [s for s in (pend["seen"] or "").split("-") if s]
@@ -817,7 +811,7 @@ async def webhook(token: str, request: Request):
         if opened:
             aft_txt = f"{after}" if after else "X"
             
-            # NOVO: Captura a ID da aposta aberta para o Passo 2
+            # Captura a ID da aposta aberta para o Passo 2
             row = _pending_get()
             entry_id = int(row["id"]) if row else None 
             
