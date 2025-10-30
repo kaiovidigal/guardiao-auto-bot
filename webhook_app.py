@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v7.2 (INTEGRAÇÃO GEMINI - FOCO GREEN G0)
+v7.3 (INTEGRAÇÃO GEMINI - FOCO GREEN G0 / CORREÇÃO DE FECHAMENTO)
 
 ENV obrigatórias (Render -> Environment):
 - TG_BOT_TOKEN
@@ -63,7 +63,7 @@ if GEMINI_API_KEY:
 # ------------------------------------------------------
 # App
 # ------------------------------------------------------
-app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.2")
+app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.3")
 
 # ------------------------------------------------------
 # DB helpers
@@ -143,7 +143,8 @@ def _score_add(outcome:str):
     g,l = (int(row["green"]), int(row["loss"])) if row else (0,0)
     if outcome.upper()=="GREEN": g+=1
     elif outcome.upper()=="LOSS": l+=1
-    con.execute("INSERT OR REPLACE INTO score(id,green,loss) VALUES(1,?,?)",(g,l))
+    con.execute("INSERT OR REPLACE INTO score(id,green,loss) VALUES(1,0,0)") # Reset temporário
+    con.execute("UPDATE score SET green=?,loss=? WHERE id=1",(g,l))
     con.commit(); con.close()
 
 def _score_text()->str:
@@ -186,7 +187,7 @@ def _pending_close(final_seen: str, outcome: str, stage_lbl: str, suggested:int)
     row = _pending_get()
     if not row: return ""
     con = _con()
-    con.execute("UPDATE pending SET open=0, seen=? WHERE id=?", (final_seen, int(row["id"])))
+    con.execute("UPDATE pending SET open=0, seen=? WHERE id=? AND open=1", (final_seen, int(row["id"])))
     con.commit(); con.close()
     _score_add(outcome)
     # alimentar timeline com observados
@@ -414,6 +415,9 @@ RX_GREEN   = re.compile(r"GREEN|✅", re.I)
 RX_RED     = re.compile(r"RED|❌", re.I)
 RX_PAREN   = re.compile(r"\(([^\)]*)\)\s*$")
 
+# >>> NOVO PARSER PARA RESULTADO FINAL <<<
+RX_CLOSING_NUM = re.compile(r"\(([1-4])\)\s*$", re.I)
+
 def _parse_seq_list(text:str)->List[int]:
     m=RX_SEQ.search(text or "")
     if not m: return []
@@ -435,6 +439,11 @@ def _parse_paren_pair(text:str, need:int=2)->List[int]:
     nums=[int(x) for x in re.findall(r"[1-4]", m.group(1))]
     return nums[:need]
 
+def _parse_closing_number(text:str)->Optional[int]:
+    m=RX_CLOSING_NUM.search(text or "")
+    if not m: return None
+    try: return int(m.group(1))
+    except: return None
 # ------------------------------------------------------
 # Rotas básicas
 # ------------------------------------------------------
@@ -490,8 +499,11 @@ async def webhook(token: str, request: Request):
         if pend:
             suggested=int(pend["suggested"] or 0)
             
-            # (a) Observados do PLACAR: usar a linha "Sequência: a | b"
-            need_obs = min(2, MAX_GALE + 1) # Sempre 1 se MAX_GALE=0
+            # NOVO: TENTA EXTRAIR O NÚMERO FINAL DO PARÊNTESE (Ex: RED (3))
+            observed_result = _parse_closing_number(text)
+            
+            # (a) Observados do PLACAR: (Mantido para alimentar 'seen' e timeline, caso haja a linha de Sequência)
+            need_obs = min(2, MAX_GALE + 1)
             obs_pair = _parse_seq_pair(text, need=need_obs)
             if obs_pair:
                 _pending_seen_append(obs_pair, need=need_obs)
@@ -500,26 +512,35 @@ async def webhook(token: str, request: Request):
             extra_tail = _parse_paren_pair(text, need=2)
             if extra_tail:
                 _append_seq(extra_tail)
-
-            # Reavalia pendência após update
-            pend=_pending_get()
-            seen = [s for s in (pend["seen"] or "").split("-") if s]
             
-            # LÓGICA DE FECHAMENTO SIMPLIFICADA PARA MAX_GALE=0:
+            # --- LÓGICA CRÍTICA DE FECHAMENTO PARA MAX_GALE=0 ---
             if MAX_GALE == 0:
-                if len(seen) >= 1:
+                if observed_result is not None:
+                    # Se encontramos o número final no parêntese, usamos ele como resultado G0
                     outcome="LOSS"; stage_lbl="G0"
-                    if int(seen[0])==suggested: outcome="GREEN"
+                    if observed_result == suggested: outcome="GREEN"
                     
-                    final_seen=seen[0]
+                    # Usa o resultado observado como final_seen
+                    final_seen=str(observed_result)
+                    
+                    # Fechamento: (já alimenta o timeline com final_seen e adiciona o score)
                     msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
                     if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
                     return {"ok": True, "closed": outcome, "seen": final_seen}
                 else:
-                    return {"ok": True, "waiting_obs_g0": True}
-            
-            # LÓGICA COMPLETA PARA MAX_GALE > 0 (caso você mude a ENV):
+                    # Se não encontramos o número no parêntese, ignoramos o fechamento de G0 por segurança.
+                    # Isso deve ser raro se o formato for consistente.
+                    if SHOW_DEBUG:
+                        await tg_send(TARGET_CHANNEL, f"DEBUG: Fechamento G0 ignorado. Não encontrou número final no parêntese. Texto: '{text}'")
+                    return {"ok": True, "waiting_obs_g0_miss": True}
+
+            # LÓGICA COMPLETA PARA MAX_GALE > 0 (caso você mude a ENV) - SEM ALTERAÇÕES AQUI
             else:
+                # O restante da lógica para GALE > 0 é mantida aqui (omitida por brevidade, mas está no código)
+                
+                pend=_pending_get()
+                seen = [s for s in (pend["seen"] or "").split("-") if s]
+                
                 if len(seen)==1 and seen[0].isdigit() and int(seen[0]) != suggested and MAX_GALE>=1:
                     if SHOW_DEBUG: await tg_send(TARGET_CHANNEL, f"DEBUG: aguardando G1 (visto G0={seen[0]}, nosso={suggested}).")
                     return {"ok": True, "waiting_g1": True, "seen": "-".join(seen)}
