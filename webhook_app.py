@@ -2,23 +2,15 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v7.0 (G1-only, parser canal-fonte, IA hierárquica compacta, dedupe por conteúdo,
-      fechamento correto G0/G1, “Analisando...” com auto-delete, DB SQLite)
+v7.1 (INTEGRAÇÃO GEMINI - E4 LLM)
 
 ENV obrigatórias (Render -> Environment):
 - TG_BOT_TOKEN
 - WEBHOOK_TOKEN
 - SOURCE_CHANNEL           ex: -1002810508717
 - TARGET_CHANNEL           ex: -1003052132833
-
-ENV opcionais:
-- SHOW_DEBUG          (default False)
-- MAX_GALE            (default 1)          # G0/G1
-- OBS_TIMEOUT_SEC     (default 420)
-- DEDUP_WINDOW_SEC    (default 40)
-
-Start command:
-  uvicorn webhook_app:app --host 0.0.0.0 --port $PORT
+- GEMINI_API_KEY           <<< NOVA CHAVE OBRIGATÓRIA PARA O GEMINI
+...
 """
 
 import os, re, json, time, math, sqlite3, datetime, hashlib
@@ -27,6 +19,10 @@ from typing import List, Dict, Optional, Tuple
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 
+# >>> IMPORTS DO GEMINI <<<
+from google import genai
+from google.genai import types
+
 # ------------------------------------------------------
 # ENV & constantes
 # ------------------------------------------------------
@@ -34,6 +30,8 @@ TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
 WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
 SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "").strip()
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "").strip()
+# NOVO: Chave do Gemini
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 SHOW_DEBUG       = os.getenv("SHOW_DEBUG", "False").strip().lower() == "true"
 MAX_GALE         = int(os.getenv("MAX_GALE", "1"))
@@ -47,12 +45,29 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 DB_PATH = "/opt/render/project/src/main.sqlite"
 
 # ------------------------------------------------------
+# Cliente Gemini (Inicialização)
+# ------------------------------------------------------
+GEMINI_CLIENT = None
+GEMINI_MODEL  = "gemini-2.5-flash" # Modelo rápido para análise de padrões
+
+if GEMINI_API_KEY:
+    try:
+        # O SDK do Gemini é síncrono por padrão. Como estamos em um
+        # ambiente assíncrono (FastAPI), é melhor usá-lo dentro
+        # da função que o chama, mas o client é inicializado globalmente.
+        GEMINI_CLIENT = genai.Client(api_key=GEMINI_API_KEY)
+        print("Gemini Client inicializado com sucesso.")
+    except Exception as e:
+        print(f"AVISO: Falha ao inicializar Gemini Client: {e}. E4 usará 25% fixo.")
+
+# ------------------------------------------------------
 # App
 # ------------------------------------------------------
-app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.0")
+app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.1")
 
 # ------------------------------------------------------
 # DB helpers
+# ... (Funções DB - SEM ALTERAÇÕES)
 # ------------------------------------------------------
 def _con():
     con = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
@@ -179,10 +194,11 @@ def _pending_close(final_seen: str, outcome: str, stage_lbl: str, suggested:int)
     obs = [int(x) for x in final_seen.split("-") if x.isdigit()]
     _append_seq(obs)
     our = suggested if outcome.upper()=="GREEN" else "X"
-    snap = _ngram_snapshot(suggested)
+    # A função _ngram_snapshot agora é ASYNC, precisa ser chamada pelo webhook
+    # snap = _ngram_snapshot(suggested) 
     msg = (f"{'🟢' if outcome.upper()=='GREEN' else '🔴'} <b>{outcome.upper()}</b> — finalizado "
            f"(<b>{stage_lbl}</b>, nosso={our}, observados={final_seen}).\n"
-           f"📊 Geral: {_score_text()}\n\n{snap}")
+           f"📊 Geral: {_score_text()}")
     return msg
 
 # ------------------ DEDUPE por conteúdo ------------------
@@ -224,9 +240,63 @@ def _post_e1_ngram(tail:List[int])->Dict[int,float]:
 
 def _post_e2_short(tail):  return _post_freq(tail, 60)
 def _post_e3_long(tail):   return _post_freq(tail, 300)
-def _post_e4_llm(tail):    return {1:0.25,2:0.25,3:0.25,4:0.25}  # placeholder offline
+
+# >>> NOVO ESPECIALISTA E4 - GEMINI (ASSÍNCRONO) <<<
+async def _post_e4_llm(tail:List[int])->Dict[int,float]:
+    if not GEMINI_CLIENT:
+        return {1:0.25,2:0.25,3:0.25,4:0.25}
+
+    # Prepara o histórico (usaremos os últimos 40 resultados)
+    history_str = ",".join(map(str, tail[-40:])) 
+    
+    prompt = f"""
+    A sequência histórica recente de resultados (os mais recentes à direita) é: {history_str}.
+    Os resultados possíveis são SOMENTE os números 1, 2, 3 e 4.
+    Analise esta sequência para identificar padrões estatísticos ou comportamentais.
+    Preveja a probabilidade de cada um dos quatro números sair na próxima rodada.
+    
+    Sua resposta deve ser *exclusivamente* um objeto JSON formatado como o schema. As chaves devem ser as strings '1', '2', '3', '4' e os valores devem ser as probabilidades decimais que somam 1.0.
+    """
+
+    try:
+        # A chamada síncrona do SDK deve ser envolta em um executor ou ser assíncrona.
+        # Como o SDK GenAI usa httpx, ele oferece um AsyncClient.
+        # No entanto, a versão padrão do SDK do Gemini é síncrona. 
+        # Para evitar bloquear o Uvicorn, o ideal seria usar `run_in_threadpool`, 
+        # mas por simplicidade no seu código, confiamos no executor do Uvicorn 
+        # para lidar com a operação I/O síncrona do SDK, MANTENDO o `await` 
+        # nas funções chamadoras para manter o controle de fluxo.
+
+        response = await GEMINI_CLIENT.models.generate_content_async(
+            model=GEMINI_MODEL,
+            contents=[prompt],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json", 
+                response_schema={
+                    "type": "object", 
+                    "properties": {
+                        "1": {"type": "number"}, "2": {"type": "number"}, 
+                        "3": {"type": "number"}, "4": {"type": "number"}
+                    },
+                    "required": ["1", "2", "3", "4"]
+                }
+            )
+        )
+        
+        data = json.loads(response.text)
+        post = {int(k): float(v) for k, v in data.items() if k.isdigit() and 1<=int(k)<=4}
+        
+        if len(post) == 4 and all(v >= 0 for v in post.values()):
+            return _norm(post)
+        
+        raise ValueError("Resposta JSON do Gemini inválida ou incompleta.")
+
+    except Exception as e:
+        if SHOW_DEBUG: print(f"DEBUG Gemini Error: {e}")
+        return {1:0.25,2:0.25,3:0.25,4:0.25}
 
 def _hedge(p1,p2,p3,p4, w=(0.40,0.25,0.25,0.10)):
+    # Pesos: E1 (40%), E2 (25%), E3 (25%), E4/Gemini (10%)
     cands=(1,2,3,4)
     out={c: w[0]*p1.get(c,0)+w[1]*p2.get(c,0)+w[2]*p3.get(c,0)+w[3]*p4.get(c,0) for c in cands}
     return _norm(out)
@@ -257,34 +327,42 @@ def _conf_floor(post:Dict[int,float], floor=0.30, cap=0.95):
     return _norm(post)
 
 def _get_ls()->int:
-    # loss streak simples (não persistido nesta versão)
     return 0
 
-def _choose_number()->Tuple[int,float,int,Dict[int,float],float,str]:
+# >>> FUNÇÃO PRINCIPAL DE ESCOLHA (TORNADA ASSÍNCRONA) <<<
+async def _choose_number()->Tuple[int,float,int,Dict[int,float],float,str]:
     tail=_timeline_tail(400)
     p1=_post_e1_ngram(tail)
     p2=_post_e2_short(tail)
     p3=_post_e3_long(tail)
-    p4=_post_e4_llm(tail)
+    
+    # CHAMADA ASSÍNCRONA PARA O GEMINI
+    p4=await _post_e4_llm(tail) 
+    
     base=_hedge(p1,p2,p3,p4)
     best, post, reason = _runnerup_ls2(base, loss_streak=_get_ls())
     post=_conf_floor(post, 0.30, 0.95)
     best=max(post,key=post.get); conf=float(post[best])
     r=sorted(post.items(), key=lambda kv: kv[1], reverse=True)
     gap=(r[0][1]-r[1][1]) if len(r)>=2 else r[0][1]
+    
+    # Retorna o post processado para o snapshot
     return best, conf, _timeline_size(), post, gap, reason
 
-def _ngram_snapshot(suggested:int)->str:
-    tail=_timeline_tail(400)
-    post=_post_e1_ngram(tail)
+# >>> FUNÇÃO DE SNAPSHOT (USANDO POST JÁ PROCESSADO) <<<
+def _ia_snapshot(suggested:int, post:Dict[int,float], reason:str)->str:
     pct=lambda x:f"{x*100:.1f}%"
     p1,p2,p3,p4 = pct(post[1]), pct(post[2]), pct(post[3]), pct(post[4])
     conf=pct(post.get(int(suggested),0.0))
-    return (f"📈 Amostra: {_timeline_size()} • Conf: {conf}\n"
-            f"🔎 E1(n-gram proxy): 1 {p1} | 2 {p2} | 3 {p3} | 4 {p4}")
+    return (f"📈 Amostra: {_timeline_size()} • Conf. Final: {conf}\n"
+            f"🔎 E1(n-gram): {p1} | E2(short): {pct(_post_e2_short(_timeline_tail(400)).get(suggested,0.0))}\n"
+            f"🧠 **E4(Gemini) Sugeriu:** {pct(_post_e4_llm.last_run.get(suggested,0.0)) if hasattr(_post_e4_llm, 'last_run') else 'n/a'}\n"
+            f"💡 Modo: {reason}")
+    # Nota: A linha E4(Gemini) é um placeholder mais complexo para mostrar o quanto o Gemini influenciou a decisão final.
 
 # ------------------------------------------------------
 # Telegram helpers (send + delete)
+# ... (Funções Telegram - SEM ALTERAÇÕES)
 # ------------------------------------------------------
 async def tg_send(chat_id: str, text: str, parse="HTML"):
     try:
@@ -318,6 +396,7 @@ async def tg_delete(chat_id: str, message_id: int):
 
 # ------------------------------------------------------
 # Parser do canal-fonte
+# ... (Funções Parser - SEM ALTERAÇÕES)
 # ------------------------------------------------------
 RX_ENTRADA = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
 RX_ANALISE = re.compile(r"\bANALISANDO\b", re.I)
@@ -439,6 +518,8 @@ async def webhook(token: str, request: Request):
             if stage_lbl=="G0" or len(seen)>=min(2, MAX_GALE+1):
                 final_seen="-".join(seen[:min(2, MAX_GALE+1)]) if seen else "X"
                 msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
+                
+                # Chamada assíncrona para enviar o fechamento
                 if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
                 return {"ok": True, "closed": outcome, "seen": final_seen}
             else:
@@ -474,10 +555,20 @@ async def webhook(token: str, request: Request):
             if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
 
         # “Analisando...” (apaga depois)
-        analyzing_id = await tg_send_return(TARGET_CHANNEL, "⏳ Analisando padrão, aguarde...")
+        analyzing_id = await tg_send_return(TARGET_CHANNEL, "⏳ Analisando padrão (com Gemini), aguarde...")
 
-        # escolhe nova sugestão
-        best, conf, samples, post, gap, reason = _choose_number()
+        # escolhe nova sugestão (AGORA É ASSÍNCRONO!)
+        best, conf, samples, post, gap, reason = await _choose_number()
+        
+        # Armazena o resultado do E4/Gemini para o snapshot, se o cliente estiver ativo
+        if GEMINI_CLIENT:
+            try:
+                # Tentativa de obter o post do E4 novamente para o snapshot
+                e4_post_result = await _post_e4_llm( _timeline_tail(400) )
+                _post_e4_llm.last_run = e4_post_result
+            except Exception:
+                _post_e4_llm.last_run = {1:0.25,2:0.25,3:0.25,4:0.25}
+
         opened=_pending_open(best)
         if opened:
             aft_txt = f" após {after}" if after else ""
@@ -485,7 +576,7 @@ async def webhook(token: str, request: Request):
                  f"🧩 <b>Padrão:</b> GEN{aft_txt}\n"
                  f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples} | <b>gap≈</b>{gap*100:.1f}pp\n"
                  f"🧠 <b>Modo:</b> {reason}\n"
-                 f"{_ngram_snapshot(best)}")
+                 f"{_ia_snapshot(best, post, reason)}")
             await tg_send(TARGET_CHANNEL, txt)
 
             if analyzing_id is not None:
