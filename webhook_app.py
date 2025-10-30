@@ -2,14 +2,15 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v7.1 (INTEGRAÇÃO GEMINI - E4 LLM)
+v7.2 (INTEGRAÇÃO GEMINI - FOCO GREEN G0)
 
 ENV obrigatórias (Render -> Environment):
 - TG_BOT_TOKEN
 - WEBHOOK_TOKEN
 - SOURCE_CHANNEL           ex: -1002810508717
 - TARGET_CHANNEL           ex: -1003052132833
-- GEMINI_API_KEY           <<< NOVA CHAVE OBRIGATÓRIA PARA O GEMINI
+- GEMINI_API_KEY           <<< CHAVE OBRIGATÓRIA PARA O GEMINI
+- MAX_GALE                 <<< DEVE SER DEFINIDO COMO '0' PARA FOCO G0
 ...
 """
 
@@ -19,7 +20,7 @@ from typing import List, Dict, Optional, Tuple
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 
-# >>> IMPORTS DO GEMINI <<<
+# >>> IMPORTS DO GEMINI (CORREÇÃO: SÓ NO ARQUIVO PYTHON) <<<
 from google import genai
 from google.genai import types
 
@@ -34,7 +35,8 @@ TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 SHOW_DEBUG       = os.getenv("SHOW_DEBUG", "False").strip().lower() == "true"
-MAX_GALE         = int(os.getenv("MAX_GALE", "1"))
+# IMPORTANTE: MAX_GALE deve ser configurado como '0' no Render para foco G0
+MAX_GALE         = int(os.getenv("MAX_GALE", "0")) 
 OBS_TIMEOUT_SEC  = int(os.getenv("OBS_TIMEOUT_SEC", "420"))
 DEDUP_WINDOW_SEC = int(os.getenv("DEDUP_WINDOW_SEC", "40"))
 
@@ -52,9 +54,7 @@ GEMINI_MODEL  = "gemini-2.5-flash" # Modelo rápido para análise de padrões
 
 if GEMINI_API_KEY:
     try:
-        # O SDK do Gemini é síncrono por padrão. Como estamos em um
-        # ambiente assíncrono (FastAPI), é melhor usá-lo dentro
-        # da função que o chama, mas o client é inicializado globalmente.
+        # A chamada assíncrona é usada nas funções de predição
         GEMINI_CLIENT = genai.Client(api_key=GEMINI_API_KEY)
         print("Gemini Client inicializado com sucesso.")
     except Exception as e:
@@ -63,11 +63,10 @@ if GEMINI_API_KEY:
 # ------------------------------------------------------
 # App
 # ------------------------------------------------------
-app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.1")
+app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.2")
 
 # ------------------------------------------------------
 # DB helpers
-# ... (Funções DB - SEM ALTERAÇÕES)
 # ------------------------------------------------------
 def _con():
     con = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
@@ -194,8 +193,7 @@ def _pending_close(final_seen: str, outcome: str, stage_lbl: str, suggested:int)
     obs = [int(x) for x in final_seen.split("-") if x.isdigit()]
     _append_seq(obs)
     our = suggested if outcome.upper()=="GREEN" else "X"
-    # A função _ngram_snapshot agora é ASYNC, precisa ser chamada pelo webhook
-    # snap = _ngram_snapshot(suggested) 
+    
     msg = (f"{'🟢' if outcome.upper()=='GREEN' else '🔴'} <b>{outcome.upper()}</b> — finalizado "
            f"(<b>{stage_lbl}</b>, nosso={our}, observados={final_seen}).\n"
            f"📊 Geral: {_score_text()}")
@@ -241,32 +239,29 @@ def _post_e1_ngram(tail:List[int])->Dict[int,float]:
 def _post_e2_short(tail):  return _post_freq(tail, 60)
 def _post_e3_long(tail):   return _post_freq(tail, 300)
 
-# >>> NOVO ESPECIALISTA E4 - GEMINI (ASSÍNCRONO) <<<
+# >>> ESPECIALISTA E4 - GEMINI (COM FOCO G0/ALTO RISCO) <<<
 async def _post_e4_llm(tail:List[int])->Dict[int,float]:
+    # Variável para armazenar o resultado do E4 para o snapshot
+    _post_e4_llm.last_run = {1:0.25,2:0.25,3:0.25,4:0.25}
+
     if not GEMINI_CLIENT:
-        return {1:0.25,2:0.25,3:0.25,4:0.25}
+        return _post_e4_llm.last_run
 
     # Prepara o histórico (usaremos os últimos 40 resultados)
     history_str = ",".join(map(str, tail[-40:])) 
     
     prompt = f"""
+    Sua única tarefa é atuar como um especialista de alto risco/alta recompensa.
     A sequência histórica recente de resultados (os mais recentes à direita) é: {history_str}.
     Os resultados possíveis são SOMENTE os números 1, 2, 3 e 4.
-    Analise esta sequência para identificar padrões estatísticos ou comportamentais.
-    Preveja a probabilidade de cada um dos quatro números sair na próxima rodada.
     
-    Sua resposta deve ser *exclusivamente* um objeto JSON formatado como o schema. As chaves devem ser as strings '1', '2', '3', '4' e os valores devem ser as probabilidades decimais que somam 1.0.
+    Analise esta sequência para identificar o **único resultado** que tem a MAIOR PROBABILIDADE de sair na próxima rodada, ignorando a necessidade de cobertura (Gale).
+    
+    Sua resposta deve ser *exclusivamente* um objeto JSON formatado como o schema. Você deve atribuir **pelo menos 40%** de chance ao resultado mais provável, e o restante deve ser distribuído entre os outros três, somando 1.0.
     """
 
     try:
-        # A chamada síncrona do SDK deve ser envolta em um executor ou ser assíncrona.
-        # Como o SDK GenAI usa httpx, ele oferece um AsyncClient.
-        # No entanto, a versão padrão do SDK do Gemini é síncrona. 
-        # Para evitar bloquear o Uvicorn, o ideal seria usar `run_in_threadpool`, 
-        # mas por simplicidade no seu código, confiamos no executor do Uvicorn 
-        # para lidar com a operação I/O síncrona do SDK, MANTENDO o `await` 
-        # nas funções chamadoras para manter o controle de fluxo.
-
+        # Chamada assíncrona
         response = await GEMINI_CLIENT.models.generate_content_async(
             model=GEMINI_MODEL,
             contents=[prompt],
@@ -287,28 +282,34 @@ async def _post_e4_llm(tail:List[int])->Dict[int,float]:
         post = {int(k): float(v) for k, v in data.items() if k.isdigit() and 1<=int(k)<=4}
         
         if len(post) == 4 and all(v >= 0 for v in post.values()):
-            return _norm(post)
+            _post_e4_llm.last_run = _norm(post) # Armazena para snapshot
+            return _post_e4_llm.last_run
         
         raise ValueError("Resposta JSON do Gemini inválida ou incompleta.")
 
     except Exception as e:
         if SHOW_DEBUG: print(f"DEBUG Gemini Error: {e}")
-        return {1:0.25,2:0.25,3:0.25,4:0.25}
+        return _post_e4_llm.last_run # Retorna 25% fixo em caso de erro
 
-def _hedge(p1,p2,p3,p4, w=(0.40,0.25,0.25,0.10)):
-    # Pesos: E1 (40%), E2 (25%), E3 (25%), E4/Gemini (10%)
+def _hedge(p1,p2,p3,p4, w=(0.30,0.20,0.20,0.30)):
+    # Pesos REVISADOS para foco G0: E1(30%), E2(20%), E3(20%), E4/Gemini (30%)
     cands=(1,2,3,4)
     out={c: w[0]*p1.get(c,0)+w[1]*p2.get(c,0)+w[2]*p3.get(c,0)+w[3]*p4.get(c,0) for c in cands}
     return _norm(out)
 
 def _runnerup_ls2(post:Dict[int,float], loss_streak:int)->Tuple[int,Dict[int,float],str]:
+    # Lógica mantida, mas como MAX_GALE=0, a intenção de G1 é ignorada
     rank=sorted(post.items(), key=lambda kv: kv[1], reverse=True)
     best=rank[0][0]
+    
+    # Mantemos a lógica IA_runnerup_ls2 por segurança, mas ela terá pouco efeito com GALE=0
     if loss_streak>=2 and len(rank)>=2 and (rank[0][1]-rank[1][1])<0.05:
         return rank[1][0], post, "IA_runnerup_ls2"
+        
     return best, post, "IA"
 
 def _conf_floor(post:Dict[int,float], floor=0.30, cap=0.95):
+    # Lógica mantida para garantir uma confiança mínima/máxima
     post=_norm({c:float(post.get(c,0)) for c in (1,2,3,4)})
     b=max(post,key=post.get); mx=post[b]
     if mx<floor:
@@ -329,7 +330,7 @@ def _conf_floor(post:Dict[int,float], floor=0.30, cap=0.95):
 def _get_ls()->int:
     return 0
 
-# >>> FUNÇÃO PRINCIPAL DE ESCOLHA (TORNADA ASSÍNCRONA) <<<
+# >>> FUNÇÃO PRINCIPAL DE ESCOLHA (ASSÍNCRONA) <<<
 async def _choose_number()->Tuple[int,float,int,Dict[int,float],float,str]:
     tail=_timeline_tail(400)
     p1=_post_e1_ngram(tail)
@@ -346,23 +347,27 @@ async def _choose_number()->Tuple[int,float,int,Dict[int,float],float,str]:
     r=sorted(post.items(), key=lambda kv: kv[1], reverse=True)
     gap=(r[0][1]-r[1][1]) if len(r)>=2 else r[0][1]
     
-    # Retorna o post processado para o snapshot
+    # Retorna o post processado
     return best, conf, _timeline_size(), post, gap, reason
 
-# >>> FUNÇÃO DE SNAPSHOT (USANDO POST JÁ PROCESSADO) <<<
+# >>> FUNÇÃO DE SNAPSHOT <<<
 def _ia_snapshot(suggested:int, post:Dict[int,float], reason:str)->str:
     pct=lambda x:f"{x*100:.1f}%"
-    p1,p2,p3,p4 = pct(post[1]), pct(post[2]), pct(post[3]), pct(post[4])
+    p1_final,p2_final,p3_final,p4_final = post[1], post[2], post[3], post[4]
     conf=pct(post.get(int(suggested),0.0))
+    
+    # Tenta obter o post cru do E4 (Gemini) para exibir no snapshot
+    e4_post = getattr(_post_e4_llm, 'last_run', {1:0.25,2:0.25,3:0.25,4:0.25})
+    e4_sug_pct = pct(e4_post.get(int(suggested), 0.0))
+    
     return (f"📈 Amostra: {_timeline_size()} • Conf. Final: {conf}\n"
-            f"🔎 E1(n-gram): {p1} | E2(short): {pct(_post_e2_short(_timeline_tail(400)).get(suggested,0.0))}\n"
-            f"🧠 **E4(Gemini) Sugeriu:** {pct(_post_e4_llm.last_run.get(suggested,0.0)) if hasattr(_post_e4_llm, 'last_run') else 'n/a'}\n"
+            f"🔎 E1(n-gram): {pct(p1_final)} | E2(short): {pct(p2_final)}\n"
+            f"🧠 **E4(Gemini) Sugeriu:** {e4_sug_pct}\n"
             f"💡 Modo: {reason}")
-    # Nota: A linha E4(Gemini) é um placeholder mais complexo para mostrar o quanto o Gemini influenciou a decisão final.
+    
 
 # ------------------------------------------------------
 # Telegram helpers (send + delete)
-# ... (Funções Telegram - SEM ALTERAÇÕES)
 # ------------------------------------------------------
 async def tg_send(chat_id: str, text: str, parse="HTML"):
     try:
@@ -396,7 +401,6 @@ async def tg_delete(chat_id: str, message_id: int):
 
 # ------------------------------------------------------
 # Parser do canal-fonte
-# ... (Funções Parser - SEM ALTERAÇÕES)
 # ------------------------------------------------------
 RX_ENTRADA = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
 RX_ANALISE = re.compile(r"\bANALISANDO\b", re.I)
@@ -477,7 +481,7 @@ async def webhook(token: str, request: Request):
         if seq: _append_seq(seq)
         return {"ok": True, "analise_seq": len(seq)}
 
-    # 2) APOSTA ENCERRADA / GREEN / RED (com dedupe + FECHAMENTO CORRETO G0/G1)
+    # 2) APOSTA ENCERRADA / GREEN / RED (com dedupe + FECHAMENTO)
     if RX_FECHA.search(text) or RX_GREEN.search(text) or RX_RED.search(text):
         if _seen_recent("fechamento", _dedupe_key(text)):
             return {"ok": True, "skipped": "fechamento_dupe"}
@@ -485,11 +489,12 @@ async def webhook(token: str, request: Request):
         pend=_pending_get()
         if pend:
             suggested=int(pend["suggested"] or 0)
-
+            
             # (a) Observados do PLACAR: usar a linha "Sequência: a | b"
-            obs_pair = _parse_seq_pair(text, need=min(2, MAX_GALE+1))
+            need_obs = min(2, MAX_GALE + 1) # Sempre 1 se MAX_GALE=0
+            obs_pair = _parse_seq_pair(text, need=need_obs)
             if obs_pair:
-                _pending_seen_append(obs_pair, need=min(2, MAX_GALE+1))
+                _pending_seen_append(obs_pair, need=need_obs)
 
             # (b) Memória extra: números finais entre parênteses "(x | y)" -> só para timeline
             extra_tail = _parse_paren_pair(text, need=2)
@@ -499,32 +504,40 @@ async def webhook(token: str, request: Request):
             # Reavalia pendência após update
             pend=_pending_get()
             seen = [s for s in (pend["seen"] or "").split("-") if s]
-
-            # Regra: se G0 != sugerido e ainda temos espaço para G1, NÃO fecha; aguarda próxima rodada
-            if len(seen)==1 and seen[0].isdigit() and int(seen[0]) != suggested and MAX_GALE>=1:
-                # mantém pendência aberta para o G1
-                if SHOW_DEBUG:
-                    await tg_send(TARGET_CHANNEL, f"DEBUG: aguardando G1 (visto G0={seen[0]}, nosso={suggested}).")
-                return {"ok": True, "waiting_g1": True, "seen": "-".join(seen)}
-
-            # Decisão final (se já temos 1 ou 2 observados suficientes)
-            outcome="LOSS"; stage_lbl="G1"
-            if len(seen)>=1 and seen[0].isdigit() and int(seen[0])==suggested:
-                outcome="GREEN"; stage_lbl="G0"
-            elif len(seen)>=2 and seen[1].isdigit() and int(seen[1])==suggested and MAX_GALE>=1:
-                outcome="GREEN"; stage_lbl="G1"
-
-            # fecha se: GREEN no G0, ou já temos G1 observado (independente de GREEN/LOSS)
-            if stage_lbl=="G0" or len(seen)>=min(2, MAX_GALE+1):
-                final_seen="-".join(seen[:min(2, MAX_GALE+1)]) if seen else "X"
-                msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
-                
-                # Chamada assíncrona para enviar o fechamento
-                if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
-                return {"ok": True, "closed": outcome, "seen": final_seen}
+            
+            # LÓGICA DE FECHAMENTO SIMPLIFICADA PARA MAX_GALE=0:
+            if MAX_GALE == 0:
+                if len(seen) >= 1:
+                    outcome="LOSS"; stage_lbl="G0"
+                    if int(seen[0])==suggested: outcome="GREEN"
+                    
+                    final_seen=seen[0]
+                    msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
+                    if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
+                    return {"ok": True, "closed": outcome, "seen": final_seen}
+                else:
+                    return {"ok": True, "waiting_obs_g0": True}
+            
+            # LÓGICA COMPLETA PARA MAX_GALE > 0 (caso você mude a ENV):
             else:
-                # ainda aguardando G1 (cenário raro se MAX_GALE>1 futuramente)
-                return {"ok": True, "waiting_more_obs": True, "seen": "-".join(seen)}
+                if len(seen)==1 and seen[0].isdigit() and int(seen[0]) != suggested and MAX_GALE>=1:
+                    if SHOW_DEBUG: await tg_send(TARGET_CHANNEL, f"DEBUG: aguardando G1 (visto G0={seen[0]}, nosso={suggested}).")
+                    return {"ok": True, "waiting_g1": True, "seen": "-".join(seen)}
+
+                outcome="LOSS"; stage_lbl="G1"
+                if len(seen)>=1 and seen[0].isdigit() and int(seen[0])==suggested:
+                    outcome="GREEN"; stage_lbl="G0"
+                elif len(seen)>=2 and seen[1].isdigit() and int(seen[1])==suggested and MAX_GALE>=1:
+                    outcome="GREEN"; stage_lbl="G1"
+
+                if stage_lbl=="G0" or len(seen)>=min(2, MAX_GALE+1):
+                    final_seen="-".join(seen[:min(2, MAX_GALE+1)]) if seen else "X"
+                    msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
+                    if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
+                    return {"ok": True, "closed": outcome, "seen": final_seen}
+                else:
+                    return {"ok": True, "waiting_more_obs": True, "seen": "-".join(seen)}
+
 
         return {"ok": True, "noted_close": True}
 
@@ -542,33 +555,26 @@ async def webhook(token: str, request: Request):
         # fecha pendência anterior se esquecida (com X)
         pend=_pending_get()
         if pend:
-            seen=[s for s in (pend["seen"] or "").split("-") if s]
-            while len(seen)<min(2,MAX_GALE+1): seen.append("X")
-            final_seen="-".join(seen[:min(2,MAX_GALE+1)])
-            suggested=int(pend["suggested"] or 0)
-            outcome="LOSS"; stage_lbl="G1"
-            if len(seen)>=1 and seen[0].isdigit() and int(seen[0])==suggested:
-                outcome="GREEN"; stage_lbl="G0"
-            elif len(seen)>=2 and seen[1].isdigit() and int(seen[1])==suggested and MAX_GALE>=1:
-                outcome="GREEN"; stage_lbl="G1"
+            # Lógica de fechamento forçado aqui é a mesma do FECHA, mas garantindo que feche com X
+            if MAX_GALE == 0:
+                final_seen="X"; suggested=int(pend["suggested"] or 0); outcome="LOSS"; stage_lbl="G0"
+            else:
+                seen=[s for s in (pend["seen"] or "").split("-") if s]
+                while len(seen)<min(2,MAX_GALE+1): seen.append("X")
+                final_seen="-".join(seen[:min(2,MAX_GALE+1)]); suggested=int(pend["suggested"] or 0)
+                outcome="LOSS"; stage_lbl="G1"
+                if len(seen)>=1 and seen[0].isdigit() and int(seen[0])==suggested: outcome="GREEN"; stage_lbl="G0"
+                elif len(seen)>=2 and seen[1].isdigit() and int(seen[1])==suggested and MAX_GALE>=1: outcome="GREEN"; stage_lbl="G1"
+            
             msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
             if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
 
         # “Analisando...” (apaga depois)
         analyzing_id = await tg_send_return(TARGET_CHANNEL, "⏳ Analisando padrão (com Gemini), aguarde...")
 
-        # escolhe nova sugestão (AGORA É ASSÍNCRONO!)
+        # escolhe nova sugestão (ASSÍNCRONO!)
         best, conf, samples, post, gap, reason = await _choose_number()
         
-        # Armazena o resultado do E4/Gemini para o snapshot, se o cliente estiver ativo
-        if GEMINI_CLIENT:
-            try:
-                # Tentativa de obter o post do E4 novamente para o snapshot
-                e4_post_result = await _post_e4_llm( _timeline_tail(400) )
-                _post_e4_llm.last_run = e4_post_result
-            except Exception:
-                _post_e4_llm.last_run = {1:0.25,2:0.25,3:0.25,4:0.25}
-
         opened=_pending_open(best)
         if opened:
             aft_txt = f" após {after}" if after else ""
