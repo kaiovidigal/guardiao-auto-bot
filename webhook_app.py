@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v7.7 (INÍCIO OTIMIZAÇÃO - PASSO 1: CONFIGURAÇÃO DINÂMICA DE PESOS)
+v7.8 (INÍCIO OTIMIZAÇÃO - PASSO 2: REGISTRO DETALHADO)
 
 ENV obrigatórias (Render -> Environment):
 - TG_BOT_TOKEN
@@ -63,7 +63,7 @@ if GEMINI_API_KEY:
 # ------------------------------------------------------
 # App
 # ------------------------------------------------------
-app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.7")
+app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.8")
 
 # ------------------------------------------------------
 # DB helpers
@@ -107,7 +107,7 @@ def db_init():
         PRIMARY KEY (kind, dkey)
     )""")
     
-    # NOVO: Tabela para armazenar a configuração dinâmica de pesos (PASSO 1)
+    # PASSO 1: Tabela para armazenar a configuração dinâmica de pesos
     cur.execute("""CREATE TABLE IF NOT EXISTS config(
         id INTEGER PRIMARY KEY CHECK(id=1),
         w1 REAL DEFAULT 0.30, 
@@ -117,10 +117,20 @@ def db_init():
         last_opt_ts INTEGER DEFAULT 0
     )""")
 
+    # PASSO 2: Tabela para o histórico detalhado dos palpites (FEEDBACK)
+    cur.execute("""CREATE TABLE IF NOT EXISTS detailed_history(
+        id INTEGER PRIMARY KEY,         -- Usa o ID da tabela 'pending'
+        opened_at INTEGER NOT NULL,
+        suggested INTEGER NOT NULL,     -- O número final sugerido
+        result    INTEGER,              -- O resultado final (1, 2, 3 ou 4)
+        p1_conf   REAL, p2_conf   REAL, -- Confiança do especialista 1 e 2
+        p3_conf   REAL, p4_conf   REAL  -- Confiança do especialista 3 e 4 (Gemini)
+    )""")
+
     if not con.execute("SELECT 1 FROM score WHERE id=1").fetchone():
         con.execute("INSERT INTO score(id,green,loss) VALUES(1,0,0)")
         
-    # NOVO: Insere os pesos iniciais se a tabela estiver vazia
+    # PASSO 1: Insere os pesos iniciais se a tabela estiver vazia
     if not con.execute("SELECT 1 FROM config WHERE id=1").fetchone():
         con.execute("INSERT INTO config(id,w1,w2,w3,w4) VALUES(1,0.30,0.20,0.20,0.30)")
         
@@ -128,18 +138,46 @@ def db_init():
 
 db_init()
 
-# NOVO: Função para ler os pesos atuais (PASSO 1)
+# PASSO 1: Função para ler os pesos atuais
 def _db_get_weights()->Tuple[float,float,float,float]:
     con=_con(); row=con.execute("SELECT w1,w2,w3,w4 FROM config WHERE id=1").fetchone(); con.close()
     return (row["w1"], row["w2"], row["w3"], row["w4"]) if row else (0.30, 0.20, 0.20, 0.30)
 
-# NOVO: Função para salvar novos pesos e atualizar timestamp (PASSO 1)
+# PASSO 1: Função para salvar novos pesos e atualizar timestamp
 def _db_save_weights(w:Dict[str,float]):
     con=_con(); now=int(time.time())
-    # O Gemini retornará as chaves 'E1', 'E2', 'E3', 'E4'
     con.execute("UPDATE config SET w1=?,w2=?,w3=?,w4=?,last_opt_ts=? WHERE id=1",
                 (w["E1"], w["E2"], w["E3"], w["E4"], now)) 
     con.commit(); con.close()
+
+# PASSO 2: Função para registrar um novo histórico detalhado na abertura da aposta
+def _db_save_detailed_entry(entry_id: int, suggested: int, post_raw: Dict[int,float]):
+    con=_con(); now=int(time.time())
+    # O objeto 'post_raw' é a distribuição de probabilidade final da IA (antes do _conf_floor)
+    
+    # Extrai a confiança do número sugerido (best) para cada especialista
+    # Usamos o _post_eX_llm.last_run (Gemini) e os outros posts (p1, p2, p3)
+    p4_post = getattr(_post_e4_llm, 'last_run', {1:0.25,2:0.25,3:0.25,4:0.25})
+    
+    # ATENÇÃO: Os posts (p1, p2, p3) são calculados na _choose_number. 
+    # Para simplificar o Passo 2, vamos usar o post_raw (o resultado da combinação) como proxy
+    # para a confiança de todos (p1_conf = post_raw[suggested], etc.). 
+    # Para ser mais preciso, o _choose_number precisaria retornar p1, p2, p3, p4 também.
+    
+    # Por hora, registraremos a confiança do número sugerido (best) na distribuição final 'post_raw'
+    # Esta não é a confiança ideal de cada especialista, mas é o suficiente para o Passo 3.
+    conf_sug = post_raw.get(suggested, 0.25)
+    
+    con.execute("INSERT OR IGNORE INTO detailed_history(id,opened_at,suggested,p1_conf,p2_conf,p3_conf,p4_conf) VALUES(?,?,?,?,?,?,?)",
+                (entry_id, now, suggested, conf_sug, conf_sug, conf_sug, conf_sug))
+    con.commit(); con.close()
+
+# PASSO 2: Adicionamos esta função para ser mais preciso, mas a chamaremos na _choose_number()
+def _db_get_detailed_history(n:int=100):
+    con=_con()
+    rows = con.execute("SELECT * FROM detailed_history WHERE result IS NOT NULL ORDER BY id DESC LIMIT ?", (n,)).fetchall()
+    con.close()
+    return rows
 
 
 def _mark_processed(upd: str):
@@ -233,7 +271,7 @@ def _pending_close(final_seen: str, outcome: str, stage_lbl: str, suggested:int)
 # ------------------ DEDUPE por conteúdo ------------------
 def _dedupe_key(text: str) -> str:
     base = re.sub(r"\s+", " ", (text or "")).strip().lower()
-    return hashlib.sha1(base.encode("utf-8")).hexdigest() # <-- CORRIGIDO AQUI
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()
 
 def _seen_recent(kind: str, dkey: str) -> bool:
     now = int(time.time())
@@ -365,7 +403,7 @@ def _get_ls()->int:
     return 0
 
 # >>> FUNÇÃO PRINCIPAL DE ESCOLHA (ASSÍNCRONA) <<<
-async def _choose_number()->Tuple[int,float,int,Dict[int,float],float,str]:
+async def _choose_number()->Tuple[int,float,int,Dict[int,float],float,str,Dict[int,float],Dict[int,float],Dict[int,float]]:
     tail=_timeline_tail(400)
     p1=_post_e1_ngram(tail)
     p2=_post_e2_short(tail)
@@ -375,17 +413,17 @@ async def _choose_number()->Tuple[int,float,int,Dict[int,float],float,str]:
     p4=await _post_e4_llm(tail) 
     
     base=_hedge(p1,p2,p3,p4)
-    best, post, reason = _runnerup_ls2(base, loss_streak=_get_ls())
+    best, post_raw, reason = _runnerup_ls2(base, loss_streak=_get_ls()) # Renomeado post para post_raw
     
     # ALTERADO: Aumentando o piso de confiança para 35% (0.35)
-    post=_conf_floor(post, 0.35, 0.95) 
+    post_final=_conf_floor(post_raw, 0.35, 0.95) # O resultado final (após o floor)
     
-    best=max(post,key=post.get); conf=float(post[best])
-    r=sorted(post.items(), key=lambda kv: kv[1], reverse=True)
+    best=max(post_final,key=post_final.get); conf=float(post_final[best])
+    r=sorted(post_final.items(), key=lambda kv: kv[1], reverse=True)
     gap=(r[0][1]-r[1][1]) if len(r)>=2 else r[0][1]
     
-    # Retorna o post processado
-    return best, conf, _timeline_size(), post, gap, reason
+    # Retorna o post processado e agora também os posts individuais (p1, p2, p3, p4) para o Passo 2
+    return best, conf, _timeline_size(), post_final, gap, reason, p1, p2, p4
 
 # >>> FUNÇÃO DE SNAPSHOT (Mantida para consistência, mas não usada na mensagem principal) <<<
 def _ia_snapshot(suggested:int, post:Dict[int,float], reason:str)->str:
@@ -400,7 +438,7 @@ def _ia_snapshot(suggested:int, post:Dict[int,float], reason:str)->str:
     return (f"📈 Amostra: {_timeline_size()} • Conf. Final: {conf}\n"
             f"🔎 E1(n-gram): {pct(p1_final)} | E2(short): {pct(p2_final)}\n"
             f"🧠 **E4(Gemini) Sugeriu:** {e4_sug_pct}\n"
-            f"💡 Modo: {reason}")
+            f"💡 **Modo:** {reason}")
     
 
 # ------------------------------------------------------
@@ -562,6 +600,11 @@ async def webhook(token: str, request: Request):
                     # Usa o resultado observado como final_seen
                     final_seen=str(observed_result)
                     
+                    # PASSO 2: ATUALIZA O RESULTADO FINAL NO detailed_history
+                    con=_con()
+                    con.execute("UPDATE detailed_history SET result=? WHERE id=?", (observed_result, int(pend["id"])))
+                    con.commit(); con.close()
+                    
                     # Fechamento: (já alimenta o timeline com final_seen e adiciona o score)
                     msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
                     if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
@@ -590,6 +633,15 @@ async def webhook(token: str, request: Request):
 
                 if stage_lbl=="G0" or len(seen)>=min(2, MAX_GALE+1):
                     final_seen="-".join(seen[:min(2, MAX_GALE+1)]) if seen else "X"
+                    
+                    # Aqui, a lógica de GALE > 0 não sabe o resultado exato (1, 2, 3 ou 4) do fechamento
+                    # O Passo 2 no GALE > 0 é mais complexo, por enquanto, apenas feche a aposta 'pending'
+                    # e use o 'observed_result' (se existir) para o detailed_history
+                    if observed_result is not None:
+                        con=_con()
+                        con.execute("UPDATE detailed_history SET result=? WHERE id=?", (observed_result, int(pend["id"])))
+                        con.commit(); con.close()
+                    
                     msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
                     if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
                     return {"ok": True, "closed": outcome, "seen": final_seen}
@@ -623,6 +675,7 @@ async def webhook(token: str, request: Request):
                 if len(seen)>=1 and seen[0].isdigit() and int(seen[0])==suggested: outcome="GREEN"; stage_lbl="G0"
                 elif len(seen)>=2 and seen[1].isdigit() and int(seen[1])==suggested and MAX_GALE>=1: outcome="GREEN"; stage_lbl="G1"
             
+            # Quando aposta é fechada à força, o resultado no detailed_history fica como NULL
             msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
             if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
 
@@ -630,12 +683,34 @@ async def webhook(token: str, request: Request):
         analyzing_id = await tg_send_return(TARGET_CHANNEL, "⏳ Analisando padrão (com Gemini), aguarde...")
 
         # escolhe nova sugestão (ASSÍNCRONO!)
-        best, conf, samples, post, gap, reason = await _choose_number()
+        # ALTERADO: A função agora retorna os posts individuais (p1, p2, p4) para o Passo 2
+        best, conf, samples, post_final, gap, reason, p1, p2, p4 = await _choose_number()
         
         opened=_pending_open(best)
         if opened:
             aft_txt = f"{after}" if after else "X"
             
+            # NOVO: Captura a ID da aposta aberta para o Passo 2
+            row = _pending_get()
+            entry_id = int(row["id"]) if row else None 
+            
+            # PASSO 2: Registra o palpite detalhado ANTES de enviar a mensagem
+            if entry_id:
+                # O post_raw (base) foi renomeado para 'base' na _choose_number. 
+                # Precisamos da confiança de CADA especialista (p1, p2, p3, p4) para o número sugerido ('best')
+                
+                # Para maior precisão no Passo 2, vamos registrar a confiança de 'best' em cada especialista:
+                conf_p1 = p1.get(best, 0.25)
+                conf_p2 = p2.get(best, 0.25)
+                conf_p3 = _post_e3_long(_timeline_tail(400)).get(best, 0.25) # Re-calculando p3 para simplificar
+                conf_p4 = p4.get(best, 0.25) # p4 já está limpo
+                
+                con=_con(); now=int(time.time())
+                con.execute("INSERT OR IGNORE INTO detailed_history(id,opened_at,suggested,p1_conf,p2_conf,p3_conf,p4_conf) VALUES(?,?,?,?,?,?,?)",
+                            (entry_id, now, best, conf_p1, conf_p2, conf_p3, conf_p4))
+                con.commit(); con.close()
+
+
             # --- NOVO MODELO DE MENSAGEM (Modelo 2: Foco em Ação e Risco) ---
             
             pct=lambda x:f"{x*100:.1f}"
