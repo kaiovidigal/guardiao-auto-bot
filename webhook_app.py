@@ -600,24 +600,19 @@ async def webhook(token: str, request: Request):
         
         opened=_pending_open(best)
         if opened:
-            aft_txt = f"{after}" if after else "X"
+            aft_txt = f"{after}" if after is not None else "X"
             
-            # --- NOVO MODELO DE MENSAGEM (Modelo 2: Foco em Ação e Risco) ---
-            
-            pct=lambda x:f"{x*100:.1f}"
-            
-            # Tenta obter o post cru do E4 (Gemini) para exibir.
-            e4_post = getattr(_post_e4_llm, 'last_run', {1:0.25,2:0.25,3:0.25,4:0.25})
-            e4_sug_pct = pct(e4_post.get(int(best), 0.0))
-            
-            # A mensagem reformulada (Modelo 2)
-            txt=(f"🚀 **ENTRADA IMEDIATA:** Número **{best}** (G0)\n"
-                 f"🌟 **CONFIANÇA** — **{conf*100:.1f}%**\n"
-                 f"🧠 **IA Leader:** Gemini ({e4_sug_pct}%)\n"
-                 f"📊 **Base:** Padrão {aft_txt} | Amostra ≈{samples}\n"
-                 f"💡 **Modo:** {reason} (Gap {gap*100:.1f}pp)")
-            
-            # --- FIM DO NOVO MODELO DE MENSAGEM ---
+            # --- NOVO MODELO SOFISTICADO ---
+            # Garante que o número X de entrada seja o número ANTERIOR (aft_txt)
+            txt = (
+                f"🚀 𝐄𝐍𝐓𝐑𝐀𝐃𝐀 𝐈𝐌𝐄𝐃𝐈𝐀𝐓𝐀: 𝐍Ú𝐌𝐄𝐑𝐎 {best} ( 𝐆𝟎 )\n\n"
+                f"✅ 𝐂𝐎𝐍𝐅𝐈𝐀𝐍Ç𝐀: {conf*100:.1f}%\n"
+                f"🧠 𝐈𝐀 𝐋Í𝐃𝐄𝐑: 𝐆𝐄𝐌𝐈𝐍𝐈 ({ranking[0][1]*100:.1f}%)\n"
+                f"📊 𝐁𝐀𝐒𝐄: 𝐏𝐀𝐃𝐑Ã𝐎 {aft_txt} | 𝐀𝐌𝐎𝐒𝐓𝐑𝐀 $\approx$ {samples}\n"
+                f"💡 𝐌𝐎𝐃𝐎: {reason} (𝐆𝐀𝐏 {gap*100:.1f}𝐩𝐩)\n\n"
+                f"🚨 𝐀ÇÃ𝐎 𝐔𝐑𝐆𝐄𝐍𝐓𝐄: 𝐄𝐍𝐓𝐑𝐀𝐑 𝐀𝐏Ó𝐒 𝐎 𝐍Ú𝐌𝐄𝐑𝐎 𝐗 {aft_txt}."
+            )
+            # --- FIM DO NOVO MODELO ---
             
             await tg_send(TARGET_CHANNEL, txt)
 
