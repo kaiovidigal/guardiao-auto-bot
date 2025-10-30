@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v7.8 (INÍCIO OTIMIZAÇÃO - PASSO 2: REGISTRO DETALHADO)
+v7.9 (FINALIZAÇÃO OTIMIZAÇÃO - PASSO 3: OTIMIZAÇÃO DINÂMICA)
 
 ENV obrigatórias (Render -> Environment):
 - TG_BOT_TOKEN
@@ -15,7 +15,7 @@ ENV obrigatórias (Render -> Environment):
 """
 
 import os, re, json, time, math, sqlite3, datetime, hashlib
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -39,6 +39,8 @@ SHOW_DEBUG       = os.getenv("SHOW_DEBUG", "False").strip().lower() == "true"
 MAX_GALE         = int(os.getenv("MAX_GALE", "0")) 
 OBS_TIMEOUT_SEC  = int(os.getenv("OBS_TIMEOUT_SEC", "420"))
 DEDUP_WINDOW_SEC = int(os.getenv("DEDUP_WINDOW_SEC", "40"))
+# NOVO: Janela de dados para otimização (100-200 é um bom equilíbrio)
+OPTIMIZATION_WINDOW = 150 
 
 if not TG_BOT_TOKEN or not WEBHOOK_TOKEN or not TARGET_CHANNEL:
     raise RuntimeError("Faltam ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN, TARGET_CHANNEL.")
@@ -54,7 +56,7 @@ GEMINI_MODEL  = "gemini-2.5-flash" # Modelo rápido para análise de padrões
 
 if GEMINI_API_KEY:
     try:
-        # A chamada assíncrona é usada nas funções de predição
+        # A chamada assíncrona é usada nas funções de predição e otimização
         GEMINI_CLIENT = genai.Client(api_key=GEMINI_API_KEY)
         print("Gemini Client inicializado com sucesso.")
     except Exception as e:
@@ -63,7 +65,7 @@ if GEMINI_API_KEY:
 # ------------------------------------------------------
 # App
 # ------------------------------------------------------
-app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.8")
+app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.9")
 
 # ------------------------------------------------------
 # DB helpers
@@ -150,31 +152,10 @@ def _db_save_weights(w:Dict[str,float]):
                 (w["E1"], w["E2"], w["E3"], w["E4"], now)) 
     con.commit(); con.close()
 
-# PASSO 2: Função para registrar um novo histórico detalhado na abertura da aposta
-def _db_save_detailed_entry(entry_id: int, suggested: int, post_raw: Dict[int,float]):
-    con=_con(); now=int(time.time())
-    # O objeto 'post_raw' é a distribuição de probabilidade final da IA (antes do _conf_floor)
-    
-    # Extrai a confiança do número sugerido (best) para cada especialista
-    # Usamos o _post_eX_llm.last_run (Gemini) e os outros posts (p1, p2, p3)
-    p4_post = getattr(_post_e4_llm, 'last_run', {1:0.25,2:0.25,3:0.25,4:0.25})
-    
-    # ATENÇÃO: Os posts (p1, p2, p3) são calculados na _choose_number. 
-    # Para simplificar o Passo 2, vamos usar o post_raw (o resultado da combinação) como proxy
-    # para a confiança de todos (p1_conf = post_raw[suggested], etc.). 
-    # Para ser mais preciso, o _choose_number precisaria retornar p1, p2, p3, p4 também.
-    
-    # Por hora, registraremos a confiança do número sugerido (best) na distribuição final 'post_raw'
-    # Esta não é a confiança ideal de cada especialista, mas é o suficiente para o Passo 3.
-    conf_sug = post_raw.get(suggested, 0.25)
-    
-    con.execute("INSERT OR IGNORE INTO detailed_history(id,opened_at,suggested,p1_conf,p2_conf,p3_conf,p4_conf) VALUES(?,?,?,?,?,?,?)",
-                (entry_id, now, suggested, conf_sug, conf_sug, conf_sug, conf_sug))
-    con.commit(); con.close()
-
-# PASSO 2: Adicionamos esta função para ser mais preciso, mas a chamaremos na _choose_number()
-def _db_get_detailed_history(n:int=100):
+# PASSO 2: Função para obter histórico detalhado COMPLETO (registros com resultado)
+def _db_get_detailed_history(n:int=OPTIMIZATION_WINDOW):
     con=_con()
+    # Pega os N registros MAIS RECENTES que JÁ TÊM UM RESULTADO (result IS NOT NULL)
     rows = con.execute("SELECT * FROM detailed_history WHERE result IS NOT NULL ORDER BY id DESC LIMIT ?", (n,)).fetchall()
     con.close()
     return rows
@@ -357,7 +338,7 @@ async def _post_e4_llm(tail:List[int])->Dict[int,float]:
         raise ValueError("Resposta JSON do Gemini inválida ou incompleta.")
 
     except Exception as e:
-        if SHOW_DEBUG: print(f"DEBUG Gemini Error: {e}")
+        if SHOW_DEBUG: print(f"DEBUG Gemini Error (E4): {e}")
         return _post_e4_llm.last_run # Retorna 25% fixo em caso de erro
 
 # ALTERADO: Removemos o argumento 'w' fixo e lemos do DB (PASSO 1)
@@ -422,24 +403,148 @@ async def _choose_number()->Tuple[int,float,int,Dict[int,float],float,str,Dict[i
     r=sorted(post_final.items(), key=lambda kv: kv[1], reverse=True)
     gap=(r[0][1]-r[1][1]) if len(r)>=2 else r[0][1]
     
-    # Retorna o post processado e agora também os posts individuais (p1, p2, p3, p4) para o Passo 2
+    # Retorna o post processado e agora também os posts individuais (p1, p2, p4) para o Passo 2
     return best, conf, _timeline_size(), post_final, gap, reason, p1, p2, p4
 
-# >>> FUNÇÃO DE SNAPSHOT (Mantida para consistência, mas não usada na mensagem principal) <<<
-def _ia_snapshot(suggested:int, post:Dict[int,float], reason:str)->str:
-    pct=lambda x:f"{x*100:.1f}%"
-    p1_final,p2_final,p3_final,p4_final = post[1], post[2], post[3], post[4]
-    conf=pct(post.get(int(suggested),0.0))
+# ------------------------------------------------------
+# PASSO 3: Lógica de Otimização (Meta-IA)
+# ------------------------------------------------------
+
+# Sub-função de análise de performance (Passo 3)
+def _analyze_performance(rows: List[sqlite3.Row])->Dict[str, Any]:
+    """Calcula a performance de cada especialista na janela de dados."""
+    if not rows: return {"count": 0, "stats": {}}
     
-    # Tenta obter o post cru do E4 (Gemini) para exibir no snapshot
-    e4_post = getattr(_post_e4_llm, 'last_run', {1:0.25,2:0.25,3:0.25,4:0.25})
-    e4_sug_pct = pct(e4_post.get(int(suggested), 0.0))
+    N = len(rows)
+    # Inicializa contadores de acertos por especialista
+    hits = {"E1": 0, "E2": 0, "E3": 0, "E4": 0}
+    # Inicializa acerto/erro do Palpite Final (aqui 'suggested' é o palpite final)
+    overall_hits = 0 
     
-    return (f"📈 Amostra: {_timeline_size()} • Conf. Final: {conf}\n"
-            f"🔎 E1(n-gram): {pct(p1_final)} | E2(short): {pct(p2_final)}\n"
-            f"🧠 **E4(Gemini) Sugeriu:** {e4_sug_pct}\n"
-            f"💡 **Modo:** {reason}")
+    # Colunas de confiança
+    conf_cols = {"E1": "p1_conf", "E2": "p2_conf", "E3": "p3_conf", "E4": "p4_conf"}
+
+    for row in rows:
+        suggested = int(row["suggested"])
+        result = int(row["result"])
+        
+        # 1. Acerto/Erro do Palpite Final (Importante para contexto)
+        if suggested == result: overall_hits += 1
+
+        # 2. Avaliação da performance de cada especialista (E1, E2, E3, E4)
+        for e_key, conf_col in conf_cols.items():
+            # A métrica principal: "O número que o especialista *mais* confiava (maior 'pX_conf')
+            # no momento do palpite foi o resultado final?"
+            # OBS: No v7.8, registramos a confiança *no número sugerido*, não *no mais confiável*.
+            # Vamos usar a métrica: "A confiança do especialista no número sugerido estava correta?"
+            
+            # Aqui, pX_conf é a confiança do especialista no 'suggested'
+            # O especialista só acertou se o 'suggested' (que ele apoiou) foi o 'result'.
+            if suggested == result and row[conf_col] > 0.30: # Acertou e tinha uma confiança minimamente decente
+                 hits[e_key] += 1
+            elif suggested != result and row[conf_col] <= 0.30: # Errou, mas não confiava muito (Neutro)
+                 hits[e_key] += 0.5 # Dá um pequeno bônus por não confiar no perdedor (ajusta o peso)
+
+
+    # Calcula as taxas de acerto
+    stats = {}
+    for e_key, h_count in hits.items():
+        accuracy = (h_count / N) if N > 0 else 0.0
+        stats[e_key] = {"hits": h_count, "accuracy": accuracy}
+
+    overall_accuracy = (overall_hits / N) if N > 0 else 0.0
+
+    return {
+        "count": N,
+        "overall_accuracy": overall_accuracy,
+        "current_weights": dict(zip(["E1", "E2", "E3", "E4"], _db_get_weights())),
+        "expert_performance": stats
+    }
+
+
+# Função principal de otimização (Passo 3)
+async def _optimize_weights(optimization_key:str)->Dict[str,Any]:
+    """Chama o Gemini para sugerir novos pesos com base na performance."""
+    if optimization_key != WEBHOOK_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden: Optimization key invalid.")
+        
+    if not GEMINI_CLIENT:
+        return {"status": "error", "message": "Gemini Client não está inicializado (API Key faltando)."}
+        
+    rows = _db_get_detailed_history(n=OPTIMIZATION_WINDOW)
+    analysis = _analyze_performance(rows)
+    N = analysis["count"]
     
+    if N < 30:
+        return {"status": "skipped", "message": f"Amostra insuficiente. Necessário >30 sinais, encontrado {N}.", "details": analysis}
+
+    # Gera o prompt para o Gemini
+    current_weights_str = json.dumps(analysis["current_weights"])
+    performance_str = json.dumps(analysis["expert_performance"], indent=2)
+    
+    prompt = f"""
+    Sua tarefa é atuar como um otimizador de peso de Meta-IA para um sistema de apostas com quatro especialistas (E1, E2, E3, E4).
+    A aposta é baseada em uma média ponderada da confiança de cada especialista.
+    
+    Análise de Performance Recente (Últimos {N} Sinais):
+    -----------------------------------------------------
+    {performance_str}
+    
+    Pesos Atuais: {current_weights_str}
+    Acurácia Geral do Sistema: {analysis['overall_accuracy']:.2f}
+    
+    Instruções para Otimização:
+    1. Aumente o peso (W) dos especialistas (E1 a E4) que tiveram a maior 'accuracy' (taxa de acerto) nos últimos sinais.
+    2. Diminua o peso dos especialistas com 'accuracy' baixa.
+    3. Os pesos (W1, W2, W3, W4) devem somar **EXATAMENTE 1.0** (ou seja, 100%).
+    4. Cada peso deve ser no mínimo 0.05 (5%) e no máximo 0.40 (40%) para garantir que nenhum especialista seja totalmente ignorado ou domine.
+    
+    Sua resposta deve ser *exclusivamente* um objeto JSON formatado como o schema.
+    """
+    
+    # Schema de resposta
+    response_schema = {
+        "type": "object", 
+        "properties": {
+            "E1": {"type": "number", "description": "Novo peso W1"}, 
+            "E2": {"type": "number", "description": "Novo peso W2"}, 
+            "E3": {"type": "number", "description": "Novo peso W3"}, 
+            "E4": {"type": "number", "description": "Novo peso W4 (Gemini)"}
+        },
+        "required": ["E1", "E2", "E3", "E4"]
+    }
+
+    try:
+        response = await GEMINI_CLIENT.models.generate_content_async(
+            model=GEMINI_MODEL,
+            contents=[prompt],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json", 
+                response_schema=response_schema
+            )
+        )
+        
+        new_weights = json.loads(response.text)
+        
+        # Validação final e normalização
+        if not isinstance(new_weights, dict) or len(new_weights) != 4:
+             raise ValueError("Resposta JSON do Gemini inválida ou incompleta.")
+
+        # Garante que os pesos somem 1.0 após o Gemini (ajuste fino)
+        total_sum = sum(new_weights.values())
+        if total_sum > 0:
+            new_weights = {k: round(v / total_sum, 4) for k, v in new_weights.items()}
+
+        # Salva os novos pesos
+        _db_save_weights(new_weights)
+        
+        return {"status": "success", "message": "Otimização de pesos concluída.", "new_weights": new_weights, "details": analysis}
+
+    except Exception as e:
+        error_msg = f"DEBUG Gemini Error (Otimização): {e}"
+        if SHOW_DEBUG: print(error_msg)
+        return {"status": "error", "message": "Falha na otimização do Gemini.", "error": str(e), "details": analysis}
+
 
 # ------------------------------------------------------
 # Telegram helpers (send + delete)
@@ -534,7 +639,36 @@ async def health():
 
 @app.get("/debug_cfg")
 async def debug_cfg():
-    return {"MAX_GALE": MAX_GALE, "OBS_TIMEOUT_SEC": OBS_TIMEOUT_SEC, "DEDUP_WINDOW_SEC": DEDUP_WINDOW_SEC}
+    w1, w2, w3, w4 = _db_get_weights()
+    history_count = len(_db_get_detailed_history(n=10000)) # Conta todos os que fecharam
+    
+    return {
+        "MAX_GALE": MAX_GALE, 
+        "OBS_TIMEOUT_SEC": OBS_TIMEOUT_SEC, 
+        "DEDUP_WINDOW_SEC": DEDUP_WINDOW_SEC,
+        "CURRENT_WEIGHTS": {"E1": w1, "E2": w2, "E3": w3, "E4": w4},
+        "OPTIMIZATION_WINDOW": OPTIMIZATION_WINDOW,
+        "CLOSED_SIGNALS_IN_DB": history_count
+    }
+
+# ROTA PARA O PASSO 3: OTIMIZAÇÃO MANUAL OU VIA CRON JOB
+@app.post("/optimize/{optimization_key}")
+async def optimize_endpoint(optimization_key: str):
+    result = await _optimize_weights(optimization_key)
+    
+    # Envia notificação via Telegram se a otimização foi bem-sucedida
+    if result.get("status") == "success":
+        new_w = result["new_weights"]
+        msg = (f"🔄 **OTIMIZAÇÃO DE PESOS CONCLUÍDA!**\n"
+               f"📊 Amostra Analisada: {result['details']['count']} sinais\n"
+               f"**Novos Pesos:**\n"
+               f"• E1 (N-gram): **{new_w['E1']*100:.1f}%**\n"
+               f"• E2 (Short): **{new_w['E2']*100:.1f}%**\n"
+               f"• E3 (Long): **{new_w['E3']*100:.1f}%**\n"
+               f"• E4 (Gemini): **{new_w['E4']*100:.1f}%**")
+        await tg_send(TARGET_CHANNEL, msg)
+    
+    return result
 
 # ------------------------------------------------------
 # Webhook principal
@@ -634,9 +768,6 @@ async def webhook(token: str, request: Request):
                 if stage_lbl=="G0" or len(seen)>=min(2, MAX_GALE+1):
                     final_seen="-".join(seen[:min(2, MAX_GALE+1)]) if seen else "X"
                     
-                    # Aqui, a lógica de GALE > 0 não sabe o resultado exato (1, 2, 3 ou 4) do fechamento
-                    # O Passo 2 no GALE > 0 é mais complexo, por enquanto, apenas feche a aposta 'pending'
-                    # e use o 'observed_result' (se existir) para o detailed_history
                     if observed_result is not None:
                         con=_con()
                         con.execute("UPDATE detailed_history SET result=? WHERE id=?", (observed_result, int(pend["id"])))
@@ -654,7 +785,6 @@ async def webhook(token: str, request: Request):
     # 3) ENTRADA CONFIRMADA (com dedupe + “Analisando...” auto-delete)
     if RX_ENTRADA.search(text):
         if _seen_recent("entrada", _dedupe_key(text)):
-            # Debug de entrada duplicada removido
             return {"ok": True, "skipped": "entrada_dupe"}
 
         seq=_parse_seq_list(text)
@@ -664,7 +794,6 @@ async def webhook(token: str, request: Request):
         # fecha pendência anterior se esquecida (com X)
         pend=_pending_get()
         if pend:
-            # Lógica de fechamento forçado aqui é a mesma do FECHA, mas garantindo que feche com X
             if MAX_GALE == 0:
                 final_seen="X"; suggested=int(pend["suggested"] or 0); outcome="LOSS"; stage_lbl="G0"
             else:
@@ -675,7 +804,6 @@ async def webhook(token: str, request: Request):
                 if len(seen)>=1 and seen[0].isdigit() and int(seen[0])==suggested: outcome="GREEN"; stage_lbl="G0"
                 elif len(seen)>=2 and seen[1].isdigit() and int(seen[1])==suggested and MAX_GALE>=1: outcome="GREEN"; stage_lbl="G1"
             
-            # Quando aposta é fechada à força, o resultado no detailed_history fica como NULL
             msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
             if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
 
@@ -683,7 +811,6 @@ async def webhook(token: str, request: Request):
         analyzing_id = await tg_send_return(TARGET_CHANNEL, "⏳ Analisando padrão (com Gemini), aguarde...")
 
         # escolhe nova sugestão (ASSÍNCRONO!)
-        # ALTERADO: A função agora retorna os posts individuais (p1, p2, p4) para o Passo 2
         best, conf, samples, post_final, gap, reason, p1, p2, p4 = await _choose_number()
         
         opened=_pending_open(best)
@@ -696,14 +823,11 @@ async def webhook(token: str, request: Request):
             
             # PASSO 2: Registra o palpite detalhado ANTES de enviar a mensagem
             if entry_id:
-                # O post_raw (base) foi renomeado para 'base' na _choose_number. 
-                # Precisamos da confiança de CADA especialista (p1, p2, p3, p4) para o número sugerido ('best')
-                
-                # Para maior precisão no Passo 2, vamos registrar a confiança de 'best' em cada especialista:
+                # O post_e3 (long) é calculado aqui para ser salvo
                 conf_p1 = p1.get(best, 0.25)
                 conf_p2 = p2.get(best, 0.25)
-                conf_p3 = _post_e3_long(_timeline_tail(400)).get(best, 0.25) # Re-calculando p3 para simplificar
-                conf_p4 = p4.get(best, 0.25) # p4 já está limpo
+                conf_p3 = _post_e3_long(_timeline_tail(400)).get(best, 0.25) 
+                conf_p4 = p4.get(best, 0.25) 
                 
                 con=_con(); now=int(time.time())
                 con.execute("INSERT OR IGNORE INTO detailed_history(id,opened_at,suggested,p1_conf,p2_conf,p3_conf,p4_conf) VALUES(?,?,?,?,?,?,?)",
