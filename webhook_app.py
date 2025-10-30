@@ -203,7 +203,7 @@ def _pending_close(final_seen: str, outcome: str, stage_lbl: str, suggested:int)
 # ------------------ DEDUPE por conteúdo ------------------
 def _dedupe_key(text: str) -> str:
     base = re.sub(r"\s+", " ", (text or "")).strip().lower()
-    return hashlib.sha1(base.encode("utf-8")).heigest()
+    return hashlib.sha1(base.encode("utf-8")).hexdigest() # <-- CORRIGIDO AQUI (hexdigest)
 
 def _seen_recent(kind: str, dkey: str) -> bool:
     now = int(time.time())
@@ -567,8 +567,7 @@ async def webhook(token: str, request: Request):
     # 3) ENTRADA CONFIRMADA (com dedupe + “Analisando...” auto-delete)
     if RX_ENTRADA.search(text):
         if _seen_recent("entrada", _dedupe_key(text)):
-            # LINHA DE DEBUG REMOVIDA DAQUI:
-            # if SHOW_DEBUG: await tg_send(TARGET_CHANNEL, "DEBUG: entrada duplicada ignorada (conteúdo repetido).")
+            # Debug de entrada duplicada removido
             return {"ok": True, "skipped": "entrada_dupe"}
 
         seq=_parse_seq_list(text)
