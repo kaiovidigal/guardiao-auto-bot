@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v7.6 (INTEGRAÇÃO GEMINI - FOCO GREEN G0 / CORREÇÃO DE FECHAMENTO (X | Y) / MODELO 2)
+v7.7 (INÍCIO OTIMIZAÇÃO - PASSO 1: CONFIGURAÇÃO DINÂMICA DE PESOS)
 
 ENV obrigatórias (Render -> Environment):
 - TG_BOT_TOKEN
@@ -63,7 +63,7 @@ if GEMINI_API_KEY:
 # ------------------------------------------------------
 # App
 # ------------------------------------------------------
-app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.6")
+app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.7")
 
 # ------------------------------------------------------
 # DB helpers
@@ -106,11 +106,41 @@ def db_init():
         ts   INTEGER NOT NULL,
         PRIMARY KEY (kind, dkey)
     )""")
+    
+    # NOVO: Tabela para armazenar a configuração dinâmica de pesos (PASSO 1)
+    cur.execute("""CREATE TABLE IF NOT EXISTS config(
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        w1 REAL DEFAULT 0.30, 
+        w2 REAL DEFAULT 0.20, 
+        w3 REAL DEFAULT 0.20, 
+        w4 REAL DEFAULT 0.30,
+        last_opt_ts INTEGER DEFAULT 0
+    )""")
+
     if not con.execute("SELECT 1 FROM score WHERE id=1").fetchone():
         con.execute("INSERT INTO score(id,green,loss) VALUES(1,0,0)")
+        
+    # NOVO: Insere os pesos iniciais se a tabela estiver vazia
+    if not con.execute("SELECT 1 FROM config WHERE id=1").fetchone():
+        con.execute("INSERT INTO config(id,w1,w2,w3,w4) VALUES(1,0.30,0.20,0.20,0.30)")
+        
     con.commit(); con.close()
 
 db_init()
+
+# NOVO: Função para ler os pesos atuais (PASSO 1)
+def _db_get_weights()->Tuple[float,float,float,float]:
+    con=_con(); row=con.execute("SELECT w1,w2,w3,w4 FROM config WHERE id=1").fetchone(); con.close()
+    return (row["w1"], row["w2"], row["w3"], row["w4"]) if row else (0.30, 0.20, 0.20, 0.30)
+
+# NOVO: Função para salvar novos pesos e atualizar timestamp (PASSO 1)
+def _db_save_weights(w:Dict[str,float]):
+    con=_con(); now=int(time.time())
+    # O Gemini retornará as chaves 'E1', 'E2', 'E3', 'E4'
+    con.execute("UPDATE config SET w1=?,w2=?,w3=?,w4=?,last_opt_ts=? WHERE id=1",
+                (w["E1"], w["E2"], w["E3"], w["E4"], now)) 
+    con.commit(); con.close()
+
 
 def _mark_processed(upd: str):
     try:
@@ -203,7 +233,7 @@ def _pending_close(final_seen: str, outcome: str, stage_lbl: str, suggested:int)
 # ------------------ DEDUPE por conteúdo ------------------
 def _dedupe_key(text: str) -> str:
     base = re.sub(r"\s+", " ", (text or "")).strip().lower()
-    return hashlib.sha1(base.encode("utf-8")).hexdigest() # <-- CORRIGIDO AQUI (hexdigest)
+    return hashlib.sha1(base.encode("utf-8")).hexdigest() # <-- CORRIGIDO AQUI
 
 def _seen_recent(kind: str, dkey: str) -> bool:
     now = int(time.time())
@@ -292,9 +322,12 @@ async def _post_e4_llm(tail:List[int])->Dict[int,float]:
         if SHOW_DEBUG: print(f"DEBUG Gemini Error: {e}")
         return _post_e4_llm.last_run # Retorna 25% fixo em caso de erro
 
-def _hedge(p1,p2,p3,p4, w=(0.30,0.20,0.20,0.30)):
-    # Pesos REVISADOS para foco G0: E1(30%), E2(20%), E3(20%), E4/Gemini (30%)
+# ALTERADO: Removemos o argumento 'w' fixo e lemos do DB (PASSO 1)
+def _hedge(p1,p2,p3,p4):
+    w1, w2, w3, w4 = _db_get_weights() # LÊ OS PESOS DINAMICAMENTE
+    w = (w1, w2, w3, w4) 
     cands=(1,2,3,4)
+    # A fórmula agora usa os pesos lidos: w[0]=w1, w[1]=w2, etc.
     out={c: w[0]*p1.get(c,0)+w[1]*p2.get(c,0)+w[2]*p3.get(c,0)+w[3]*p4.get(c,0) for c in cands}
     return _norm(out)
 
@@ -343,7 +376,10 @@ async def _choose_number()->Tuple[int,float,int,Dict[int,float],float,str]:
     
     base=_hedge(p1,p2,p3,p4)
     best, post, reason = _runnerup_ls2(base, loss_streak=_get_ls())
-    post=_conf_floor(post, 0.30, 0.95)
+    
+    # ALTERADO: Aumentando o piso de confiança para 35% (0.35)
+    post=_conf_floor(post, 0.35, 0.95) 
+    
     best=max(post,key=post.get); conf=float(post[best])
     r=sorted(post.items(), key=lambda kv: kv[1], reverse=True)
     gap=(r[0][1]-r[1][1]) if len(r)>=2 else r[0][1]
@@ -531,9 +567,8 @@ async def webhook(token: str, request: Request):
                     if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
                     return {"ok": True, "closed": outcome, "seen": final_seen}
                 else:
-                    # Se não encontramos o número no parêntese, ignoramos o fechamento de G0 por segurança.
-                    if SHOW_DEBUG:
-                        await tg_send(TARGET_CHANNEL, f"DEBUG: Fechamento G0 ignorado. Não encontrou número final no parêntese. Texto: '{text}'")
+                    # AVISO CRÍTICO: Fechamento G0 ignorado se o número final estiver faltando.
+                    await tg_send(TARGET_CHANNEL, f"⚠️ **ERRO/AVISO CRÍTICO:** Fechamento G0 IGNORADO. Não encontrou o número final da aposta (1-4) no parêntese. Verifique o formato da mensagem de origem. Texto: '{text}'")
                     return {"ok": True, "waiting_obs_g0_miss": True}
 
             # LÓGICA COMPLETA PARA MAX_GALE > 0 (caso você mude a ENV) - SEM ALTERAÇÕES AQUI
