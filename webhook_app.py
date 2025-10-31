@@ -2,15 +2,15 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v7.9.3 (FINALIZADO: Otimização, Persistência e Correção de Erro)
+v7.9.3 (FINALIZADO: Otimização, Persistência e Correção de Fechamento)
 
 ENV obrigatórias (Render -> Environment):
 - TG_BOT_TOKEN
 - WEBHOOK_TOKEN
-- SOURCE_CHANNEL           ex: -1002810508717
-- TARGET_CHANNEL           ex: -1003052132833
-- GEMINI_API_KEY           <<< CHAVE OBRIGATÓRIA PARA O GEMINI
-- MAX_GALE                 <<< DEVE SER DEFINIDO COMO '0' PARA FOCO G0
+- SOURCE_CHANNEL
+- TARGET_CHANNEL
+- GEMINI_API_KEY
+- MAX_GALE (DEVE SER DEFINIDO COMO '0' PARA FOCO G0)
 ...
 """
 
@@ -71,6 +71,7 @@ app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.9.3")
 # ------------------------------------------------------
 # DB helpers
 # ------------------------------------------------------
+# ... [O restante das funções de DB (db_init, _con, _db_get_weights, etc.) não foi alterado. MANTENHA-AS]
 def _con():
     # Garante que a pasta do disco exista antes de tentar criar o DB
     db_dir = os.path.dirname(DB_PATH)
@@ -250,6 +251,8 @@ def _pending_close(final_seen: str, outcome: str, stage_lbl: str, suggested:int)
     _append_seq(obs)
     our = suggested if outcome.upper()=="GREEN" else "X"
     
+    # AQUI ESTÁ O AJUSTE CRÍTICO: usar o palpite do bot no texto para referência
+    our = suggested
     msg = (f"{'🟢' if outcome.upper()=='GREEN' else '🔴'} <b>{outcome.upper()}</b> — finalizado "
            f"(<b>{stage_lbl}</b>, nosso={our}, observados={final_seen}).\n"
            f"📊 Geral: {_score_text()}")
@@ -275,6 +278,7 @@ def _seen_recent(kind: str, dkey: str) -> bool:
 # ------------------------------------------------------
 # IA “12 camadas” compacta (4 especialistas + ajustes)
 # ------------------------------------------------------
+# ... [Todas as funções de IA (_norm, _post_freq, _post_e1_ngram, _post_e4_llm, _hedge, etc.) inalteradas. MANTENHA-AS]
 def _norm(d: Dict[int,float])->Dict[int,float]:
     s=sum(d.values()) or 1e-9
     return {k:v/s for k,v in d.items()}
@@ -412,8 +416,7 @@ async def _choose_number()->Tuple[int,float,int,Dict[int,float],float,str,Dict[i
 # ------------------------------------------------------
 # PASSO 3: Lógica de Otimização (Meta-IA)
 # ------------------------------------------------------
-
-# Sub-função de análise de performance (Passo 3)
+# ... [Todas as funções de Otimização (_analyze_performance, _optimize_weights) inalteradas. MANTENHA-AS]
 def _analyze_performance(rows: List[sqlite3.Row])->Dict[str, Any]:
     """Calcula a performance de cada especialista na janela de dados."""
     if not rows: return {"count": 0, "stats": {}}
@@ -546,6 +549,7 @@ async def _optimize_weights(optimization_key:str)->Dict[str,Any]:
 # ------------------------------------------------------
 # Telegram helpers (send + delete)
 # ------------------------------------------------------
+# ... [Todas as funções de Telegram helpers (tg_send, tg_delete, etc.) inalteradas. MANTENHA-AS]
 async def tg_send(chat_id: str, text: str, parse="HTML"):
     try:
         async with httpx.AsyncClient(timeout=15) as cli:
@@ -576,6 +580,7 @@ async def tg_delete(chat_id: str, message_id: int):
     except Exception:
         pass
 
+
 # ------------------------------------------------------
 # Parser do canal-fonte
 # ------------------------------------------------------
@@ -591,8 +596,9 @@ RX_GREEN   = re.compile(r"GREEN|✅", re.I)
 RX_RED     = re.compile(r"RED|❌", re.I)
 RX_PAREN   = re.compile(r"\(([^\)]*)\)\s*$")
 
-# Ele busca o primeiro número (1-4) dentro do último parêntese.
-RX_CLOSING_NUM = re.compile(r"\(([^\)]*?)([1-4]).*?\)\s*$", re.I)
+# >>> AJUSTE CRÍTICO AQUI: Novo regex para o formato "(1)" ou "(4)" no final da mensagem <<<
+# Busca (1) ou (2) ou (3) ou (4) no final da string.
+RX_CLOSING_NUM = re.compile(r"\(([1-4])\)\s*$", re.I) 
 
 def _parse_seq_list(text:str)->List[int]:
     m=RX_SEQ.search(text or "")
@@ -619,12 +625,13 @@ def _parse_closing_number(text:str)->Optional[int]:
     m=RX_CLOSING_NUM.search(text or "")
     if not m: return None
     try: 
-        # m.group(2) é o primeiro número [1-4] capturado dentro do parêntese.
-        return int(m.group(2)) 
+        # m.group(1) captura o número que está DENTRO dos parênteses
+        return int(m.group(1)) 
     except: return None
 # ------------------------------------------------------
 # Rotas básicas
 # ------------------------------------------------------
+# ... [Todas as rotas (/, /health, /debug_cfg, /optimize/{optimization_key}) inalteradas. MANTENHA-AS]
 @app.get("/")
 async def root():
     return {"ok": True, "service": "GuardiAo Auto Bot", "time": datetime.datetime.utcnow().isoformat()+"Z"}
@@ -706,7 +713,7 @@ async def webhook(token: str, request: Request):
         if pend:
             suggested=int(pend["suggested"] or 0)
             
-            # TENTA EXTRAIR O NÚMERO FINAL DO PARÊNTESE
+            # TENTA EXTRAIR O NÚMERO FINAL DO PARÊNTESE (Corrigido para o formato "(1)")
             observed_result = _parse_closing_number(text)
             
             # (a) Observados do PLACAR: (Mantido para alimentar 'seen' e timeline, caso haja a linha de Sequência)
@@ -731,7 +738,8 @@ async def webhook(token: str, request: Request):
                     
                     # PASSO 2: ATUALIZA O RESULTADO FINAL NO detailed_history
                     con=_con()
-                    con.execute("UPDATE detailed_history SET result=? WHERE id=?", (observed_result, int(pend["id"])))
+                    pend_id = int(pend["id"])
+                    con.execute("UPDATE detailed_history SET result=? WHERE id=?", (observed_result, pend_id))
                     con.commit(); con.close()
                     
                     # Fechamento: 
@@ -764,7 +772,8 @@ async def webhook(token: str, request: Request):
                     
                     if observed_result is not None:
                         con=_con()
-                        con.execute("UPDATE detailed_history SET result=? WHERE id=?", (observed_result, int(pend["id"])))
+                        pend_id = int(pend["id"])
+                        con.execute("UPDATE detailed_history SET result=? WHERE id=?", (observed_result, pend_id))
                         con.commit(); con.close()
                     
                     msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
@@ -777,6 +786,7 @@ async def webhook(token: str, request: Request):
         return {"ok": True, "noted_close": True}
 
     # 3) ENTRADA CONFIRMADA (com dedupe + “Analisando...” auto-delete)
+    # ... [O restante do webhook (Entrada Confirmada) inalterado. MANTENHA-O]
     if RX_ENTRADA.search(text):
         if _seen_recent("entrada", _dedupe_key(text)):
             return {"ok": True, "skipped": "entrada_dupe"}
