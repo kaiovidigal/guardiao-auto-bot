@@ -199,12 +199,14 @@ def _score_add(outcome:str):
     if outcome.upper()=="GREEN": g+=1
     elif outcome.upper()=="LOSS": l+=1
     
+    # ATUALIZA o placar
     con.execute("UPDATE score SET green=?,loss=? WHERE id=1",(g,l))
     con.commit(); con.close()
 
 def _score_reset_if_new_day():
     """Verifica e zera o placar se um novo dia (00:00 GMT-3) começou."""
     con = _con()
+    # Pega o placar atual e a última data de reset
     row = con.execute("SELECT green, loss, last_reset_day FROM score WHERE id=1").fetchone()
     
     if not row:
@@ -218,17 +220,15 @@ def _score_reset_if_new_day():
     
     if today_str != last_reset_day:
         # É um novo dia (meia-noite passou). ZERA O PLACAR.
-        g, l = row["green"], row["loss"]
         
-        # Opcional: Notificação de fechamento do dia anterior (executado pelo processo que chamou _score_text)
-        # O reset deve ser feito aqui no DB.
+        # O reset é feito aqui no DB.
         con.execute("UPDATE score SET green=0, loss=0, last_reset_day=? WHERE id=1", (today_str,))
         con.commit()
 
     con.close()
 
 def _score_text()->str:
-    # 1. Tenta resetar o placar se for um novo dia
+    # 1. Tenta resetar o placar se for um novo dia (executado na primeira chamada do dia)
     _score_reset_if_new_day() 
     
     # 2. Lê e retorna o placar atualizado
@@ -276,12 +276,15 @@ def _pending_close(final_seen: str, outcome: str, stage_lbl: str, suggested:int)
     con = _con()
     con.execute("UPDATE pending SET open=0, seen=? WHERE id=? AND open=1", (final_seen, int(row["id"])))
     con.commit(); con.close()
-    _score_add(outcome)
-    # alimentar timeline com observados
+    
+    # 1. Adiciona o resultado final do dia no placar
+    _score_add(outcome) 
+    
+    # 2. alimentar timeline com observados
     obs = [int(x) for x in final_seen.split("-") if x.isdigit()]
     _append_seq(obs)
     
-    # AQUI FOI CORRIGIDO para exibir o palpite do bot
+    # 3. Gera a mensagem (que chama _score_text e, se for novo dia, reseta o placar)
     our = suggested
     msg = (f"{'🟢' if outcome.upper()=='GREEN' else '🔴'} <b>{outcome.upper()}</b> — finalizado "
            f"(<b>{stage_lbl}</b>, nosso={our}, observados={final_seen}).\n"
@@ -768,7 +771,6 @@ async def webhook(token: str, request: Request):
                     con.commit(); con.close()
                     
                     # Fechamento: 
-                    # A chamada a _pending_close é onde o _score_text() é chamado para atualizar o placar.
                     msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
                     if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
                     return {"ok": True, "closed": outcome, "seen": final_seen}
@@ -786,9 +788,18 @@ async def webhook(token: str, request: Request):
             return {"ok": True, "skipped": "entrada_dupe"}
 
         # Se já tiver um sinal pendente, ignora nova entrada
-        if _pending_get():
-            return {"ok": True, "skipped": "already_open"}
+        pend=_pending_get()
+        if pend:
+            # Se um sinal anterior não fechou, ele é considerado LOSS para o placar final
+            if MAX_GALE == 0:
+                final_seen="X"; suggested=int(pend["suggested"] or 0); outcome="LOSS"; stage_lbl="G0"
+            else:
+                # Lógica de fechamento de sinal antigo MAX_GALE > 0
+                final_seen="X"; suggested=int(pend["suggested"] or 0); outcome="LOSS"; stage_lbl="X"
 
+            msg_txt=_pending_close(final_seen, outcome, stage_lbl, suggested)
+            if msg_txt: await tg_send(TARGET_CHANNEL, msg_txt)
+        
         # --- GERA O PALPITE G0 ---
         number, conf, timeline_size, post_final, gap, reason, p1, p2, p4 = await _choose_number()
 
@@ -799,20 +810,28 @@ async def webhook(token: str, request: Request):
         _pending_open(suggested=number)
 
         # Salva o detalhe do sinal para otimização futura (Passo 2)
-        con=_con(); pend_id = con.execute("SELECT id FROM pending WHERE open=1 ORDER BY id DESC LIMIT 1").fetchone()["id"]; con.close()
+        con=_con(); pend_row = con.execute("SELECT id FROM pending WHERE open=1 ORDER BY id DESC LIMIT 1").fetchone(); con.close()
+        pend_id = int(pend_row["id"]) if pend_row else None 
         
-        con=_con()
-        con.execute("""INSERT INTO detailed_history(id, opened_at, suggested, p1_conf, p2_conf, p3_conf, p4_conf) 
-                       VALUES(?,?,?,?,?,?,?)""",
-                    (pend_id, int(time.time()), number, post_final.get(1,0), post_final.get(2,0), post_final.get(3,0), post_final.get(4,0)))
-        con.commit(); con.close()
+        if pend_id:
+            # O post_e3 (long) é calculado aqui para ser salvo
+            conf_p1 = p1.get(number, 0.25)
+            conf_p2 = p2.get(number, 0.25)
+            conf_p3 = _post_e3_long(_timeline_tail(400)).get(number, 0.25) 
+            conf_p4 = p4.get(number, 0.25) 
+
+            con=_con(); now=int(time.time())
+            con.execute("INSERT OR IGNORE INTO detailed_history(id,opened_at,suggested,p1_conf,p2_conf,p3_conf,p4_conf) VALUES(?,?,?,?,?,?,?)",
+                        (pend_id, now, number, conf_p1, conf_p2, conf_p3, conf_p4))
+            con.commit(); con.close()
 
 
         # Mensagem G0
-        msg_txt = (f"⚽️ **ENTRADA CONFIRMADA (G0)**\n"
-                   f"🎯 Aposta: **{number}**\n"
-                   f"📈 Confiança IA: {conf*100:.1f}% (Gap: {gap*100:.1f}%) "
-                   f"[{reason}]\n"
+        msg_txt = (f"🚀 **ENTRADA IMEDIATA:** Número **{number}** (G0)\n"
+                   f"🌟 **CONFIANÇA** — **{conf*100:.1f}%**\n"
+                   f"🧠 **IA Leader:** Gemini ({p4.get(number, 0.25)*100:.1f}%)\n"
+                   f"📊 **Base:** Amostra ≈{timeline_size} | Gap {gap*100:.1f}pp\n"
+                   f"💡 **Modo:** {reason}\n"
                    f"📊 Geral: {_score_text()}")
 
         # Envia e armazena ID da mensagem para possível edição/exclusão (opcional)
@@ -829,13 +848,7 @@ async def webhook(token: str, request: Request):
             obs_pair = _parse_seq_pair(text, need=need_obs) or _parse_paren_pair(text, need=need_obs)
             
             if obs_pair:
-                current_seen = pend["seen"].split("-")
-                
-                # Verifica se a nova observação move o sinal para o próximo Gale
                 # A lógica de Gale é complexa e exige saber qual número de fato saiu
-                
-                # Por simplicidade no G0/foco, não implementaremos a lógica completa de Gale aqui. 
-                # Apenas alimentamos o "visto" no DB.
                 _pending_seen_append(obs_pair, need=need_obs)
 
     return {"ok": True, "processed": False}
