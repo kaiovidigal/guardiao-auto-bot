@@ -1,141 +1,125 @@
-# main.py - Versão FINAL SEM GEMINI (Modo Destravado: Coleta de Dados)
-
 import os
-import sqlite3
-import re
-import logging
+import json
 import time
-from datetime import datetime
-from fastapi import FastAPI, Request, HTTPException
-import httpx 
+import logging
+from typing import Optional, Dict, Any, List
 
-# Importações do Gemini Removidas
+from fastapi import FastAPI, HTTPException, Request
+import httpx
+from google import genai
+from google.genai import types
 
-# ====================================================================
-# CONFIGURAÇÃO GERAL E LOGGING
-# ====================================================================
+# --- CONFIGURAÇÕES DE AMBIENTE ---
+# Puxe variáveis de ambiente ou use valores de fallback
+BOT_TOKEN: str = os.getenv("BOT_TOKEN", "SEU_BOT_TOKEN_AQUI")
+WEBHOOK_TOKEN: str = os.getenv("WEBHOOK_TOKEN", "Jonbet") # Seu token de seguranca
+CANAL_ORIGEM_IDS_STR: str = os.getenv("CANAL_ORIGEM_IDS", "")
+CANAL_DESTINO_ID: str = os.getenv("CANAL_DESTINO_ID", "")
+GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+
+# Configuração de Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# VARIÁVEIS DE AMBIENTE (Lidas do Render)
-BOT_TOKEN   = os.environ.get("BOT_TOKEN", "").strip()
-WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN", "default_secret_token").strip() 
-# GEMINI_API_KEY Removida
+# Conversão de IDs de Canal (lista de strings)
+CANAL_ORIGEM_IDS: List[str] = [id.strip() for id in CANAL_ORIGEM_IDS_STR.split(',') if id.strip()]
 
-# IDs dos Canais (Lidos de ENVs)
-CANAL_ORIGEM_IDS_STR = os.environ.get("CANAL_ORIGEM_IDS", "-1003156785631").strip()
-CANAL_DESTINO_ID_STR = os.environ.get("CANAL_DESTINO_ID", "-1002796105884").strip()
-CANAL_FEEDBACK_ID_STR = os.environ.get("CANAL_FEEDBACK_ID", "-1002796105884").strip()
+# URLs da API do Telegram
+TELEGRAM_API_URL: str = f"https://api.telegram.org/bot{BOT_TOKEN}"
+SEND_MESSAGE_URL: str = f"{TELEGRAM_API_URL}/sendMessage"
 
-# Conversão dos IDs de canal
+# --- CONFIGURAÇÕES DE ESTADO (Para evitar duplicação) ---
+# Variável Global de Estado para rastrear o último envio.
+# O valor será mantido enquanto o servidor Uvicorn estiver ativo.
+last_signal_time = 0
+COOLDOWN_SECONDS = 30 # Tempo mínimo entre o envio de sinais (em segundos)
+
+# --- CONFIGURAÇÕES DE IA E CONFIANÇA ---
+# Modo Destravado: Permite que a IA envie sinais com qualquer confiança para fins de aprendizado/teste.
+# Valor usado: 0.0, conforme o modo APRENDIZADOBRUTO.
+PERCENTUAL_MINIMO_CONFIANCA: float = float(os.getenv("MIN_CONFIDENCE", "0.0"))
+
+# Inicialização da API do Gemini
 try:
-    CANAL_ORIGEM_IDS = [int(id_.strip()) for id_ in CANAL_ORIGEM_IDS_STR.split(',') if id_.strip()]
-    CANAL_DESTINO_ID = int(CANAL_DESTINO_ID_STR)
-    CANAL_FEEDBACK_ID = int(CANAL_FEEDBACK_ID_STR)
-except ValueError as e:
-    logging.critical(f"ERRO: IDs de canais inválidos nas ENVs. Verifique: {e}")
-    CANAL_ORIGEM_IDS, CANAL_DESTINO_ID, CANAL_FEEDBACK_ID = [], 0, 0 
-
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-
-# ====================================================================
-# CONFIGURAÇÃO DE APRENDIZADO E FILTRAGEM
-# ====================================================================
-MIN_JOGADAS_APRENDIZADO = 10
-# MODO DESTRAVADO: Confiança mínima para enviar. 0.0 garante que envie para COLETAR DADOS.
-PERCENTUAL_MINIMO_CONFIANCA = 0.0 
-
-# Variável de estado global para armazenar o ÚLTIMO SINAL ENVIADO (Chave com Tempo)
-LAST_SENT_SIGNAL = {"text": None, "timestamp": 0} 
-
-# ====================================================================
-# BANCO DE DADOS (SQLite) E PERSISTÊNCIA DE DISCO NO RENDER
-# ====================================================================
-DB_MOUNT_PATH = os.environ.get("DB_MOUNT_PATH", "/var/data") 
-DB_NAME = os.path.join(DB_MOUNT_PATH, 'double_jonbet_data.db') 
-
-def setup_db():
-    os.makedirs(DB_MOUNT_PATH, exist_ok=True)
-    conn = sqlite3.connect(DB_NAME, check_same_thread=False)
-    cursor = conn.cursor()
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS sinais_performance (
-        sinal_original TEXT PRIMARY KEY,
-        jogadas_analisadas INTEGER DEFAULT 0,
-        acertos_branco INTEGER DEFAULT 0
-    )
-    ''')
-    conn.commit()
-    logging.info(f"DB configurado em: {DB_NAME}")
-    return conn, cursor
-
-conn, cursor = setup_db()
-
-def get_performance(sinal):
-    """Retorna a performance, confiança e histórico (jogadas e acertos) de um sinal."""
-    cursor.execute("SELECT jogadas_analisadas, acertos_branco FROM sinais_performance WHERE sinal_original = ?", (sinal,))
-    data = cursor.fetchone()
-    
-    if data:
-        analisadas, acertos = data
-        if analisadas > 0:
-            confianca = (acertos / analisadas) * 100
-            # Retorna o histórico de jogadas/acertos 
-            historico_string = f"JOGADAS: {analisadas}, ACERTOS BRANCO: {acertos}"
-            return analisadas, confianca, historico_string
-        return 0, 0.0, "JOGADAS: 0, ACERTOS BRANCO: 0"
-    
-    cursor.execute("INSERT OR IGNORE INTO sinais_performance (sinal_original) VALUES (?)", (sinal,))
-    conn.commit()
-    return 0, 0.0, "JOGADAS: 0, ACERTOS BRANCO: 0"
-
-def atualizar_performance(sinal, is_win):
-    """Atualiza o histórico de jogadas e acertos no banco de dados."""
-    cursor.execute("SELECT jogadas_analisadas, acertos_branco FROM sinais_performance WHERE sinal_original = ?", (sinal,))
-    data = cursor.fetchone()
-    
-    if not data:
-        # Insere se o sinal não existe
-        cursor.execute("INSERT INTO sinais_performance (sinal_original, jogadas_analisadas, acertos_branco) VALUES (?, 1, ?)", 
-                       (sinal, 1 if is_win else 0))
+    if GEMINI_API_KEY:
+        genai_client = genai.Client(api_key=GEMINI_API_KEY)
+        logging.info("Cliente Gemini inicializado com sucesso.")
     else:
-        jogadas, acertos = data
-        jogadas += 1
-        acertos += 1 if is_win else 0
-        cursor.execute("UPDATE sinais_performance SET jogadas_analisadas = ?, acertos_branco = ? WHERE sinal_original = ?", 
-                       (jogadas, acertos, sinal))
-                       
-    conn.commit()
-    logging.info(f"Performance atualizada para '{sinal}'. Win: {is_win}.")
+        genai_client = None
+        logging.warning("GEMINI_API_KEY ausente. A funcionalidade de IA será desativada.")
+except Exception as e:
+    genai_client = None
+    logging.error(f"Erro ao inicializar o cliente Gemini: {e}")
 
-# ----------------------------------------------------
-# FUNÇÃO DE DECISÃO DE ENVIO (SIMPLIFICADA)
-# ----------------------------------------------------
+app = FastAPI()
 
-async def deve_enviar_sinal(sinal: str):
-    """Lógica original de aprendizado estatístico."""
-    
-    analisadas, confianca_estatistica, historico_db = get_performance(sinal)
-    
-    # 1. Modo APRENDIZADO (Envio garantido para coletar dados)
-    if analisadas < MIN_JOGADAS_APRENDIZADO: 
-        return True, "APRENDIZADO_BRUTO", confianca_estatistica
-    
-    # 2. Envio pelo Fallback Estatístico
-    # Como o PERCENTUAL_MINIMO_CONFIANCA está em 0.0, ele enviará sempre
-    if confianca_estatistica >= PERCENTUAL_MINIMO_CONFIANCA:
-        return True, "ESTATISTICA_FALLBACK", confianca_estatistica
+# --- MODELO DE IA ---
+# Instruções para o Gemini: Foco no BRANCO e na formatação correta.
+SYSTEM_INSTRUCTION = (
+    "Você é um especialista em análise de sinais para jogos de Double/Roleta, focado exclusivamente na cor BRANCO. "
+    "Sua única tarefa é analisar o texto da mensagem de entrada. Você deve seguir estritamente as seguintes regras: "
+    "1. Seu FOCO É EXCLUSIVO NO BRANCO. Você deve analisar a mensagem e determinar se ela está sugerindo uma aposta ou padrão que favorece o BRANCO (⚪). "
+    "2. Se a mensagem for sobre BRANCO, você deve gerar uma 'Confiança' (score de 0.0 a 100.0) e uma 'Justificativa'. "
+    "3. Se a mensagem for sobre outras cores (PRETO, VERMELHO, etc.) ou for MISTURADA e você não conseguir extrair uma indicação clara de BRANCO, sua Confiança DEVE SER SEMPRE 0.0. "
+    "4. SUA RESPOSTA DEVE SER APENAS O JSON, NADA MAIS. O JSON DEVE SEGUIR ESTA ESTRUTURA RIGOROSA: "
+    '{"confianca": <float entre 0.0 e 100.0>, "justificativa": "<string explicando a confiança em até 50 palavras>"}'
+)
+
+def analyze_message_with_gemini(message_text: str) -> Optional[Dict[str, Any]]:
+    """Envia a mensagem para o Gemini para análise e pontuação."""
+    if not genai_client:
+        return None
+
+    try:
+        response = genai_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=message_text,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_INSTRUCTION,
+                response_mime_type="application/json",
+            )
+        )
         
-    return False, "BLOQUEIO_ZERO_CONFIANÇA", confianca_estatistica
-
-
-async def tg_send_message(chat_id: int, text: str):
-    """Envia a mensagem para o Telegram usando httpx."""
-    
-    if not BOT_TOKEN:
-        logging.critical("BOT_TOKEN não configurado. Não é possível enviar mensagem.")
-        return False
+        # O modelo deve retornar um JSON válido
+        json_output = json.loads(response.text)
         
-    url = f"{TELEGRAM_API}/sendMessage"
+        # Validação básica da estrutura
+        if "confianca" in json_output and "justificativa" in json_output:
+            json_output["confianca"] = max(0.0, min(100.0, float(json_output["confianca"])))
+            return json_output
+        else:
+            logging.error("Resposta da IA com formato JSON inválido.")
+            return None
+
+    except Exception as e:
+        logging.error(f"Erro na comunicação ou processamento da IA: {e}")
+        return None
+
+def build_final_message(original_text: str, ai_analysis: Dict[str, Any]) -> str:
+    """Formata a mensagem final com análise da IA."""
+    confianca: float = ai_analysis.get("confianca", 0.0)
+    justificativa: str = ai_analysis.get("justificativa", "Análise indisponível.")
+
+    modo = "APRENDIZADOBRUTO" if PERCENTUAL_MINIMO_CONFIANCA == 0.0 else "PRODUÇÃO"
+
+    header = (
+        f"⚠️ SINAL EXCLUSIVO BRANCO (MODO: {modo}) ⚠️\n"
+        f"🎯 JOGO: Double JonBet\n"
+        f"🔥 FOCO TOTAL NO **BRANCO** 🔥\n\n"
+        f"📊 Confiança: `{confianca:.2f}%`\n"
+        f"🧠 Análise Gemini: _{justificativa}_\n\n"
+    )
+
+    footer = (
+        f"\n---\n"
+        f"🔔 Sinal Original: {original_text}"
+    )
+
+    # Garante que o texto final não exceda o limite do Telegram (4096 caracteres)
+    final_message = header + footer
+    return final_message[:4096]
+
+async def send_telegram_message(chat_id: str, text: str):
+    """Envia a mensagem formatada para o canal de destino."""
     payload = {
         "chat_id": chat_id,
         "text": text,
@@ -143,147 +127,118 @@ async def tg_send_message(chat_id: int, text: str):
         "disable_web_page_preview": True
     }
     
-    try:
-        # Usa httpx para requisições assíncronas (async)
-        async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.post(url, json=payload)
-            response.raise_for_status() 
-            return response.json().get('ok', False)
-    except httpx.HTTPStatusError as e:
-        logging.error(f"Erro HTTP ao enviar Telegram: {e.response.text}")
-    except Exception as e:
-        logging.error(f"Erro ao enviar Telegram: {e}")
-    return False
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(SEND_MESSAGE_URL, json=payload, timeout=10)
+            response.raise_for_status()
+            logging.info(f"Mensagem enviada com sucesso para {chat_id}.")
+        except httpx.HTTPStatusError as e:
+            logging.error(f"Erro ao enviar mensagem HTTP {e.response.status_code}: {e.response.text}")
+        except httpx.RequestError as e:
+            logging.error(f"Erro de requisição ao enviar mensagem: {e}")
 
 
-# ====================================================================
-# APLICAÇÃO FASTAPI (Webhook)
-# ====================================================================
+# --- ENDPOINTS DA APLICAÇÃO ---
 
-app = FastAPI(title="Double JonBet Webhook", version="1.0")
+@app.get("/")
+def read_root():
+    """Endpoint de saúde para verificar se o serviço está vivo."""
+    return {"status": "ok", "service": "Jonbet Telegram Bot is running."}
 
-@app.post("/webhook/{token}")
-async def telegram_webhook(token: str, request: Request):
-    global LAST_SENT_SIGNAL
+@app.post(f"/webhook/{{webhook_token}}")
+async def telegram_webhook(webhook_token: str, request: Request):
+    """Manipula as requisições Webhook do Telegram."""
     
-    if token != WEBHOOK_TOKEN:
-        raise HTTPException(status_code=403, detail="Forbidden: Invalid Webhook Token")
+    # 1. VERIFICAÇÃO DO TOKEN DE SEGURANÇA
+    if webhook_token != WEBHOOK_TOKEN:
+        logging.error(f"Tentativa de acesso com token inválido: {webhook_token}")
+        raise HTTPException(status_code=403, detail="Token de segurança inválido.")
 
     try:
         data = await request.json()
-    except Exception:
-        return {"ok": True, "skipped": "invalid_json"}
+    except json.JSONDecodeError:
+        logging.error("Payload não é um JSON válido.")
+        raise HTTPException(status_code=400, detail="Payload inválido.")
 
-    message = data.get("message") or data.get("channel_post") or data.get("edited_channel_post") or {}
-    chat = message.get("chat") or {}
-    
-    if not message or not chat:
-        return {"ok": True, "skipped": "no_message"}
+    # 2. EXTRAÇÃO E VERIFICAÇÃO BÁSICA
+    if "message" not in data:
+        return {"ok": True, "action": "ignored_no_message"}
 
-    chat_id = chat.get("id", 0)
-    text = (message.get("text") or message.get("caption") or "").strip()
-    
-    if not text or not chat_id:
-        return {"ok": True, "skipped": "no_text_or_chat"}
+    message: Dict[str, Any] = data["message"]
+    chat_id: Optional[int] = message.get("chat", {}).get("id")
+    text: Optional[str] = message.get("text")
 
+    if not chat_id or not text:
+        return {"ok": True, "action": "ignored_no_text_or_chat"}
+
+    global last_signal_time
     logging.info(f"Mensagem recebida de Chat ID: {chat_id}")
-    
-    # --- 2. LÓGICA DE ROTEAMENTO E PROCESSAMENTO ---
-    
-    # A) PROCESSAR SINAL DE ORIGEM
-    if chat_id in CANAL_ORIGEM_IDS:
-        logging.info("Mensagem roteada para PROCESSAMENTO DE SINAL.")
-        
-        # Filtra SÓ se a mensagem for um sinal com foco em BRANCO (⚪)
-        if "branco" not in text.lower() and "⚪" not in text:
-            logging.info("Sinal ignorado: Não foca em BRANCO.")
-            return {"ok": True, "action": "ignored_not_branco"}
-        
-        # OBTÉM A HORA E MINUTO ATUAIS para a chave de aprendizado
-        hora_minuto_atual = datetime.now().strftime("%H:%M") 
-        
-        sinal_limpo_texto = re.sub(r'#[0-9]+', '', text).strip()
-        
-        # CHAVE DE APRENDIZADO COMPLETA (texto + tempo)
-        sinal_com_tempo = f"{sinal_limpo_texto} | {hora_minuto_atual}"
-        
-        deve_enviar, modo, confianca = await deve_enviar_sinal(sinal_com_tempo) # Agora é assíncrona
-        
-        if deve_enviar:
-            sinal_convertido = (
-                f"⚠️ **SINAL EXCLUSIVO BRANCO ({modo})** ⚠️\n\n"
-                f"🎯 JOGO: **Double JonBet**\n"
-                f"🔥 FOCO TOTAL NO **BRANCO** 🔥\n\n"
-                f"⏰ Entrada às: **{hora_minuto_atual}**\n"
-                f"📊 Confiança: `{confianca:.2f}%` (Modo: {modo})\n"
-                f"🔔 Sinal Original: {sinal_limpo_texto}"
-            )
-            
-            await tg_send_message(CANAL_DESTINO_ID, sinal_convertido)
-            
-            # Registra o último sinal ENVIADO com a CHAVE COMPLETA (texto + tempo)
-            LAST_SENT_SIGNAL["text"] = sinal_com_tempo 
-            LAST_SENT_SIGNAL["timestamp"] = time.time()
-            logging.warning(f"Sinal ENVIADO: '{sinal_com_tempo}'. Esperando feedback em {CANAL_FEEDBACK_ID}.")
-        
-        else:
-            logging.info(f"Sinal IGNORADO: '{sinal_com_tempo}'. Confiança: {confianca:.2f}% (Motivo: {modo})")
-            
-        return {"ok": True, "action": "processed_sinal"}
 
-    # B) PROCESSAR FEEDBACK (WIN/LOSS)
-    elif chat_id == CANAL_FEEDBACK_ID:
-        logging.info("Mensagem roteada para PROCESSAMENTO DE FEEDBACK.")
-        
-        if LAST_SENT_SIGNAL["text"] is None or (time.time() - LAST_SENT_SIGNAL["timestamp"]) > 3600: # Ignora feedback antigo (> 1h)
-            logging.warning("Feedback recebido, mas nenhum sinal recente pendente ou sinal expirado.")
-            return {"ok": True, "action": "feedback_ignored_no_signal"}
+    # 3. FILTRAGEM DE CANAL DE ORIGEM
+    chat_id_str = str(chat_id)
+    if chat_id_str not in CANAL_ORIGEM_IDS:
+        logging.info(f"Mensagem ignorada: ID de chat {chat_id} não é um canal de origem configurado.")
+        return {"ok": True, "action": "ignored_wrong_source"}
 
-        feedback_text = text.strip().upper()
+    logging.info("Mensagem roteada para PROCESSAMENTO DE SINAL.")
+
+
+    # --- BLOCO DE FILTRAGEM DE CONTEÚDO: FOCO TOTAL NO BRANCO ---
+    text_lower = text.lower()
+
+    # 1. Deve conter BRANCO para ser considerado.
+    contains_branco = "branco" in text_lower or "⚪" in text
+
+    # 2. NÃO DEVE conter PRETO ou VERMELHO/OUTRAS CORES, pois é um sinal misturado.
+    contains_preto_ou_vermelho = "preto" in text_lower or "⚫" in text_lower or "🔴" in text_lower
+
+    if not contains_branco:
+        logging.info("Sinal ignorado: Não contém a palavra/emoji 'BRANCO'.")
+        return {"ok": True, "action": "ignored_not_branco"}
+
+    if contains_preto_ou_vermelho:
+        logging.info("Sinal ignorado: Contém BRANCO, mas está misturado com PRETO/VERMELHO.")
+        return {"ok": True, "action": "ignored_mixed_signal"}
+    # --- FIM DO BLOCO DE FILTRAGEM ---
+
+
+    # 4. ANÁLISE DE IA
+    if not genai_client:
+        logging.warning("IA desativada. Sinal não processado por IA.")
+        # Se a IA estiver desativada, ele ainda passa a mensagem original para fins de teste.
+        final_message = f"🚨 IA DESATIVADA. Sinal Original:\n\n{text}"
+        await send_telegram_message(CANAL_DESTINO_ID, final_message)
+        last_signal_time = time.time() # Atualiza o lock
+        return {"ok": True, "action": "sent_original_message_ai_off"}
+
+
+    ai_analysis = analyze_message_with_gemini(text)
+    
+    if not ai_analysis:
+        logging.error("Análise da IA falhou ou retornou um JSON inválido.")
+        return {"ok": True, "action": "ai_analysis_failed"}
+    
+    confianca_ia = ai_analysis.get("confianca", 0.0)
+
+    # 5. FILTRO DE CONFIANÇA (Modo Destravado: 0.0)
+    if confianca_ia >= PERCENTUAL_MINIMO_CONFIANCA:
         
-        # Lógica de Feedback:
-        is_feedback_received = any(k in feedback_text for k in ["VITÓRIA", "GREEN", "LOSS", "RED", "PERDEU", "GANHOU", "GANHO"])
-        is_win_branco = "BRANCO" in feedback_text or "⚪" in text
+        # 6. FILTRO ANTI-DUPLICAÇÃO (Timestamp Lock)
+        current_time = time.time()
         
-        is_win = False
+        if current_time - last_signal_time < COOLDOWN_SECONDS:
+            cooldown_remaining = COOLDOWN_SECONDS - (current_time - last_signal_time)
+            logging.info(f"Sinal ignorado devido ao COOLDOWN. {cooldown_remaining:.2f}s restantes.")
+            return {"ok": True, "action": "ignored_cooldown"}
+            
+        # Se passou no cooldown, envia e atualiza o timestamp
+        final_message = build_final_message(text, ai_analysis)
+        await send_telegram_message(CANAL_DESTINO_ID, final_message)
         
-        if is_win_branco:
-            is_win = True
-        elif is_feedback_received:
-            # Qualquer outro resultado de rodada é LOSS para o sistema do BRANCO
-            is_win = False
-            
-        if is_win_branco or is_feedback_received:
-            sinal_para_atualizar = LAST_SENT_SIGNAL["text"]
-            
-            atualizar_performance(sinal_para_atualizar, is_win)
-            
-            sinal_original_apenas_texto = sinal_para_atualizar.split('|')[0].strip()
-            
-            if is_win:
-                resultado_msg = f"✅ **WIN BRANCO!**\nSinal: `{sinal_original_apenas_texto}`. Feedback: `{feedback_text}`"
-            else:
-                resultado_msg = f"❌ **LOSS BRANCO.**\nSinal: `{sinal_original_apenas_texto}`. Feedback: `{feedback_text}`"
-                
-            await tg_send_message(CANAL_DESTINO_ID, resultado_msg)
-            
-            LAST_SENT_SIGNAL["text"] = None 
-            logging.info("Estado de feedback limpo. Pronto para o próximo sinal.")
-            
-            return {"ok": True, "action": "feedback_processed", "outcome": "WIN" if is_win else "LOSS"}
+        last_signal_time = current_time # Atualiza o lock
         
-        else:
-            logging.info("Feedback recebido, mas não é um WIN/LOSS reconhecido.")
-            return {"ok": True, "action": "feedback_unrecognized"}
-            
-    # C) CHAT NÃO CONFIGURADO
+        logging.info(f"Sinal enviado! Confiança: {confianca_ia:.2f}%")
+        return {"ok": True, "action": "signal_sent", "confidence": confianca_ia}
     else:
-        logging.info(f"Mensagem de chat {chat_id} ignorada (Não é origem ou feedback).")
-        return {"ok": True, "action": "chat_ignored"}
-
-# ----------------------------------------
-# ROTA DE STATUS (Health Check)
-# ----------------------------------------
-@app.get("/")
-async def health_check():
-    return {"status": "running", "service": "Double JonBet Webhook", "db_path": DB_NAME}
+        logging.info(f"Sinal ignorado pelo filtro de confiança da IA: {confianca_ia:.2f}% (Mínimo: {PERCENTUAL_MINIMO_CONFIANCA:.2f}%)")
+        return {"ok": True, "action": "ignored_low_confidence", "confidence": confianca_ia}
