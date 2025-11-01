@@ -89,27 +89,25 @@ def analyze_message_with_gemini(message_text: str) -> Optional[Dict[str, Any]]:
         logging.error(f"Erro na comunicação ou processamento da IA: {e}")
         return None
 
-def build_final_message(original_text: str, ai_analysis: Dict[str, Any]) -> str:
-    """Formata a mensagem final com análise da IA."""
+def build_final_message(ai_analysis: Dict[str, Any]) -> str:
+    """Formata a mensagem final com análise da IA, SEM O SINAL ORIGINAL."""
     confianca: float = ai_analysis.get("confianca", 0.0)
     justificativa: str = ai_analysis.get("justificativa", "Análise indisponível.")
 
     modo = "APRENDIZADOBRUTO" if PERCENTUAL_MINIMO_CONFIANCA == 0.0 else "PRODUÇÃO"
 
-    header = (
-        f"⚠️ SINAL EXCLUSIVO BRANCO (MODO: {modo}) ⚠️\n"
+    # --- MENSAGEM FINAL PADRÃO E LIMPA ---
+    final_message = (
+        f"🚨 **ENTRADA IMEDIATA NO BRANCO!** ⚪️\n\n"
         f"🎯 JOGO: Double JonBet\n"
-        f"🔥 FOCO TOTAL NO **BRANCO** 🔥\n\n"
-        f"📊 Confiança: `{confianca:.2f}%`\n"
+        f"🔥 FOCO: BRANCO\n"
+        f"📊 Confiança: `{confianca:.2f}%` ({modo})\n"
         f"🧠 Análise Gemini: _{justificativa}_\n\n"
+        f"⚠️ **ESTRATÉGIA: G0 (ZERO GALES).**\n"
+        f"💻 Site: Acessar Double"
     )
+    # --- FIM DA MENSAGEM PADRÃO ---
 
-    footer = (
-        f"\n---\n"
-        f"🔔 Sinal Original: {original_text}"
-    )
-
-    final_message = header + footer
     return final_message[:4096]
 
 async def send_telegram_message(chat_id: str, text: str):
@@ -183,14 +181,14 @@ async def telegram_webhook(webhook_token: str, request: Request):
     # 1. Deve conter BRANCO para ser considerado.
     contains_branco = "branco" in text_lower or "⚪" in text or "⬜" in text
 
-    # 2. NÃO DEVE conter outras CORES, GALE, WIN, ou MARTINGALE.
+    # 2. NÃO DEVE conter outras CORES, GALE, WIN, ou MARTINGALE. (FILTRO MÁXIMO)
     contains_outras_cores_ou_gale = (
         "preto" in text_lower or "⚫" in text_lower or 
         "vermelho" in text_lower or "🔴" in text_lower or
         "verde" in text_lower or "🟢" in text_lower or
-        "gale" in text_lower or "gales" in text_lower or # Exclui GALE
-        "✅" in text_lower or "win" in text_lower or # Exclui WIN/Check Mark
-        "loss" in text_lower # Exclui LOSS (garante que só é sinal de entrada)
+        "gale" in text_lower or "gales" in text_lower or 
+        "✅" in text_lower or "win" in text_lower or 
+        "loss" in text_lower or "perda" in text_lower # Exclui LOSS
     )
 
     if not contains_branco:
@@ -205,22 +203,19 @@ async def telegram_webhook(webhook_token: str, request: Request):
 
     # 4. ANÁLISE DE IA
     if not genai_client:
-        logging.warning("IA desativada. Sinal não processado por IA.")
-        final_message = f"🚨 IA DESATIVADA. Sinal Original:\n\n{text}"
-        await send_telegram_message(CANAL_DESTINO_ID, final_message)
-        last_signal_time = time.time() # Atualiza o lock
-        return {"ok": True, "action": "sent_original_message_ai_off"}
-
+        logging.warning("IA desativada.")
+        # Se a IA estiver desativada, não envia nada (pois não temos a formatação de confiança)
+        return {"ok": True, "action": "ai_disabled_no_action"}
 
     ai_analysis = analyze_message_with_gemini(text)
     
     if not ai_analysis:
-        logging.error("Análise da IA falhou ou retornou um JSON inválido.")
+        logging.error("Análise da IA falhou.")
         return {"ok": True, "action": "ai_analysis_failed"}
     
     confianca_ia = ai_analysis.get("confianca", 0.0)
 
-    # 5. FILTRO DE CONFIANÇA (Modo Destravado: 0.0)
+    # 5. FILTRO DE CONFIANÇA E ANTI-DUPLICAÇÃO
     if confianca_ia >= PERCENTUAL_MINIMO_CONFIANCA:
         
         # 6. FILTRO ANTI-DUPLICAÇÃO (Timestamp Lock)
@@ -231,8 +226,8 @@ async def telegram_webhook(webhook_token: str, request: Request):
             logging.info(f"Sinal ignorado devido ao COOLDOWN. {cooldown_remaining:.2f}s restantes.")
             return {"ok": True, "action": "ignored_cooldown"}
             
-        # Se passou no cooldown, envia e atualiza o timestamp
-        final_message = build_final_message(text, ai_analysis)
+        # Se passou em tudo, envia a mensagem PADRÃO e LIMPA
+        final_message = build_final_message(ai_analysis) 
         await send_telegram_message(CANAL_DESTINO_ID, final_message)
         
         last_signal_time = current_time # Atualiza o lock
