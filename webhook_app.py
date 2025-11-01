@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 GuardiAo Auto Bot — webhook_app.py
-v7.9.3 (FINALIZADO: Otimização, Persistência e Correção de Erro)
+v7.9.4 (CORREÇÃO CRÍTICA DE ERRO DO GEMINI - Chamadas Síncronas)
 
 ENV obrigatórias (Render -> Environment):
 - TG_BOT_TOKEN
 - WEBHOOK_TOKEN
-- SOURCE_CHANNEL           ex: -1002810508717
-- TARGET_CHANNEL           ex: -1003052132833
+- SOURCE_CHANNEL
+- TARGET_CHANNEL
 - GEMINI_API_KEY           <<< CHAVE OBRIGATÓRIA PARA O GEMINI
 - MAX_GALE                 <<< DEVE SER DEFINIDO COMO '0' PARA FOCO G0
 ...
@@ -47,7 +47,6 @@ if not TG_BOT_TOKEN or not WEBHOOK_TOKEN or not TARGET_CHANNEL:
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 # >>> AJUSTE CRUCIAL: Apontando para o disco persistente do Render (/var/data) <<<
-# O Render está montando o disco persistente em /var/data, conforme a sua imagem de "Disk Configuration".
 DB_PATH = "/var/data/main.sqlite"
 
 # ------------------------------------------------------
@@ -58,7 +57,7 @@ GEMINI_MODEL  = "gemini-2.5-flash" # Modelo rápido para análise de padrões
 
 if GEMINI_API_KEY:
     try:
-        # A chamada assíncrona é usada nas funções de predição e otimização
+        # A chamada AGORA é síncrona para evitar o erro generate_content_async
         GEMINI_CLIENT = genai.Client(api_key=GEMINI_API_KEY)
         print("Gemini Client inicializado com sucesso.")
     except Exception as e:
@@ -67,17 +66,18 @@ if GEMINI_API_KEY:
 # ------------------------------------------------------
 # App
 # ------------------------------------------------------
-app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.9.3")
+# O app é mantido assíncrono para lidar com I/O de rede (Telegram, HTTP)
+app = FastAPI(title="GuardiAo Auto Bot (webhook)", version="7.9.4")
 
 # ------------------------------------------------------
 # DB helpers
 # ------------------------------------------------------
 def _con():
-    # Garante que a pasta do disco exista antes de tentar criar o DB
     db_dir = os.path.dirname(DB_PATH)
     if not os.path.exists(db_dir):
         os.makedirs(db_dir, exist_ok=True)
         
+    # Aumentando o timeout para 15 segundos para dar tempo ao Gemini
     con = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL;")
@@ -116,7 +116,7 @@ def db_init():
         PRIMARY KEY (kind, dkey)
     )""")
     
-    # PASSO 1: Tabela para armazenar a configuração dinâmica de pesos
+    # Tabela para armazenar a configuração dinâmica de pesos
     cur.execute("""CREATE TABLE IF NOT EXISTS config(
         id INTEGER PRIMARY KEY CHECK(id=1),
         w1 REAL DEFAULT 0.30, 
@@ -126,7 +126,7 @@ def db_init():
         last_opt_ts INTEGER DEFAULT 0
     )""")
 
-    # PASSO 2: Tabela para o histórico detalhado dos palpites (FEEDBACK)
+    # Tabela para o histórico detalhado dos palpites (FEEDBACK)
     cur.execute("""CREATE TABLE IF NOT EXISTS detailed_history(
         id INTEGER PRIMARY KEY,         -- Usa o ID da tabela 'pending'
         opened_at INTEGER NOT NULL,
@@ -139,7 +139,7 @@ def db_init():
     if not con.execute("SELECT 1 FROM score WHERE id=1").fetchone():
         con.execute("INSERT INTO score(id,green,loss) VALUES(1,0,0)")
         
-    # PASSO 1: Insere os pesos iniciais se a tabela estiver vazia
+    # Insere os pesos iniciais se a tabela estiver vazia
     if not con.execute("SELECT 1 FROM config WHERE id=1").fetchone():
         con.execute("INSERT INTO config(id,w1,w2,w3,w4) VALUES(1,0.30,0.20,0.20,0.30)")
         
@@ -147,19 +147,19 @@ def db_init():
 
 db_init()
 
-# PASSO 1: Função para ler os pesos atuais
+# Função para ler os pesos atuais
 def _db_get_weights()->Tuple[float,float,float,float]:
     con=_con(); row=con.execute("SELECT w1,w2,w3,w4 FROM config WHERE id=1").fetchone(); con.close()
     return (row["w1"], row["w2"], row["w3"], row["w4"]) if row else (0.30, 0.20, 0.20, 0.30)
 
-# PASSO 1: Função para salvar novos pesos e atualizar timestamp
+# Função para salvar novos pesos e atualizar timestamp
 def _db_save_weights(w:Dict[str,float]):
     con=_con(); now=int(time.time())
     con.execute("UPDATE config SET w1=?,w2=?,w3=?,w4=?,last_opt_ts=? WHERE id=1",
                 (w["E1"], w["E2"], w["E3"], w["E4"], now)) 
     con.commit(); con.close()
 
-# PASSO 2: Função para obter histórico detalhado COMPLETO (registros com resultado)
+# Função para obter histórico detalhado COMPLETO (registros com resultado)
 def _db_get_detailed_history(n:int=OPTIMIZATION_WINDOW):
     con=_con()
     # Pega os N registros MAIS RECENTES que JÁ TÊM UM RESULTADO (result IS NOT NULL)
@@ -259,7 +259,6 @@ def _pending_close(final_seen: str, outcome: str, stage_lbl: str, suggested:int)
 # ------------------ DEDUPE por conteúdo ------------------
 def _dedupe_key(text: str) -> str:
     base = re.sub(r"\s+", " ", (text or "")).strip().lower()
-    # >>> CORREÇÃO: heigest -> hexdigest <<<
     return hashlib.sha1(base.encode("utf-8")).hexdigest()
 
 def _seen_recent(kind: str, dkey: str) -> bool:
@@ -297,8 +296,8 @@ def _post_e1_ngram(tail:List[int])->Dict[int,float]:
 def _post_e2_short(tail):  return _post_freq(tail, 60)
 def _post_e3_long(tail):   return _post_freq(tail, 300)
 
-# >>> ESPECIALISTA E4 - GEMINI (COM FOCO G0/ALTO RISCO) <<<
-async def _post_e4_llm(tail:List[int])->Dict[int,float]:
+# >>> ESPECIALISTA E4 - GEMINI (TROCA PARA CHAMADA SÍNCRONA) <<<
+def _post_e4_llm(tail:List[int])->Dict[int,float]:
     # Variável para armazenar o resultado do E4 para o snapshot
     _post_e4_llm.last_run = {1:0.25,2:0.25,3:0.25,4:0.25}
 
@@ -319,8 +318,8 @@ async def _post_e4_llm(tail:List[int])->Dict[int,float]:
     """
 
     try:
-        # Chamada assíncrona
-        response = await GEMINI_CLIENT.models.generate_content_async(
+        # CORREÇÃO: TROCA DE generate_content_async (ASSÍNCRONA) PARA generate_content (SÍNCRONA)
+        response = GEMINI_CLIENT.models.generate_content(
             model=GEMINI_MODEL,
             contents=[prompt],
             config=types.GenerateContentConfig(
@@ -388,15 +387,16 @@ def _conf_floor(post:Dict[int,float], floor=0.35, cap=0.95):
 def _get_ls()->int:
     return 0
 
-# >>> FUNÇÃO PRINCIPAL DE ESCOLHA (ASSÍNCRONA) <<<
+# >>> FUNÇÃO PRINCIPAL DE ESCOLHA (TORNADA SÍNCRONA) <<<
+# OBS: O 'async' é mantido aqui para que o FastAPI consiga chamar, mas a chamada do Gemini é síncrona.
 async def _choose_number()->Tuple[int,float,int,Dict[int,float],float,str,Dict[int,float],Dict[int,float],Dict[int,float]]:
     tail=_timeline_tail(400)
     p1=_post_e1_ngram(tail)
     p2=_post_e2_short(tail)
     p3=_post_e3_long(tail)
     
-    # CHAMADA ASSÍNCRONA PARA O GEMINI
-    p4=await _post_e4_llm(tail) 
+    # CHAMADA AGORA É SÍNCRONA
+    p4=_post_e4_llm(tail) 
     
     base=_hedge(p1,p2,p3,p4)
     best, post_raw, reason = _runnerup_ls2(base, loss_streak=_get_ls())
@@ -411,10 +411,10 @@ async def _choose_number()->Tuple[int,float,int,Dict[int,float],float,str,Dict[i
     return best, conf, _timeline_size(), post_final, gap, reason, p1, p2, p4
 
 # ------------------------------------------------------
-# PASSO 3: Lógica de Otimização (Meta-IA)
+# Lógica de Otimização (Meta-IA)
 # ------------------------------------------------------
 
-# Sub-função de análise de performance (Passo 3)
+# Sub-função de análise de performance
 def _analyze_performance(rows: List[sqlite3.Row])->Dict[str, Any]:
     """Calcula a performance de cada especialista na janela de dados."""
     if not rows: return {"count": 0, "stats": {}}
@@ -422,10 +422,8 @@ def _analyze_performance(rows: List[sqlite3.Row])->Dict[str, Any]:
     N = len(rows)
     # Inicializa contadores de acertos por especialista
     hits = {"E1": 0, "E2": 0, "E3": 0, "E4": 0}
-    # Inicializa acerto/erro do Palpite Final (aqui 'suggested' é o palpite final)
     overall_hits = 0 
     
-    # Colunas de confiança
     conf_cols = {"E1": "p1_conf", "E2": "p2_conf", "E3": "p3_conf", "E4": "p4_conf"}
 
     for row in rows:
@@ -460,7 +458,7 @@ def _analyze_performance(rows: List[sqlite3.Row])->Dict[str, Any]:
     }
 
 
-# Função principal de otimização (Passo 3)
+# Função principal de otimização (TROCA PARA CHAMADA SÍNCRONA)
 async def _optimize_weights(optimization_key:str)->Dict[str,Any]:
     """Chama o Gemini para sugerir novos pesos com base na performance."""
     if optimization_key != WEBHOOK_TOKEN:
@@ -513,7 +511,8 @@ async def _optimize_weights(optimization_key:str)->Dict[str,Any]:
     }
 
     try:
-        response = await GEMINI_CLIENT.models.generate_content_async(
+        # CORREÇÃO: TROCA DE generate_content_async (ASSÍNCRONA) PARA generate_content (SÍNCRONA)
+        response = GEMINI_CLIENT.models.generate_content(
             model=GEMINI_MODEL,
             contents=[prompt],
             config=types.GenerateContentConfig(
@@ -545,7 +544,7 @@ async def _optimize_weights(optimization_key:str)->Dict[str,Any]:
 
 
 # ------------------------------------------------------
-# Telegram helpers (send + delete)
+# Telegram helpers (send + delete) - Devem ser assíncronos
 # ------------------------------------------------------
 async def tg_send(chat_id: str, text: str, parse="HTML"):
     try:
@@ -578,7 +577,7 @@ async def tg_delete(chat_id: str, message_id: int):
         pass
 
 # ------------------------------------------------------
-# Parser do canal-fonte
+# Parser do canal-fonte (Sem alterações)
 # ------------------------------------------------------
 RX_ENTRADA = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
 RX_ANALISE = re.compile(r"\bANALISANDO\b", re.I)
@@ -592,7 +591,6 @@ RX_GREEN   = re.compile(r"GREEN|✅", re.I)
 RX_RED     = re.compile(r"RED|❌", re.I)
 RX_PAREN   = re.compile(r"\(([^\)]*)\)\s*$")
 
-# Ele busca o primeiro número (1-4) dentro do último parêntese.
 RX_CLOSING_NUM = re.compile(r"\(([^\)]*?)([1-4]).*?\)\s*$", re.I)
 
 def _parse_seq_list(text:str)->List[int]:
@@ -620,11 +618,10 @@ def _parse_closing_number(text:str)->Optional[int]:
     m=RX_CLOSING_NUM.search(text or "")
     if not m: return None
     try: 
-        # m.group(2) é o primeiro número [1-4] capturado dentro do parêntese.
         return int(m.group(2)) 
     except: return None
 # ------------------------------------------------------
-# Rotas básicas
+# Rotas básicas (Sem alterações)
 # ------------------------------------------------------
 @app.get("/")
 async def root():
@@ -637,7 +634,7 @@ async def health():
 @app.get("/debug_cfg")
 async def debug_cfg():
     w1, w2, w3, w4 = _db_get_weights()
-    history_count = len(_db_get_detailed_history(n=10000)) # Conta todos os que fecharam
+    history_count = len(_db_get_detailed_history(n=10000))
     
     return {
         "MAX_GALE": MAX_GALE, 
@@ -651,6 +648,7 @@ async def debug_cfg():
 # ROTA PARA O PASSO 3: OTIMIZAÇÃO MANUAL OU VIA CRON JOB
 @app.post("/optimize/{optimization_key}")
 async def optimize_endpoint(optimization_key: str):
+    # Esta rota é async, mas chama a função de otimização que faz a chamada síncrona ao Gemini.
     result = await _optimize_weights(optimization_key)
     
     # Envia notificação via Telegram se a otimização foi bem-sucedida
@@ -668,7 +666,7 @@ async def optimize_endpoint(optimization_key: str):
     return result
 
 # ------------------------------------------------------
-# Webhook principal
+# Webhook principal (Sem alterações de lógica, apenas chamadas de funções)
 # ------------------------------------------------------
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
