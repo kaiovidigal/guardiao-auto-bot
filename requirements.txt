@@ -1,6 +1,5 @@
 fastapi 
 uvicorn 
 httpx 
-google-genai 
-python-json-logger
+python-dotenv
 openai
