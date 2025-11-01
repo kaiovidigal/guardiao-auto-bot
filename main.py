@@ -1,4 +1,4 @@
-# main.py - Versão FINAL COM INTEGRAÇÃO GEMINI (Modo Destravado: Coleta de Dados)
+# main.py - Versão FINAL SEM GEMINI (Modo Destravado: Coleta de Dados)
 
 import os
 import sqlite3
@@ -9,9 +9,7 @@ from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException
 import httpx 
 
-# Importações do Gemini
-from google import genai 
-from google.genai import types
+# Importações do Gemini Removidas
 
 # ====================================================================
 # CONFIGURAÇÃO GERAL E LOGGING
@@ -21,7 +19,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # VARIÁVEIS DE AMBIENTE (Lidas do Render)
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "").strip()
 WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN", "default_secret_token").strip() 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", None) # Chave do Gemini (Fornecida nas ENVs)
+# GEMINI_API_KEY Removida
 
 # IDs dos Canais (Lidos de ENVs)
 CANAL_ORIGEM_IDS_STR = os.environ.get("CANAL_ORIGEM_IDS", "-1003156785631").strip()
@@ -81,7 +79,7 @@ def get_performance(sinal):
         analisadas, acertos = data
         if analisadas > 0:
             confianca = (acertos / analisadas) * 100
-            # Retorna o histórico de jogadas/acertos para ser usado no prompt do Gemini
+            # Retorna o histórico de jogadas/acertos 
             historico_string = f"JOGADAS: {analisadas}, ACERTOS BRANCO: {acertos}"
             return analisadas, confianca, historico_string
         return 0, 0.0, "JOGADAS: 0, ACERTOS BRANCO: 0"
@@ -90,7 +88,6 @@ def get_performance(sinal):
     conn.commit()
     return 0, 0.0, "JOGADAS: 0, ACERTOS BRANCO: 0"
 
-# --- FUNÇÃO CORRIGIDA (CRUCIAL PARA PERSISTÊNCIA) ---
 def atualizar_performance(sinal, is_win):
     """Atualiza o histórico de jogadas e acertos no banco de dados."""
     cursor.execute("SELECT jogadas_analisadas, acertos_branco FROM sinais_performance WHERE sinal_original = ?", (sinal,))
@@ -109,84 +106,21 @@ def atualizar_performance(sinal, is_win):
                        
     conn.commit()
     logging.info(f"Performance atualizada para '{sinal}'. Win: {is_win}.")
-# ----------------------------------------------------
-
 
 # ----------------------------------------------------
-# NOVA FUNÇÃO DE ANÁLISE PREDITIVA COM GEMINI
-# ----------------------------------------------------
-
-async def analisar_com_gemini(sinal_com_tempo: str, historico_db: str):
-    """Envia o sinal atual e os dados históricos para o Gemini para uma previsão contextual."""
-    
-    # 1. Checagem da Chave de API
-    if not GEMINI_API_KEY:
-        logging.warning("GEMINI_API_KEY não configurada. Pulando análise Gemini.")
-        return None, "FALHA_CHAVE_API"
-        
-    try:
-        # Inicializa o cliente Gemini
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        
-        # Constrói o Prompt para o Gemini
-        prompt = (
-            f"Você é um analista de cassino focado em otimizar a aposta no BRANCO no jogo Double."
-            f"Sua tarefa é prever a probabilidade percentual de WIN no BRANCO para o sinal atual, usando o contexto histórico fornecido."
-            f"SINAL DE ENTRADA: {sinal_com_tempo}\n"
-            f"HISTÓRICO NO BANCO DE DADOS (JOGADAS neste padrão): {historico_db}\n\n"
-            f"Regra: Retorne APENAS o número inteiro de 0 a 100 que representa a probabilidade percentual (sem símbolos ou texto)."
-        )
-        
-        # Chama a API
-        response = client.models.generate_content(
-            model='gemini-2.5-flash', # Modelo rápido
-            contents=prompt
-        )
-        
-        # Tenta extrair a previsão (número)
-        # Usa re.sub para limpar qualquer caractere não numérico
-        confianca_gemini = int(re.sub(r'\D', '', response.text).strip())
-        
-        if 0 <= confianca_gemini <= 100:
-            return confianca_gemini, "PREVISÃO_GEMINI"
-        else:
-            logging.error(f"Resposta Gemini inválida: {response.text}")
-            return None, "RESPOSTA_GEMINI_INVALIDA"
-            
-    except Exception as e:
-        logging.error(f"Erro ao chamar a API Gemini: {e}")
-        return None, "ERRO_CHAMADA_API"
-
-# ----------------------------------------------------
-# FUNÇÃO DE DECISÃO DE ENVIO
+# FUNÇÃO DE DECISÃO DE ENVIO (SIMPLIFICADA)
 # ----------------------------------------------------
 
 async def deve_enviar_sinal(sinal: str):
-    """Combina a lógica estatística com a análise preditiva do Gemini."""
+    """Lógica original de aprendizado estatístico."""
     
     analisadas, confianca_estatistica, historico_db = get_performance(sinal)
     
     # 1. Modo APRENDIZADO (Envio garantido para coletar dados)
     if analisadas < MIN_JOGADAS_APRENDIZADO: 
-        # O bot envia para coletar os primeiros 10 dados, independentemente da confiança.
         return True, "APRENDIZADO_BRUTO", confianca_estatistica
     
-    # 2. Análise Preditiva do Gemini
-    # NOTA: O cliente Gemini usa HTTPX internamente, o que é compatível com o asyncio
-    confianca_gemini, modo_gemini = await analisar_com_gemini(sinal, historico_db)
-    
-    if confianca_gemini is not None:
-        # Se a IA Gemini conseguiu prever, usamos a previsão dela para o envio
-        
-        # *MODO DESTRAVADO*
-        if confianca_gemini > PERCENTUAL_MINIMO_CONFIANCA: 
-            return True, modo_gemini, confianca_gemini
-        else:
-            # Bloqueia se a previsão do Gemini for menor que 0.0% (nunca deveria acontecer no modo destravado)
-            return False, "BLOQUEIO_GEMINI", confianca_gemini
-
-    # 3. Falha no Gemini (Volta para a estatística bruta para garantir o funcionamento)
-    
+    # 2. Envio pelo Fallback Estatístico
     # Como o PERCENTUAL_MINIMO_CONFIANCA está em 0.0, ele enviará sempre
     if confianca_estatistica >= PERCENTUAL_MINIMO_CONFIANCA:
         return True, "ESTATISTICA_FALLBACK", confianca_estatistica
@@ -226,7 +160,7 @@ async def tg_send_message(chat_id: int, text: str):
 # APLICAÇÃO FASTAPI (Webhook)
 # ====================================================================
 
-app = FastAPI(title="Double JonBet IA Webhook", version="1.0")
+app = FastAPI(title="Double JonBet Webhook", version="1.0")
 
 @app.post("/webhook/{token}")
 async def telegram_webhook(token: str, request: Request):
@@ -273,7 +207,7 @@ async def telegram_webhook(token: str, request: Request):
         # CHAVE DE APRENDIZADO COMPLETA (texto + tempo)
         sinal_com_tempo = f"{sinal_limpo_texto} | {hora_minuto_atual}"
         
-        deve_enviar, modo, confianca = await deve_enviar_sinal(sinal_com_tempo) # Chamada assíncrona
+        deve_enviar, modo, confianca = await deve_enviar_sinal(sinal_com_tempo) # Agora é assíncrona
         
         if deve_enviar:
             sinal_convertido = (
@@ -352,4 +286,4 @@ async def telegram_webhook(token: str, request: Request):
 # ----------------------------------------
 @app.get("/")
 async def health_check():
-    return {"status": "running", "service": "Double JonBet Webhook IA", "db_path": DB_NAME}
+    return {"status": "running", "service": "Double JonBet Webhook", "db_path": DB_NAME}
