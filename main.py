@@ -1,226 +1,147 @@
-# main.py - JonBet IA v2 (FastAPI + OpenAI + SQLite)
 import os
 import json
 import time
 import logging
-import sqlite3
 from typing import Optional, List, Dict, Any
-from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Request
 import httpx
-from dotenv import load_dotenv
 
-# OpenAI client (novo SDK)
-try:
-    from openai import OpenAI
-except Exception:
-    import openai as _old_openai
-    class OpenAI:
-        def __init__(self, api_key=None): 
-            _old_openai.api_key = api_key
-            self._old = _old_openai
-        def chat(self): 
-            return self._old.ChatCompletion
-
-load_dotenv()
-
-# --- CONFIG ---
+# --- CONFIGURAÇÕES DE AMBIENTE ---
+# NOTA: O código agora LÊ as variáveis diretamente do ambiente (Render), 
+# pois 'load_dotenv()' foi removido.
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
 WEBHOOK_TOKEN: str = os.getenv("WEBHOOK_TOKEN", "Jonbet")
 CANAL_ORIGEM_IDS_STR: str = os.getenv("CANAL_ORIGEM_IDS", "-1003156785631")
 CANAL_DESTINO_ID: str = os.getenv("CANAL_DESTINO_ID", "-1002796105884")
-OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "0"))  # cooldown desativado
-HISTORY_DB_PATH = os.getenv("HISTORY_DB_PATH", "./signals.db")
-TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
-SEND_MESSAGE_URL = f"{TELEGRAM_API_URL}/sendMessage"
+# Usamos o COOLDOWN_SECONDS padrão do Render, ou 30 segundos se não for definido.
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "30")) 
 
-CANAL_ORIGEM_IDS: List[str] = [i.strip() for i in CANAL_ORIGEM_IDS_STR.split(",") if i.strip()]
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+CANAL_ORIGEM_IDS: List[str] = [id.strip() for id in CANAL_ORIGEM_IDS_STR.split(',') if id.strip()]
+TELEGRAM_API_URL: str = f"https://api.telegram.org/bot{BOT_TOKEN}"
+SEND_MESSAGE_URL: str = f"{TELEGRAM_API_URL}/sendMessage"
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# --- CONFIGURAÇÕES DE ESTADO ---
+last_signal_time = 0 
 
-# OpenAI client init
-if not OPENAI_API_KEY:
-    logging.warning("OPENAI_API_KEY não definido. Análises IA estarão desativadas.")
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+app = FastAPI()
 
-# --- Estado ---
-last_signal_time = 0
+# --- MODELOS DE MENSAGEM ---
 
-app = FastAPI(title="JonBet IA v2")
-
-# --- DB helpers ---
-def init_db(path: str = HISTORY_DB_PATH):
-    conn = sqlite3.connect(path, check_same_thread=False)
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts INTEGER NOT NULL,
-            iso TEXT NOT NULL,
-            chat_id TEXT,
-            text TEXT,
-            kind TEXT,         
-            outcome TEXT       
-        )
-    """)
-    conn.commit()
-    return conn
-
-db = init_db()
-
-def insert_event(kind: str, chat_id: str, text: str, outcome: Optional[str] = None):
-    ts = int(time.time())
-    iso = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-    cur = db.cursor()
-    cur.execute("INSERT INTO events (ts, iso, chat_id, text, kind, outcome) VALUES (?, ?, ?, ?, ?, ?)",
-                (ts, iso, chat_id, text, kind, outcome))
-    db.commit()
-    logging.debug("Evento inserido no DB: %s %s", kind, outcome)
-
-def fetch_recent_events(limit: int = 200) -> List[Dict[str, Any]]:
-    cur = db.cursor()
-    cur.execute("SELECT ts, iso, chat_id, text, kind, outcome FROM events ORDER BY ts DESC LIMIT ?", (limit,))
-    rows = cur.fetchall()
-    out = []
-    for r in rows:
-        out.append({"ts": r[0], "iso": r[1], "chat_id": r[2], "text": r[3], "kind": r[4], "outcome": r[5]})
-    return out[::-1]
-
-# --- Mensagens/template ---
-def build_final_message(analysis_text: str = "") -> str:
-    base = (
-        "🚨 **ENTRADA IMEDIATA NO BRANCO!** ⚪️\n\n"
-        "🎯 JOGO: Double JonBet\n"
-        "🔥 FOCO: BRANCO (FORÇADO)\n"
-        "📊 Confiança: `Automática via IA`\n"
-        "🧠 Observações IA: \n"
-    )
-    if analysis_text:
-        base += f"{analysis_text}\n\n"
-    base += "⚠️ **ESTRATÉGIA: G0 (SEM GALES)**\n💻 Site: Acessar Double"
-    return base[:4096]
+def build_final_message() -> str:
+    """Formata a mensagem de ENTRADA BRANCO PADRÃO e LIMPA."""
+    return (
+        f"🚨 **ENTRADA IMEDIATA NO BRANCO!** ⚪️\n\n"
+        f"🎯 JOGO: Double JonBet\n"
+        f"🔥 FOCO: BRANCO\n"
+        f"📊 Confiança: `Filtro ON` (TEXTUAL)\n"
+        f"🧠 Análise: _Filtro de Texto Agressivo Ativado._\n\n"
+        f"⚠️ **ESTRATÉGIA: G0 (ZERO GALES).**\n"
+        f"💻 Site: Acessar Double"
+    )[:4096]
 
 def build_simple_placar(text_lower: str) -> Optional[str]:
-    if any(p in text_lower for p in ["✅", "vitória", "green", "win"]):
+    """Cria a mensagem de Placar Simples (GREEN/LOSS) Limpa."""
+    
+    contem_branco = "branco" in text_lower or "⚪" in text_lower or "⬜" in text_lower
+    contem_cores = "preto" in text_lower or "vermelho" in text_lower or "verde" in text_lower or "⚫" in text_lower or "🔴" in text_lower or "🟢" in text_lower
+    
+    if contem_branco or "green" in text_lower or "vitória" in text_lower or "✅" in text_lower:
         return f"✅ **GREEN!** 🤑\n\nÚltimo resultado no Double JonBet."
-    if any(p in text_lower for p in ["loss", "perda", "perdeu", "❌"]):
+    
+    if contem_cores or "loss" in text_lower or "perda" in text_lower:
         return f"❌ **LOSS!** 😥\n\nPronto para o próximo sinal de entrada."
+        
     return None
 
-# --- OpenAI analysis ---
-def prepare_analysis_prompt(recent_events: List[Dict[str, Any]], lookback: int = 100) -> str:
-    trimmed = recent_events[-lookback:]
-    records = []
-    for e in trimmed:
-        ts = datetime.fromtimestamp(e["ts"], tz=timezone.utc)
-        hour = ts.strftime("%H:%M")
-        records.append({"iso": e["iso"], "hour": hour, "kind": e["kind"], "outcome": e["outcome"]})
-    prompt = (
-        "Você é um analista que recebe histórico de sinais e resultados do jogo Double JonBet.\n"
-        "Analise os registros abaixo e responda em JSON com estas chaves:\n"
-        "  - confianca_percent: int (taxa de acerto estimada para o BRANCO nos últimos registros)\n"
-        "  - horas_quentes: lista de strings com intervalos 'HH:MM-HH:MM' onde ocorreram mais GREENS\n"
-        "  - tendencia: 'alta'|'media'|'baixa'\n"
-        "Use apenas os dados fornecidos e seja sucinto.\n\n"
-        "Dados:\n"
-        f"{json.dumps(records, ensure_ascii=False)}\n\n"
-        "Retorne somente um JSON válido."
-    )
-    return prompt
-
-def analyze_with_openai(recent_events: List[Dict[str, Any]]) -> str:
-    if not openai_client:
-        return "IA desativada (OPENAI_API_KEY ausente)."
-    prompt = prepare_analysis_prompt(recent_events, lookback=200)
-    try:
-        resp = openai_client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=300
-        )
-        text = resp.choices[0].message.content if hasattr(resp.choices[0].message, "content") else resp.choices[0].text
-        try:
-            parsed = json.loads(text.strip())
-            pretty = json.dumps(parsed, ensure_ascii=False)
-            return pretty
-        except Exception:
-            return text.strip()
-    except Exception as e:
-        logging.error("Erro OpenAI: %s", e)
-        return "Erro na análise IA."
-
-# --- Telegram sender ---
+# --- TELEGRAM SENDER ---
 async def send_telegram_message(chat_id: str, text: str):
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": True
-    }
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True}
     async with httpx.AsyncClient() as client:
         try:
-            r = await client.post(SEND_MESSAGE_URL, json=payload, timeout=10)
-            r.raise_for_status()
-            logging.info("Mensagem enviada para %s", chat_id)
+            response = await client.post(SEND_MESSAGE_URL, json=payload, timeout=10)
+            response.raise_for_status()
+            logging.info(f"Mensagem enviada com sucesso para {chat_id}.")
         except Exception as e:
-            logging.error("Erro ao enviar Telegram: %s", e)
+            logging.error(f"Erro ao enviar mensagem para {chat_id}: {e}")
 
-# --- FastAPI endpoints ---
+# --- ENDPOINTS DA APLICAÇÃO ---
+
 @app.get("/")
-def root():
-    return {"status": "ok", "service": "JonBet IA v2"}
+def read_root(): return {"status": "ok", "service": "Jonbet Telegram Bot is running (Text Filter Only)."}
 
-@app.post("/webhook/{webhook_token}")
-async def webhook(webhook_token: str, request: Request):
-    if webhook_token != WEBHOOK_TOKEN:
-        raise HTTPException(status_code=403, detail="Token inválido.")
-    try:
-        data = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Payload inválido.")
+@app.post(f"/webhook/{{webhook_token}}")
+async def telegram_webhook(webhook_token: str, request: Request):
+    
+    if webhook_token != WEBHOOK_TOKEN: raise HTTPException(status_code=403, detail="Token de segurança inválido.")
 
-    message = data.get("message", {}) or {}
-    chat = message.get("chat", {}) or {}
-    chat_id = str(chat.get("id", ""))
-    text = message.get("text", "")
-    if not chat_id or not text:
-        return {"ok": True, "action": "ignored_no_text_or_chat"}
-
-    if CANAL_ORIGEM_IDS and chat_id not in CANAL_ORIGEM_IDS:
-        return {"ok": True, "action": "ignored_wrong_source"}
+    try: data = await request.json()
+    except json.JSONDecodeError: raise HTTPException(status_code=400, detail="Payload inválido.")
+    
+    message = data.get("message", {})
+    chat_id = message.get("chat", {}).get("id")
+    text = message.get("text")
+    if not chat_id or not text: return {"ok": True, "action": "ignored_no_text_or_chat"}
 
     global last_signal_time
     text_lower = text.lower()
+    
+    chat_id_str = str(chat_id)
+    if chat_id_str not in CANAL_ORIGEM_IDS: return {"ok": True, "action": "ignored_wrong_source"}
+    
+    logging.info("Mensagem roteada para PROCESSAMENTO DE SINAL.")
 
-    placar_message = build_simple_placar(text_lower)
-    if placar_message:
-        outcome = "green" if any(p in text_lower for p in ["✅", "vitória", "green", "win"]) else "loss"
-        insert_event(kind="result", chat_id=chat_id, text=text, outcome=outcome)
-        await send_telegram_message(CANAL_DESTINO_ID, placar_message)
-        logging.info("Placar processado e registrado: %s", outcome)
-        return {"ok": True, "action": "result_logged_sent"}
+    # --- BLOCO DE FILTRAGEM: PLACAR OU ENTRADA? ---
 
-    now = time.time()
-    if now - last_signal_time < COOLDOWN_SECONDS:
-        logging.info("Ignorado por cooldown.")
-        insert_event(kind="signal", chat_id=chat_id, text=text, outcome=None)
-        return {"ok": True, "action": "ignored_cooldown_logged"}
+    is_placar = "loss" in text_lower or "perda" in text_lower or "vitória" in text_lower or "✅" in text_lower or "🟢" in text_lower
+    contains_entrada_palavras_aposta = "aposta" in text_lower or "entrar" in text_lower or "duplo" in text_lower
 
-    insert_event(kind="signal", chat_id=chat_id, text=text, outcome=None)
-    recent = fetch_recent_events(limit=500)
-    ia_analysis = analyze_with_openai(recent)
-    final = build_final_message(analysis_text=ia_analysis)
-    await send_telegram_message(CANAL_DESTINO_ID, final)
+    
+    # === AVALIAÇÃO DE PLACAR/RESULTADO ===
+    if is_placar:
+        if contains_entrada_palavras_aposta or "gale" in text_lower:
+            logging.info("Placar ignorado: Está misturado com sinais de entrada ou Gale.")
+            return {"ok": True, "action": "ignored_mixed_placar"}
+            
+        final_placar_message = build_simple_placar(text_lower)
+        if final_placar_message:
+            await send_telegram_message(CANAL_DESTINO_ID, final_placar_message)
+            logging.info("Placar simples enviado.")
+            return {"ok": True, "action": "placar_sent"}
 
-    last_signal_time = now
-    logging.info("Sinal (entrada forçada no BRANCO) enviado com análise IA.")
-    return {"ok": True, "action": "signal_sent_with_analysis"}
 
-@app.get("/debug/recent")
-def debug_recent(n: int = 50):
-    rows = fetch_recent_events(limit=n)
-    return {"count": len(rows), "rows": rows}
+    # === AVALIAÇÃO DE ENTRADA BRANCO / G0 (FILTRO AGRESSIVO) ===
+    contains_branco = "branco" in text_lower or "⚪" in text or "⬜" in text
+    
+    # FILTRO AGRESSIVO: Rejeita TUDO que não for sinal BRANCO G0 puro
+    contains_sujeira_entrada = (
+        "gale" in text_lower or "gales" in text_lower or 
+        "preto" in text_lower or "vermelho" in text_lower or "verde" in text_lower or 
+        "⚫" in text_lower or "🔴" in text_lower or "🟢" in text_lower or 
+        "vitória" in text_lower or "loss" in text_lower or "✅" in text_lower or 
+        "perda" in text_lower
+    )
+
+    if not contains_branco:
+        logging.info("Sinal ignorado: Não contém a palavra/emoji 'BRANCO'.")
+        return {"ok": True, "action": "ignored_not_branco"}
+
+    if contains_sujeira_entrada:
+        logging.info("Sinal ignorado: Contém BRANCO, mas também SUJEIRA (GALE, CORES, RESULTADO).")
+        return {"ok": True, "action": "ignored_mixed_signal_not_g0"}
+    
+    # 4. COOLDOWN (APENAS PARA SINAIS DE ENTRADA LIMPA)
+    current_time = time.time()
+    if current_time - last_signal_time < COOLDOWN_SECONDS:
+        logging.info(f"Sinal ignorado devido ao COOLDOWN.")
+        return {"ok": True, "action": "ignored_cooldown"}
+        
+    # Envia o modelo de entrada limpa
+    final_message = build_final_message() 
+    await send_telegram_message(CANAL_DESTINO_ID, final_message)
+    
+    last_signal_time = current_time 
+    
+    logging.info("Sinal (Filtrado por Texto) enviado!")
+    return {"ok": True, "action": "signal_sent_text_filter"}
