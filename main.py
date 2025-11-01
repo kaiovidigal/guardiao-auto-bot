@@ -1,4 +1,4 @@
-# main.py - Versão FINAL COM APRENDIZADO, Persistência de Disco, LÓGICA DE TEMPO e FILTRO 0% (Modo Destravado)
+# main.py - Versão FINAL COM INTEGRAÇÃO GEMINI (Modo Destravado: Coleta de Dados)
 
 import os
 import sqlite3
@@ -9,6 +9,10 @@ from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException
 import httpx 
 
+# Importações do Gemini (Adicionadas)
+from google import genai 
+from google.genai import types
+
 # ====================================================================
 # CONFIGURAÇÃO GERAL E LOGGING
 # ====================================================================
@@ -17,6 +21,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # VARIÁVEIS DE AMBIENTE (Lidas do Render)
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "").strip()
 WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN", "default_secret_token").strip() 
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", None) # Nova chave do Gemini
 
 # IDs dos Canais (Lidos de ENVs)
 CANAL_ORIGEM_IDS_STR = os.environ.get("CANAL_ORIGEM_IDS", "-1003156785631").strip()
@@ -38,7 +43,7 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 # CONFIGURAÇÃO DE APRENDIZADO E FILTRAGEM
 # ====================================================================
 MIN_JOGADAS_APRENDIZADO = 10
-# AJUSTE CHAVE: Confiança mínima para enviar. 0.0 significa que envia qualquer um para começar a coletar dados.
+# MODO DESTRAVADO: Confiança mínima para enviar. 0.0 garante que envie para COLETAR DADOS.
 PERCENTUAL_MINIMO_CONFIANCA = 0.0 
 
 # Variável de estado global para armazenar o ÚLTIMO SINAL ENVIADO (Chave com Tempo)
@@ -52,7 +57,6 @@ DB_NAME = os.path.join(DB_MOUNT_PATH, 'double_jonbet_data.db')
 
 def setup_db():
     os.makedirs(DB_MOUNT_PATH, exist_ok=True)
-    # check_same_thread=False é crucial para FastAPI/Async
     conn = sqlite3.connect(DB_NAME, check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute('''
@@ -69,53 +73,106 @@ def setup_db():
 conn, cursor = setup_db()
 
 def get_performance(sinal):
-    """Retorna a performance e a confiança de um sinal."""
+    """Retorna a performance, confiança e histórico (jogadas e acertos) de um sinal."""
     cursor.execute("SELECT jogadas_analisadas, acertos_branco FROM sinais_performance WHERE sinal_original = ?", (sinal,))
     data = cursor.fetchone()
+    
     if data:
         analisadas, acertos = data
         if analisadas > 0:
             confianca = (acertos / analisadas) * 100
-            return analisadas, confianca
-        return analisadas, 0.0
+            # Retorna o histórico de jogadas/acertos para ser usado no prompt do Gemini
+            historico_string = f"JOGADAS: {analisadas}, ACERTOS BRANCO: {acertos}"
+            return analisadas, confianca, historico_string
+        return 0, 0.0, "JOGADAS: 0, ACERTOS BRANCO: 0"
     
     cursor.execute("INSERT OR IGNORE INTO sinais_performance (sinal_original) VALUES (?)", (sinal,))
     conn.commit()
-    return 0, 0.0
+    return 0, 0.0, "JOGADAS: 0, ACERTOS BRANCO: 0"
 
-def deve_enviar_sinal(sinal):
-    """Lógica da 'IA' para decidir o envio."""
-    analisadas, confianca = get_performance(sinal)
+# ----------------------------------------------------
+# NOVA FUNÇÃO DE ANÁLISE PREDITIVA COM GEMINI
+# ----------------------------------------------------
+
+async def analisar_com_gemini(sinal_com_tempo: str, historico_db: str):
+    """Envia o sinal atual e os dados históricos para o Gemini para uma previsão contextual."""
     
-    if analisadas < MIN_JOGADAS_APRENDIZADO: 
-        return True, "APRENDIZADO"
-
-    # Esta condição agora é True para qualquer confiança maior que 0.0
-    if confianca > PERCENTUAL_MINIMO_CONFIANCA:
-        return True, "COLETA_DADOS"
+    if not GEMINI_API_KEY:
+        logging.warning("GEMINI_API_KEY não configurada. Pulando análise Gemini.")
+        return None, "FALHA_CHAVE_API"
         
-    return False, "BLOQUEIO_ZERO_CONFIANÇA"
+    try:
+        # Inicializa o cliente Gemini
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        
+        # Constrói o Prompt para o Gemini
+        prompt = (
+            f"Você é um analista de cassino focado em otimizar a aposta no BRANCO no jogo Double."
+            f"Sua tarefa é prever a probabilidade percentual de WIN no BRANCO para o sinal atual, usando o contexto histórico fornecido."
+            f"SINAL DE ENTRADA: {sinal_com_tempo}\n"
+            f"HISTÓRICO NO BANCO DE DADOS (JOGADAS neste padrão): {historico_db}\n\n"
+            f"Regra: Retorne APENAS o número inteiro de 0 a 100 que representa a probabilidade percentual (sem símbolos ou texto)."
+        )
+        
+        # Chama a API
+        response = await client.models.generate_content(
+            model='gemini-2.5-flash', # Modelo rápido
+            contents=prompt
+        )
+        
+        # Tenta extrair a previsão (número)
+        confianca_gemini = int(re.sub(r'\D', '', response.text).strip())
+        
+        if 0 <= confianca_gemini <= 100:
+            return confianca_gemini, "PREVISÃO_GEMINI"
+        else:
+            logging.error(f"Resposta Gemini inválida: {response.text}")
+            return None, "RESPOSTA_GEMINI_INVALIDA"
+            
+    except Exception as e:
+        logging.error(f"Erro ao chamar a API Gemini: {e}")
+        return None, "ERRO_CHAMADA_API"
 
-def atualizar_performance(sinal, is_win):
-    """Atualiza o DB com o resultado da rodada."""
-    novo_acerto = 1 if is_win else 0
-    
-    cursor.execute("""
-    UPDATE sinais_performance SET 
-        jogadas_analisadas = jogadas_analisadas + 1, 
-        acertos_branco = acertos_branco + ?
-    WHERE sinal_original = ?
-    """, (novo_acerto, sinal))
-    
-    conn.commit()
-    logging.info(f"DB Atualizado: {sinal} - WIN BRANCO: {is_win}")
+# ----------------------------------------------------
+# FUNÇÃO DE DECISÃO DE ENVIO
+# ----------------------------------------------------
 
-# ====================================================================
-# FUNÇÃO DE ENVIO DE MENSAGENS TELEGRAM
-# ====================================================================
+async def deve_enviar_sinal(sinal: str):
+    """Combina a lógica estatística com a análise preditiva do Gemini."""
+    
+    analisadas, confianca_estatistica, historico_db = get_performance(sinal)
+    
+    # 1. Modo APRENDIZADO (Envio garantido para coletar dados)
+    if analisadas < MIN_JOGADAS_APRENDIZADO: 
+        # O bot envia para coletar os primeiros 10 dados, independentemente da confiança.
+        return True, "APRENDIZADO_BRUTO", confianca_estatistica
+    
+    # 2. Análise Preditiva do Gemini
+    confianca_gemini, modo_gemini = await analisar_com_gemini(sinal, historico_db)
+    
+    if confianca_gemini is not None:
+        # Se a IA Gemini conseguiu prever, usamos a previsão dela para o envio
+        
+        # *AQUI É ONDE VOCÊ CONTROLARÁ O FILTRO FUTURO:*
+        # Por enquanto, mantemos 0.0 para envio total (Modo Destravado)
+        if confianca_gemini > PERCENTUAL_MINIMO_CONFIANCA: 
+            return True, modo_gemini, confianca_gemini
+        else:
+            # Bloqueia se a previsão do Gemini for menor que o filtro
+            return False, "BLOQUEIO_GEMINI", confianca_gemini
+
+    # 3. Falha no Gemini (Volta para a estatística bruta para garantir o funcionamento)
+    
+    # Como o PERCENTUAL_MINIMO_CONFIANCA está em 0.0, ele enviará sempre que houver falha no Gemini
+    if confianca_estatistica > PERCENTUAL_MINIMO_CONFIANCA:
+        return True, "ESTATISTICA_FALLBACK", confianca_estatistica
+        
+    return False, "BLOQUEIO_ZERO_CONFIANÇA", confianca_estatistica
+
 
 async def tg_send_message(chat_id: int, text: str):
-    """Envia uma mensagem assíncrona usando a API HTTP do Telegram."""
+    # ... (código da função tg_send_message permanece o mesmo) ...
+    # (Removido aqui por brevidade, mas deve estar no seu arquivo)
     if not BOT_TOKEN:
         logging.critical("BOT_TOKEN não configurado. Não é possível enviar mensagem.")
         return False
@@ -191,8 +248,7 @@ async def telegram_webhook(token: str, request: Request):
         # CHAVE DE APRENDIZADO COMPLETA (texto + tempo)
         sinal_com_tempo = f"{sinal_limpo_texto} | {hora_minuto_atual}"
         
-        deve_enviar, modo = deve_enviar_sinal(sinal_com_tempo) # Usa o sinal com tempo
-        analisadas, confianca = get_performance(sinal_com_tempo)
+        deve_enviar, modo, confianca = await deve_enviar_sinal(sinal_com_tempo) # Agora é assíncrona
         
         if deve_enviar:
             sinal_convertido = (
@@ -200,8 +256,8 @@ async def telegram_webhook(token: str, request: Request):
                 f"🎯 JOGO: **Double JonBet**\n"
                 f"🔥 FOCO TOTAL NO **BRANCO** 🔥\n\n"
                 f"⏰ Entrada às: **{hora_minuto_atual}**\n"
-                f"📊 Confiança: `{confianca:.2f}%` (Base: {analisadas} análises)\n"
-                f"🔔 Sinal Original: {sinal_limpo_texto}" # Mostra apenas o texto para o usuário
+                f"📊 Confiança: `{confianca:.2f}%` (Modo: {modo})\n"
+                f"🔔 Sinal Original: {sinal_limpo_texto}"
             )
             
             await tg_send_message(CANAL_DESTINO_ID, sinal_convertido)
@@ -212,7 +268,7 @@ async def telegram_webhook(token: str, request: Request):
             logging.warning(f"Sinal ENVIADO: '{sinal_com_tempo}'. Esperando feedback em {CANAL_FEEDBACK_ID}.")
         
         else:
-            logging.info(f"Sinal IGNORADO: '{sinal_com_tempo}'. Confiança: {confianca:.2f}%")
+            logging.info(f"Sinal IGNORADO: '{sinal_com_tempo}'. Confiança: {confianca:.2f}% (Motivo: {modo})")
             
         return {"ok": True, "action": "processed_sinal"}
 
@@ -228,23 +284,17 @@ async def telegram_webhook(token: str, request: Request):
         
         # Lógica de Feedback:
         is_feedback_received = any(k in feedback_text for k in ["VITÓRIA", "GREEN", "LOSS", "RED", "PERDEU", "GANHOU", "GANHO"])
-        
-        # SÓ conta como WIN se houver a palavra "BRANCO" ou o emoji ⚪
         is_win_branco = "BRANCO" in feedback_text or "⚪" in text
         
         is_win = False
-        is_loss = False
-
+        
         if is_win_branco:
-            # WIN EXCLUSIVO DO BRANCO
             is_win = True
-            is_loss = False
         elif is_feedback_received:
             # Qualquer outro resultado de rodada é LOSS para o sistema do BRANCO
             is_win = False
-            is_loss = True
             
-        if is_win or is_loss:
+        if is_win_branco or is_feedback_received:
             sinal_para_atualizar = LAST_SENT_SIGNAL["text"]
             
             atualizar_performance(sinal_para_atualizar, is_win)
