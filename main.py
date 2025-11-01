@@ -9,7 +9,7 @@ from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException
 import httpx 
 
-# Importações do Gemini (Adicionadas)
+# Importações do Gemini
 from google import genai 
 from google.genai import types
 
@@ -21,7 +21,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # VARIÁVEIS DE AMBIENTE (Lidas do Render)
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "").strip()
 WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN", "default_secret_token").strip() 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", None) # Nova chave do Gemini
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", None) # Chave do Gemini (Fornecida nas ENVs)
 
 # IDs dos Canais (Lidos de ENVs)
 CANAL_ORIGEM_IDS_STR = os.environ.get("CANAL_ORIGEM_IDS", "-1003156785631").strip()
@@ -90,6 +90,28 @@ def get_performance(sinal):
     conn.commit()
     return 0, 0.0, "JOGADAS: 0, ACERTOS BRANCO: 0"
 
+# --- FUNÇÃO CORRIGIDA (CRUCIAL PARA PERSISTÊNCIA) ---
+def atualizar_performance(sinal, is_win):
+    """Atualiza o histórico de jogadas e acertos no banco de dados."""
+    cursor.execute("SELECT jogadas_analisadas, acertos_branco FROM sinais_performance WHERE sinal_original = ?", (sinal,))
+    data = cursor.fetchone()
+    
+    if not data:
+        # Insere se o sinal não existe
+        cursor.execute("INSERT INTO sinais_performance (sinal_original, jogadas_analisadas, acertos_branco) VALUES (?, 1, ?)", 
+                       (sinal, 1 if is_win else 0))
+    else:
+        jogadas, acertos = data
+        jogadas += 1
+        acertos += 1 if is_win else 0
+        cursor.execute("UPDATE sinais_performance SET jogadas_analisadas = ?, acertos_branco = ? WHERE sinal_original = ?", 
+                       (jogadas, acertos, sinal))
+                       
+    conn.commit()
+    logging.info(f"Performance atualizada para '{sinal}'. Win: {is_win}.")
+# ----------------------------------------------------
+
+
 # ----------------------------------------------------
 # NOVA FUNÇÃO DE ANÁLISE PREDITIVA COM GEMINI
 # ----------------------------------------------------
@@ -97,6 +119,7 @@ def get_performance(sinal):
 async def analisar_com_gemini(sinal_com_tempo: str, historico_db: str):
     """Envia o sinal atual e os dados históricos para o Gemini para uma previsão contextual."""
     
+    # 1. Checagem da Chave de API
     if not GEMINI_API_KEY:
         logging.warning("GEMINI_API_KEY não configurada. Pulando análise Gemini.")
         return None, "FALHA_CHAVE_API"
@@ -115,12 +138,13 @@ async def analisar_com_gemini(sinal_com_tempo: str, historico_db: str):
         )
         
         # Chama a API
-        response = await client.models.generate_content(
+        response = client.models.generate_content(
             model='gemini-2.5-flash', # Modelo rápido
             contents=prompt
         )
         
         # Tenta extrair a previsão (número)
+        # Usa re.sub para limpar qualquer caractere não numérico
         confianca_gemini = int(re.sub(r'\D', '', response.text).strip())
         
         if 0 <= confianca_gemini <= 100:
@@ -148,31 +172,31 @@ async def deve_enviar_sinal(sinal: str):
         return True, "APRENDIZADO_BRUTO", confianca_estatistica
     
     # 2. Análise Preditiva do Gemini
+    # NOTA: O cliente Gemini usa HTTPX internamente, o que é compatível com o asyncio
     confianca_gemini, modo_gemini = await analisar_com_gemini(sinal, historico_db)
     
     if confianca_gemini is not None:
         # Se a IA Gemini conseguiu prever, usamos a previsão dela para o envio
         
-        # *AQUI É ONDE VOCÊ CONTROLARÁ O FILTRO FUTURO:*
-        # Por enquanto, mantemos 0.0 para envio total (Modo Destravado)
+        # *MODO DESTRAVADO*
         if confianca_gemini > PERCENTUAL_MINIMO_CONFIANCA: 
             return True, modo_gemini, confianca_gemini
         else:
-            # Bloqueia se a previsão do Gemini for menor que o filtro
+            # Bloqueia se a previsão do Gemini for menor que 0.0% (nunca deveria acontecer no modo destravado)
             return False, "BLOQUEIO_GEMINI", confianca_gemini
 
     # 3. Falha no Gemini (Volta para a estatística bruta para garantir o funcionamento)
     
-    # Como o PERCENTUAL_MINIMO_CONFIANCA está em 0.0, ele enviará sempre que houver falha no Gemini
-    if confianca_estatistica > PERCENTUAL_MINIMO_CONFIANCA:
+    # Como o PERCENTUAL_MINIMO_CONFIANCA está em 0.0, ele enviará sempre
+    if confianca_estatistica >= PERCENTUAL_MINIMO_CONFIANCA:
         return True, "ESTATISTICA_FALLBACK", confianca_estatistica
         
     return False, "BLOQUEIO_ZERO_CONFIANÇA", confianca_estatistica
 
 
 async def tg_send_message(chat_id: int, text: str):
-    # ... (código da função tg_send_message permanece o mesmo) ...
-    # (Removido aqui por brevidade, mas deve estar no seu arquivo)
+    """Envia a mensagem para o Telegram usando httpx."""
+    
     if not BOT_TOKEN:
         logging.critical("BOT_TOKEN não configurado. Não é possível enviar mensagem.")
         return False
@@ -186,6 +210,7 @@ async def tg_send_message(chat_id: int, text: str):
     }
     
     try:
+        # Usa httpx para requisições assíncronas (async)
         async with httpx.AsyncClient(timeout=10) as client:
             response = await client.post(url, json=payload)
             response.raise_for_status() 
@@ -248,7 +273,7 @@ async def telegram_webhook(token: str, request: Request):
         # CHAVE DE APRENDIZADO COMPLETA (texto + tempo)
         sinal_com_tempo = f"{sinal_limpo_texto} | {hora_minuto_atual}"
         
-        deve_enviar, modo, confianca = await deve_enviar_sinal(sinal_com_tempo) # Agora é assíncrona
+        deve_enviar, modo, confianca = await deve_enviar_sinal(sinal_com_tempo) # Chamada assíncrona
         
         if deve_enviar:
             sinal_convertido = (
@@ -276,8 +301,8 @@ async def telegram_webhook(token: str, request: Request):
     elif chat_id == CANAL_FEEDBACK_ID:
         logging.info("Mensagem roteada para PROCESSAMENTO DE FEEDBACK.")
         
-        if LAST_SENT_SIGNAL["text"] is None:
-            logging.warning("Feedback recebido, mas nenhum sinal recente pendente.")
+        if LAST_SENT_SIGNAL["text"] is None or (time.time() - LAST_SENT_SIGNAL["timestamp"]) > 3600: # Ignora feedback antigo (> 1h)
+            logging.warning("Feedback recebido, mas nenhum sinal recente pendente ou sinal expirado.")
             return {"ok": True, "action": "feedback_ignored_no_signal"}
 
         feedback_text = text.strip().upper()
