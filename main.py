@@ -10,33 +10,25 @@ from google import genai
 from google.genai import types
 
 # --- CONFIGURAÇÕES DE AMBIENTE ---
-# Puxe variáveis de ambiente ou use valores de fallback
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "SEU_BOT_TOKEN_AQUI")
-WEBHOOK_TOKEN: str = os.getenv("WEBHOOK_TOKEN", "Jonbet") # Seu token de seguranca
+WEBHOOK_TOKEN: str = os.getenv("WEBHOOK_TOKEN", "Jonbet")
 CANAL_ORIGEM_IDS_STR: str = os.getenv("CANAL_ORIGEM_IDS", "")
 CANAL_DESTINO_ID: str = os.getenv("CANAL_DESTINO_ID", "")
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 
-# Configuração de Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# Conversão de IDs de Canal (lista de strings)
 CANAL_ORIGEM_IDS: List[str] = [id.strip() for id in CANAL_ORIGEM_IDS_STR.split(',') if id.strip()]
-
-# URLs da API do Telegram
 TELEGRAM_API_URL: str = f"https://api.telegram.org/bot{BOT_TOKEN}"
 SEND_MESSAGE_URL: str = f"{TELEGRAM_API_URL}/sendMessage"
 
-# --- CONFIGURAÇÕES DE ESTADO (Para evitar duplicação - COOLDOWN) ---
-# O servidor manterá esta variável na memória enquanto estiver ativo.
+# --- CONFIGURAÇÕES DE ESTADO ---
 last_signal_time = 0
-COOLDOWN_SECONDS = 30 # Tempo mínimo entre o envio de sinais (em segundos)
+COOLDOWN_SECONDS = 30 
 
 # --- CONFIGURAÇÕES DE IA E CONFIANÇA ---
-# Modo Destravado (APRENDIZADOBRUTO)
-PERCENTUAL_MINIMO_CONFIANCA: float = float(os.getenv("MIN_CONFIDENCE", "0.0"))
+# Recomendado: Mantenha em 1.0. Se for 0.0, o modo APRENDIZADOBRUTO aceitará sinais misturados.
+PERCENTUAL_MINIMO_CONFIANCA: float = float(os.getenv("MIN_CONFIDENCE", "1.0"))
 
-# Inicialização da API do Gemini
 try:
     if GEMINI_API_KEY:
         genai_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -63,8 +55,8 @@ SYSTEM_INSTRUCTION = (
 
 def analyze_message_with_gemini(message_text: str) -> Optional[Dict[str, Any]]:
     """Envia a mensagem para o Gemini para análise e pontuação."""
-    if not genai_client:
-        return None
+    global genai_client
+    if not genai_client: return None
 
     try:
         response = genai_client.models.generate_content(
@@ -75,29 +67,25 @@ def analyze_message_with_gemini(message_text: str) -> Optional[Dict[str, Any]]:
                 response_mime_type="application/json",
             )
         )
-        
         json_output = json.loads(response.text)
-        
         if "confianca" in json_output and "justificativa" in json_output:
             json_output["confianca"] = max(0.0, min(100.0, float(json_output["confianca"])))
             return json_output
         else:
             logging.error("Resposta da IA com formato JSON inválido.")
             return None
-
     except Exception as e:
         logging.error(f"Erro na comunicação ou processamento da IA: {e}")
         return None
 
 def build_final_message(ai_analysis: Dict[str, Any]) -> str:
-    """Formata a mensagem final com análise da IA, SEM O SINAL ORIGINAL."""
+    """Formata a mensagem de ENTRADA BRANCO PADRÃO e LIMPA (MODELO 1)."""
     confianca: float = ai_analysis.get("confianca", 0.0)
     justificativa: str = ai_analysis.get("justificativa", "Análise indisponível.")
 
     modo = "APRENDIZADOBRUTO" if PERCENTUAL_MINIMO_CONFIANCA == 0.0 else "PRODUÇÃO"
 
-    # --- MENSAGEM FINAL PADRÃO E LIMPA ---
-    final_message = (
+    return (
         f"🚨 **ENTRADA IMEDIATA NO BRANCO!** ⚪️\n\n"
         f"🎯 JOGO: Double JonBet\n"
         f"🔥 FOCO: BRANCO\n"
@@ -105,20 +93,29 @@ def build_final_message(ai_analysis: Dict[str, Any]) -> str:
         f"🧠 Análise Gemini: _{justificativa}_\n\n"
         f"⚠️ **ESTRATÉGIA: G0 (ZERO GALES).**\n"
         f"💻 Site: Acessar Double"
-    )
-    # --- FIM DA MENSAGEM PADRÃO ---
+    )[:4096]
 
-    return final_message[:4096]
+def build_simple_placar(text_lower: str) -> Optional[str]:
+    """Cria a mensagem de Placar Simples (GREEN/LOSS) (MODELOS 2 E 3)."""
+    
+    # Regras de inferência (Branco = GREEN, Cores = LOSS)
+    contem_branco = "branco" in text_lower or "⚪" in text_lower or "⬜" in text_lower
+    contem_cores = "preto" in text_lower or "vermelho" in text_lower or "verde" in text_lower or "⚫" in text_lower or "🔴" in text_lower or "🟢" in text_lower
+    
+    # 1. Identificar GREEN
+    if contem_branco or "green" in text_lower or "vitória" in text_lower or "✅" in text_lower:
+        return f"✅ **GREEN!** 🤑\n\nÚltimo resultado no Double JonBet."
+    
+    # 2. Identificar LOSS
+    if contem_cores or "loss" in text_lower or "perda" in text_lower:
+        return f"❌ **LOSS!** 😥\n\nPronto para o próximo sinal de entrada."
+        
+    return None
+
 
 async def send_telegram_message(chat_id: str, text: str):
     """Envia a mensagem formatada para o canal de destino."""
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": True
-    }
-    
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True}
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(SEND_MESSAGE_URL, json=payload, timeout=10)
@@ -133,107 +130,81 @@ async def send_telegram_message(chat_id: str, text: str):
 # --- ENDPOINTS DA APLICAÇÃO ---
 
 @app.get("/")
-def read_root():
-    """Endpoint de saúde para verificar se o serviço está vivo."""
-    return {"status": "ok", "service": "Jonbet Telegram Bot is running."}
+def read_root(): return {"status": "ok", "service": "Jonbet Telegram Bot is running."}
 
 @app.post(f"/webhook/{{webhook_token}}")
 async def telegram_webhook(webhook_token: str, request: Request):
-    """Manipula as requisições Webhook do Telegram."""
     
-    # 1. VERIFICAÇÃO DO TOKEN DE SEGURANÇA
-    if webhook_token != WEBHOOK_TOKEN:
-        logging.error(f"Tentativa de acesso com token inválido: {webhook_token}")
-        raise HTTPException(status_code=403, detail="Token de segurança inválido.")
+    if webhook_token != WEBHOOK_TOKEN: raise HTTPException(status_code=403, detail="Token de segurança inválido.")
 
-    try:
-        data = await request.json()
-    except json.JSONDecodeError:
-        logging.error("Payload não é um JSON válido.")
-        raise HTTPException(status_code=400, detail="Payload inválido.")
-
-    # 2. EXTRAÇÃO E VERIFICAÇÃO BÁSICA
-    if "message" not in data:
-        return {"ok": True, "action": "ignored_no_message"}
-
-    message: Dict[str, Any] = data["message"]
-    chat_id: Optional[int] = message.get("chat", {}).get("id")
-    text: Optional[str] = message.get("text")
-
-    if not chat_id or not text:
-        return {"ok": True, "action": "ignored_no_text_or_chat"}
+    try: data = await request.json()
+    except json.JSONDecodeError: raise HTTPException(status_code=400, detail="Payload inválido.")
+    
+    message = data.get("message", {})
+    chat_id = message.get("chat", {}).get("id")
+    text = message.get("text")
+    if not chat_id or not text: return {"ok": True, "action": "ignored_no_text_or_chat"}
 
     global last_signal_time
-    logging.info(f"Mensagem recebida de Chat ID: {chat_id}")
-
-    # 3. FILTRAGEM DE CANAL DE ORIGEM
+    text_lower = text.lower()
+    
     chat_id_str = str(chat_id)
-    if chat_id_str not in CANAL_ORIGEM_IDS:
-        logging.info(f"Mensagem ignorada: ID de chat {chat_id} não é um canal de origem configurado.")
-        return {"ok": True, "action": "ignored_wrong_source"}
-
+    if chat_id_str not in CANAL_ORIGEM_IDS: return {"ok": True, "action": "ignored_wrong_source"}
+    
     logging.info("Mensagem roteada para PROCESSAMENTO DE SINAL.")
 
+    # --- BLOCO DE FILTRAGEM: PLACAR OU ENTRADA? ---
 
-    # --- BLOCO DE FILTRAGEM DE CONTEÚDO: FOCO TOTAL NO BRANCO ---
-    text_lower = text.lower()
+    is_placar = "loss" in text_lower or "perda" in text_lower or "vitória" in text_lower or "✅" in text_lower or "🟢" in text_lower
+    contains_entrada_palavras_aposta = "aposta" in text_lower or "entrar" in text_lower or "duplo" in text_lower
 
-    # 1. Deve conter BRANCO para ser considerado.
+    
+    # === AVALIAÇÃO DE PLACAR/RESULTADO ===
+    if is_placar:
+        # Rejeita placar se for misturado com GALE ou palavras de entrada (tipo: "VITÓRIA! Aposta de novo!")
+        if contains_entrada_palavras_aposta or "gale" in text_lower:
+            logging.info("Placar ignorado: Está misturado com sinais de entrada ou Gale.")
+            return {"ok": True, "action": "ignored_mixed_placar"}
+            
+        final_placar_message = build_simple_placar(text_lower)
+        if final_placar_message:
+            await send_telegram_message(CANAL_DESTINO_ID, final_placar_message)
+            logging.info("Placar simples enviado.")
+            return {"ok": True, "action": "placar_sent"}
+
+
+    # === AVALIAÇÃO DE ENTRADA BRANCO / G0 ===
     contains_branco = "branco" in text_lower or "⚪" in text or "⬜" in text
-
-    # 2. NÃO DEVE conter outras CORES, GALE, WIN, ou MARTINGALE. (FILTRO MÁXIMO)
-    contains_outras_cores_ou_gale = (
-        "preto" in text_lower or "⚫" in text_lower or 
-        "vermelho" in text_lower or "🔴" in text_lower or
-        "verde" in text_lower or "🟢" in text_lower or
-        "gale" in text_lower or "gales" in text_lower or 
-        "✅" in text_lower or "win" in text_lower or 
-        "loss" in text_lower or "perda" in text_lower # Exclui LOSS
-    )
+    contains_gale_ou_cores_mistas = "gale" in text_lower or "gales" in text_lower or "preto" in text_lower or "vermelho" in text_lower or "verde" in text_lower or "⚫" in text_lower or "🔴" in text_lower or "🟢" in text_lower
 
     if not contains_branco:
         logging.info("Sinal ignorado: Não contém a palavra/emoji 'BRANCO'.")
         return {"ok": True, "action": "ignored_not_branco"}
 
-    if contains_outras_cores_ou_gale:
-        logging.info("Sinal ignorado: Contém BRANCO, mas também contém GALE, WIN, LOSS ou outras CORES (sinal misto/resultado).")
-        return {"ok": True, "action": "ignored_mixed_signal"}
-    # --- FIM DO BLOCO DE FILTRAGEM ---
-
-
-    # 4. ANÁLISE DE IA
-    if not genai_client:
-        logging.warning("IA desativada.")
-        # Se a IA estiver desativada, não envia nada (pois não temos a formatação de confiança)
-        return {"ok": True, "action": "ai_disabled_no_action"}
-
+    if contains_gale_ou_cores_mistas:
+        logging.info("Sinal ignorado: Contém BRANCO, mas também contém GALE ou CORES (não é G0 puro).")
+        return {"ok": True, "action": "ignored_mixed_signal_not_g0"}
+    
+    # 4. ANÁLISE DE IA E COOLDOWN (APENAS PARA SINAIS DE ENTRADA)
+    if not genai_client: return {"ok": True, "action": "ai_disabled_no_action"}
+    
     ai_analysis = analyze_message_with_gemini(text)
-    
-    if not ai_analysis:
-        logging.error("Análise da IA falhou.")
-        return {"ok": True, "action": "ai_analysis_failed"}
-    
+    if not ai_analysis: return {"ok": True, "action": "ai_analysis_failed"}
     confianca_ia = ai_analysis.get("confianca", 0.0)
 
-    # 5. FILTRO DE CONFIANÇA E ANTI-DUPLICAÇÃO
     if confianca_ia >= PERCENTUAL_MINIMO_CONFIANCA:
-        
-        # 6. FILTRO ANTI-DUPLICAÇÃO (Timestamp Lock)
         current_time = time.time()
-        
         if current_time - last_signal_time < COOLDOWN_SECONDS:
-            cooldown_remaining = COOLDOWN_SECONDS - (current_time - last_signal_time)
-            logging.info(f"Sinal ignorado devido ao COOLDOWN. {cooldown_remaining:.2f}s restantes.")
+            logging.info(f"Sinal ignorado devido ao COOLDOWN.")
             return {"ok": True, "action": "ignored_cooldown"}
             
-        # Se passou em tudo, envia a mensagem PADRÃO e LIMPA
         final_message = build_final_message(ai_analysis) 
         await send_telegram_message(CANAL_DESTINO_ID, final_message)
         
-        last_signal_time = current_time # Atualiza o lock
+        last_signal_time = current_time 
         
         logging.info(f"Sinal enviado! Confiança: {confianca_ia:.2f}%")
         return {"ok": True, "action": "signal_sent", "confidence": confianca_ia}
     else:
-        logging.info(f"Sinal ignorado pelo filtro de confiança da IA: {confianca_ia:.2f}% (Mínimo: {PERCENTUAL_MINIMO_CONFIANCA:.2f}%)")
+        logging.info(f"Sinal ignorado pelo filtro de confiança da IA: {confianca_ia:.2f}%")
         return {"ok": True, "action": "ignored_low_confidence", "confidence": confianca_ia}
