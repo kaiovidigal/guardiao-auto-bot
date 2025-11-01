@@ -1,12 +1,14 @@
 # main.py - Versão FINAL COM APRENDIZADO e Persistência de Disco (WEBHOOK/FASTAPI)
+# *** MODIFICADO PARA INCLUIR HORA E MINUTO NO APRENDIZADO ***
 
 import os
 import sqlite3
 import re
 import logging
 import time
+from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException
-import httpx # Necessário para enviar mensagens assíncronas ao Telegram
+import httpx 
 
 # ====================================================================
 # CONFIGURAÇÃO GERAL E LOGGING
@@ -14,23 +16,22 @@ import httpx # Necessário para enviar mensagens assíncronas ao Telegram
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # VARIÁVEIS DE AMBIENTE (Lidas do Render)
-# ATENÇÃO: API_ID/API_HASH NÃO SÃO MAIS NECESSÁRIOS.
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "").strip()
-WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN", "default_secret_token").strip() # Novo token de segurança
+WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN", "default_secret_token").strip() 
 
 # IDs dos Canais (Lidos de ENVs para maior flexibilidade no Webhook)
-CANAL_ORIGEM_IDS_STR = os.environ.get("CANAL_ORIGEM_IDS", "-1003156785631,-1009998887776").strip()
+CANAL_ORIGEM_IDS_STR = os.environ.get("CANAL_ORIGEM_IDS", "-1003156785631").strip()
 CANAL_DESTINO_ID_STR = os.environ.get("CANAL_DESTINO_ID", "-1002796105884").strip()
-CANAL_FEEDBACK_ID_STR = os.environ.get("CANAL_FEEDBACK_ID", "-1009990001112").strip()
+CANAL_FEEDBACK_ID_STR = os.environ.get("CANAL_FEEDBACK_ID", "-1002796105884").strip()
 
-# Converte IDs de string para lista de inteiros
+# Usando seus IDs confirmados para os valores padrão de fallback:
 try:
     CANAL_ORIGEM_IDS = [int(id_.strip()) for id_ in CANAL_ORIGEM_IDS_STR.split(',') if id_.strip()]
     CANAL_DESTINO_ID = int(CANAL_DESTINO_ID_STR)
     CANAL_FEEDBACK_ID = int(CANAL_FEEDBACK_ID_STR)
 except ValueError as e:
     logging.critical(f"ERRO: IDs de canais inválidos nas ENVs. Verifique: {e}")
-    CANAL_ORIGEM_IDS, CANAL_DESTINO_ID, CANAL_FEEDBACK_ID = [], 0, 0 # Valores de falha
+    CANAL_ORIGEM_IDS, CANAL_DESTINO_ID, CANAL_FEEDBACK_ID = [], 0, 0 
 
 # URL base da API do Telegram para envio de mensagens
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
@@ -41,7 +42,7 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 MIN_JOGADAS_APRENDIZADO = 10
 PERCENTUAL_MINIMO_CONFIANCA = 79.0 
 
-# Variável de estado global para armazenar o ÚLTIMO SINAL ENVIADO (MANTIDA FORA DO DB PARA SIMPLICIDADE)
+# Variável de estado global para armazenar o ÚLTIMO SINAL ENVIADO
 LAST_SENT_SIGNAL = {"text": None, "timestamp": 0} 
 
 # ====================================================================
@@ -51,9 +52,7 @@ DB_MOUNT_PATH = os.environ.get("DB_MOUNT_PATH", "/var/data")
 DB_NAME = os.path.join(DB_MOUNT_PATH, 'double_jonbet_data.db') 
 
 def setup_db():
-    # ... (A lógica de setup_db() permanece a mesma)
     os.makedirs(DB_MOUNT_PATH, exist_ok=True)
-    # ATENÇÃO: check_same_thread=False é crucial para FastAPI/Async
     conn = sqlite3.connect(DB_NAME, check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute('''
@@ -69,8 +68,9 @@ def setup_db():
 
 conn, cursor = setup_db()
 
+# As funções de DB permanecem as mesmas, mas agora a 'sinal_original' incluirá o tempo.
 def get_performance(sinal):
-    # ... (A lógica de get_performance() permanece a mesma)
+    """Retorna a performance e a confiança de um sinal."""
     cursor.execute("SELECT jogadas_analisadas, acertos_branco FROM sinais_performance WHERE sinal_original = ?", (sinal,))
     data = cursor.fetchone()
     if data:
@@ -80,12 +80,13 @@ def get_performance(sinal):
             return analisadas, confianca
         return analisadas, 0.0
     
+    # Insere o sinal se for a primeira vez que é visto
     cursor.execute("INSERT OR IGNORE INTO sinais_performance (sinal_original) VALUES (?)", (sinal,))
     conn.commit()
     return 0, 0.0
 
 def deve_enviar_sinal(sinal):
-    # ... (A lógica de deve_enviar_sinal() permanece a mesma)
+    """Lógica da 'IA' para decidir o envio (Aprendizado e Confiança > 79%)."""
     analisadas, confianca = get_performance(sinal)
     
     if analisadas < MIN_JOGADAS_APRENDIZADO: 
@@ -97,7 +98,7 @@ def deve_enviar_sinal(sinal):
     return False, "BLOQUEIO"
 
 def atualizar_performance(sinal, is_win):
-    # ... (A lógica de atualizar_performance() permanece a mesma)
+    """Atualiza o DB com o resultado da rodada."""
     novo_acerto = 1 if is_win else 0
     
     cursor.execute("""
@@ -111,11 +112,10 @@ def atualizar_performance(sinal, is_win):
     logging.info(f"DB Atualizado: {sinal} - WIN BRANCO: {is_win}")
 
 # ====================================================================
-# FUNÇÃO DE ENVIO DE MENSAGENS TELEGRAM (AGORA HTTPX)
+# FUNÇÃO DE ENVIO DE MENSAGENS TELEGRAM
 # ====================================================================
-
+# (Sem alterações)
 async def tg_send_message(chat_id: int, text: str):
-    """Envia uma mensagem assíncrona usando a API HTTP do Telegram."""
     if not BOT_TOKEN:
         logging.critical("BOT_TOKEN não configurado. Não é possível enviar mensagem.")
         return False
@@ -153,7 +153,6 @@ app = FastAPI(title="Double JonBet IA Webhook", version="1.0")
 async def telegram_webhook(token: str, request: Request):
     global LAST_SENT_SIGNAL
     
-    # 1. VALIDAÇÃO DE SEGURANÇA
     if token != WEBHOOK_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden: Invalid Webhook Token")
 
@@ -163,11 +162,9 @@ async def telegram_webhook(token: str, request: Request):
         logging.warning("Received invalid JSON data.")
         return {"ok": True}
 
-    # Extrai a mensagem (pode vir como 'message' ou 'channel_post')
     message = data.get("message") or data.get("channel_post") or data.get("edited_channel_post") or {}
     chat = message.get("chat") or {}
     
-    # Validação mínima
     if not message or not chat:
         return {"ok": True, "skipped": "no_message"}
 
@@ -185,29 +182,36 @@ async def telegram_webhook(token: str, request: Request):
     if chat_id in CANAL_ORIGEM_IDS:
         logging.info("Mensagem roteada para PROCESSAMENTO DE SINAL.")
         
-        sinal_limpo = re.sub(r'#[0-9]+', '', text).strip() # Limpa o sinal
-        deve_enviar, modo = deve_enviar_sinal(sinal_limpo)
-        analisadas, confianca = get_performance(sinal_limpo)
+        # OBTÉM A HORA E MINUTO ATUAIS
+        hora_minuto_atual = datetime.now().strftime("%H:%M") 
+        
+        sinal_limpo_texto = re.sub(r'#[0-9]+', '', text).strip()
+        
+        # *** CHAVE DE APRENDIZADO INCLUINDO O TEMPO ***
+        sinal_com_tempo = f"{sinal_limpo_texto} | {hora_minuto_atual}"
+        
+        deve_enviar, modo = deve_enviar_sinal(sinal_com_tempo) # Usa o sinal com tempo
+        analisadas, confianca = get_performance(sinal_com_tempo)
         
         if deve_enviar:
             sinal_convertido = (
                 f"⚠️ **SINAL EXCLUSIVO BRANCO ({modo})** ⚠️\n\n"
                 f"🎯 JOGO: **Double JonBet**\n"
                 f"🔥 FOCO TOTAL NO **BRANCO** 🔥\n\n"
+                f"⏰ Hora/Minuto da Entrada: **{hora_minuto_atual}**\n"
                 f"📊 Confiança: `{confianca:.2f}%` (Base: {analisadas} análises)\n"
-                f"🔔 Sinal Original: {sinal_limpo}"
+                f"🔔 Sinal Original: {sinal_limpo_texto}" # Mostra apenas o texto para o usuário
             )
             
-            # Envia para o canal de destino
             await tg_send_message(CANAL_DESTINO_ID, sinal_convertido)
             
-            # Registra o último sinal enviado para o sistema de feedback
-            LAST_SENT_SIGNAL["text"] = sinal_limpo
+            # Registra o último sinal ENVIADO com a CHAVE COMPLETA (texto + tempo)
+            LAST_SENT_SIGNAL["text"] = sinal_com_tempo 
             LAST_SENT_SIGNAL["timestamp"] = time.time()
-            logging.warning(f"Sinal ENVIADO: '{sinal_limpo}'. Esperando feedback em {CANAL_FEEDBACK_ID}.")
+            logging.warning(f"Sinal ENVIADO: '{sinal_com_tempo}'. Esperando feedback em {CANAL_FEEDBACK_ID}.")
         
         else:
-            logging.info(f"Sinal IGNORADO: '{sinal_limpo}'. Confiança: {confianca:.2f}%")
+            logging.info(f"Sinal IGNORADO: '{sinal_com_tempo}'. Confiança: {confianca:.2f}%")
             
         return {"ok": True, "action": "processed_sinal"}
 
@@ -221,25 +225,25 @@ async def telegram_webhook(token: str, request: Request):
             logging.warning("Feedback recebido, mas nenhum sinal recente pendente.")
             return {"ok": True, "action": "feedback_ignored_no_signal"}
 
-        # Lógica para detectar WIN ou LOSS
         is_win = "WIN" in feedback_text or "GREEN" in feedback_text
         is_loss = "LOSS" in feedback_text or "RED" in feedback_text or "NO WIN" in feedback_text
         
         if is_win or is_loss:
+            # O sinal_para_atualizar AGORA contém a CHAVE COMPLETA (texto + tempo)
             sinal_para_atualizar = LAST_SENT_SIGNAL["text"]
             
-            # 1. Atualiza o DB
             atualizar_performance(sinal_para_atualizar, is_win)
             
-            # 2. Envia a confirmação para o canal de destino
+            # Formata a mensagem de confirmação
+            sinal_original_apenas_texto = sinal_para_atualizar.split('|')[0].strip()
+            
             if is_win:
-                resultado_msg = f"✅ **WIN BRANCO!** Feedback: `{feedback_text}`"
+                resultado_msg = f"✅ **WIN BRANCO!**\nSinal: `{sinal_original_apenas_texto}`. Feedback: `{feedback_text}`"
             else:
-                resultado_msg = f"❌ **LOSS BRANCO.** Feedback: `{feedback_text}`"
+                resultado_msg = f"❌ **LOSS BRANCO.**\nSinal: `{sinal_original_apenas_texto}`. Feedback: `{feedback_text}`"
                 
             await tg_send_message(CANAL_DESTINO_ID, resultado_msg)
             
-            # 3. Limpa o estado
             LAST_SENT_SIGNAL["text"] = None 
             logging.info("Estado de feedback limpo. Pronto para o próximo sinal.")
             
@@ -254,9 +258,6 @@ async def telegram_webhook(token: str, request: Request):
         logging.info(f"Mensagem de chat {chat_id} ignorada (Não é origem ou feedback).")
         return {"ok": True, "action": "chat_ignored"}
 
-# ----------------------------------------
-# ROTA DE STATUS (Health Check)
-# ----------------------------------------
 @app.get("/")
 async def health_check():
     return {"status": "running", "service": "Double JonBet Webhook IA", "db_path": DB_NAME}
