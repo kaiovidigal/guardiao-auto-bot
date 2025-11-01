@@ -28,14 +28,10 @@ TELEGRAM_API_URL: str = f"https://api.telegram.org/bot{BOT_TOKEN}"
 SEND_MESSAGE_URL: str = f"{TELEGRAM_API_URL}/sendMessage"
 
 # --- CONFIGURAÇÕES DE ESTADO (Para evitar duplicação) ---
-# Variável Global de Estado para rastrear o último envio.
-# O valor será mantido enquanto o servidor Uvicorn estiver ativo.
 last_signal_time = 0
 COOLDOWN_SECONDS = 30 # Tempo mínimo entre o envio de sinais (em segundos)
 
 # --- CONFIGURAÇÕES DE IA E CONFIANÇA ---
-# Modo Destravado: Permite que a IA envie sinais com qualquer confiança para fins de aprendizado/teste.
-# Valor usado: 0.0, conforme o modo APRENDIZADOBRUTO.
 PERCENTUAL_MINIMO_CONFIANCA: float = float(os.getenv("MIN_CONFIDENCE", "0.0"))
 
 # Inicialização da API do Gemini
@@ -53,13 +49,12 @@ except Exception as e:
 app = FastAPI()
 
 # --- MODELO DE IA ---
-# Instruções para o Gemini: Foco no BRANCO e na formatação correta.
 SYSTEM_INSTRUCTION = (
     "Você é um especialista em análise de sinais para jogos de Double/Roleta, focado exclusivamente na cor BRANCO. "
     "Sua única tarefa é analisar o texto da mensagem de entrada. Você deve seguir estritamente as seguintes regras: "
     "1. Seu FOCO É EXCLUSIVO NO BRANCO. Você deve analisar a mensagem e determinar se ela está sugerindo uma aposta ou padrão que favorece o BRANCO (⚪). "
     "2. Se a mensagem for sobre BRANCO, você deve gerar uma 'Confiança' (score de 0.0 a 100.0) e uma 'Justificativa'. "
-    "3. Se a mensagem for sobre outras cores (PRETO, VERMELHO, etc.) ou for MISTURADA e você não conseguir extrair uma indicação clara de BRANCO, sua Confiança DEVE SER SEMPRE 0.0. "
+    "3. Se a mensagem for sobre outras cores (PRETO, VERMELHO, VERDE etc.) ou for MISTURADA e você não conseguir extrair uma indicação clara de BRANCO, sua Confiança DEVE SER SEMPRE 0.0. "
     "4. SUA RESPOSTA DEVE SER APENAS O JSON, NADA MAIS. O JSON DEVE SEGUIR ESTA ESTRUTURA RIGOROSA: "
     '{"confianca": <float entre 0.0 e 100.0>, "justificativa": "<string explicando a confiança em até 50 palavras>"}'
 )
@@ -79,10 +74,8 @@ def analyze_message_with_gemini(message_text: str) -> Optional[Dict[str, Any]]:
             )
         )
         
-        # O modelo deve retornar um JSON válido
         json_output = json.loads(response.text)
         
-        # Validação básica da estrutura
         if "confianca" in json_output and "justificativa" in json_output:
             json_output["confianca"] = max(0.0, min(100.0, float(json_output["confianca"])))
             return json_output
@@ -114,7 +107,6 @@ def build_final_message(original_text: str, ai_analysis: Dict[str, Any]) -> str:
         f"🔔 Sinal Original: {original_text}"
     )
 
-    # Garante que o texto final não exceda o limite do Telegram (4096 caracteres)
     final_message = header + footer
     return final_message[:4096]
 
@@ -183,21 +175,25 @@ async def telegram_webhook(webhook_token: str, request: Request):
     logging.info("Mensagem roteada para PROCESSAMENTO DE SINAL.")
 
 
-    # --- BLOCO DE FILTRAGEM DE CONTEÚDO: FOCO TOTAL NO BRANCO ---
+    # --- BLOCO DE FILTRAGEM DE CONTEÚDO: FOCO TOTAL NO BRANCO (Inclui exclusão de VERDE) ---
     text_lower = text.lower()
 
     # 1. Deve conter BRANCO para ser considerado.
-    contains_branco = "branco" in text_lower or "⚪" in text
+    contains_branco = "branco" in text_lower or "⚪" in text or "⬜" in text
 
-    # 2. NÃO DEVE conter PRETO ou VERMELHO/OUTRAS CORES, pois é um sinal misturado.
-    contains_preto_ou_vermelho = "preto" in text_lower or "⚫" in text_lower or "🔴" in text_lower
+    # 2. NÃO DEVE conter PRETO, VERMELHO ou VERDE, pois é um sinal misturado.
+    contains_outras_cores = (
+        "preto" in text_lower or "⚫" in text_lower or 
+        "vermelho" in text_lower or "🔴" in text_lower or
+        "verde" in text_lower or "🟢" in text_lower
+    )
 
     if not contains_branco:
         logging.info("Sinal ignorado: Não contém a palavra/emoji 'BRANCO'.")
         return {"ok": True, "action": "ignored_not_branco"}
 
-    if contains_preto_ou_vermelho:
-        logging.info("Sinal ignorado: Contém BRANCO, mas está misturado com PRETO/VERMELHO.")
+    if contains_outras_cores:
+        logging.info("Sinal ignorado: Contém BRANCO, mas está misturado com outras cores (PRETO/VERMELHO/VERDE).")
         return {"ok": True, "action": "ignored_mixed_signal"}
     # --- FIM DO BLOCO DE FILTRAGEM ---
 
@@ -205,7 +201,6 @@ async def telegram_webhook(webhook_token: str, request: Request):
     # 4. ANÁLISE DE IA
     if not genai_client:
         logging.warning("IA desativada. Sinal não processado por IA.")
-        # Se a IA estiver desativada, ele ainda passa a mensagem original para fins de teste.
         final_message = f"🚨 IA DESATIVADA. Sinal Original:\n\n{text}"
         await send_telegram_message(CANAL_DESTINO_ID, final_message)
         last_signal_time = time.time() # Atualiza o lock
