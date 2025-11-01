@@ -1,4 +1,4 @@
-# main.py - Versão FINAL COM APRENDIZADO, Persistência de Disco e LÓGICA DE TEMPO (WEBHOOK/FASTAPI)
+# main.py - Versão FINAL COM APRENDIZADO, Persistência de Disco, LÓGICA DE TEMPO e FILTRO 0% (Modo Destravado)
 
 import os
 import sqlite3
@@ -19,7 +19,6 @@ BOT_TOKEN   = os.environ.get("BOT_TOKEN", "").strip()
 WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN", "default_secret_token").strip() 
 
 # IDs dos Canais (Lidos de ENVs)
-# Valores padrão ajustados para o seu cenário (Origem -> Destino/Feedback)
 CANAL_ORIGEM_IDS_STR = os.environ.get("CANAL_ORIGEM_IDS", "-1003156785631").strip()
 CANAL_DESTINO_ID_STR = os.environ.get("CANAL_DESTINO_ID", "-1002796105884").strip()
 CANAL_FEEDBACK_ID_STR = os.environ.get("CANAL_FEEDBACK_ID", "-1002796105884").strip()
@@ -39,7 +38,8 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 # CONFIGURAÇÃO DE APRENDIZADO E FILTRAGEM
 # ====================================================================
 MIN_JOGADAS_APRENDIZADO = 10
-PERCENTUAL_MINIMO_CONFIANCA = 79.0 
+# AJUSTE CHAVE: Confiança mínima para enviar. 0.0 significa que envia qualquer um para começar a coletar dados.
+PERCENTUAL_MINIMO_CONFIANCA = 0.0 
 
 # Variável de estado global para armazenar o ÚLTIMO SINAL ENVIADO (Chave com Tempo)
 LAST_SENT_SIGNAL = {"text": None, "timestamp": 0} 
@@ -90,10 +90,11 @@ def deve_enviar_sinal(sinal):
     if analisadas < MIN_JOGADAS_APRENDIZADO: 
         return True, "APRENDIZADO"
 
+    # Esta condição agora é True para qualquer confiança maior que 0.0
     if confianca > PERCENTUAL_MINIMO_CONFIANCA:
-        return True, "CONFIANÇA"
+        return True, "COLETA_DADOS"
         
-    return False, "BLOQUEIO"
+    return False, "BLOQUEIO_ZERO_CONFIANÇA"
 
 def atualizar_performance(sinal, is_win):
     """Atualiza o DB com o resultado da rodada."""
