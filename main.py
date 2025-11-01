@@ -27,11 +27,13 @@ CANAL_ORIGEM_IDS: List[str] = [id.strip() for id in CANAL_ORIGEM_IDS_STR.split('
 TELEGRAM_API_URL: str = f"https://api.telegram.org/bot{BOT_TOKEN}"
 SEND_MESSAGE_URL: str = f"{TELEGRAM_API_URL}/sendMessage"
 
-# --- CONFIGURAÇÕES DE ESTADO (Para evitar duplicação) ---
+# --- CONFIGURAÇÕES DE ESTADO (Para evitar duplicação - COOLDOWN) ---
+# O servidor manterá esta variável na memória enquanto estiver ativo.
 last_signal_time = 0
 COOLDOWN_SECONDS = 30 # Tempo mínimo entre o envio de sinais (em segundos)
 
 # --- CONFIGURAÇÕES DE IA E CONFIANÇA ---
+# Modo Destravado (APRENDIZADOBRUTO)
 PERCENTUAL_MINIMO_CONFIANCA: float = float(os.getenv("MIN_CONFIDENCE", "0.0"))
 
 # Inicialização da API do Gemini
@@ -175,25 +177,28 @@ async def telegram_webhook(webhook_token: str, request: Request):
     logging.info("Mensagem roteada para PROCESSAMENTO DE SINAL.")
 
 
-    # --- BLOCO DE FILTRAGEM DE CONTEÚDO: FOCO TOTAL NO BRANCO (Inclui exclusão de VERDE) ---
+    # --- BLOCO DE FILTRAGEM DE CONTEÚDO: FOCO TOTAL NO BRANCO ---
     text_lower = text.lower()
 
     # 1. Deve conter BRANCO para ser considerado.
     contains_branco = "branco" in text_lower or "⚪" in text or "⬜" in text
 
-    # 2. NÃO DEVE conter PRETO, VERMELHO ou VERDE, pois é um sinal misturado.
-    contains_outras_cores = (
+    # 2. NÃO DEVE conter outras CORES, GALE, WIN, ou MARTINGALE.
+    contains_outras_cores_ou_gale = (
         "preto" in text_lower or "⚫" in text_lower or 
         "vermelho" in text_lower or "🔴" in text_lower or
-        "verde" in text_lower or "🟢" in text_lower
+        "verde" in text_lower or "🟢" in text_lower or
+        "gale" in text_lower or "gales" in text_lower or # Exclui GALE
+        "✅" in text_lower or "win" in text_lower or # Exclui WIN/Check Mark
+        "loss" in text_lower # Exclui LOSS (garante que só é sinal de entrada)
     )
 
     if not contains_branco:
         logging.info("Sinal ignorado: Não contém a palavra/emoji 'BRANCO'.")
         return {"ok": True, "action": "ignored_not_branco"}
 
-    if contains_outras_cores:
-        logging.info("Sinal ignorado: Contém BRANCO, mas está misturado com outras cores (PRETO/VERMELHO/VERDE).")
+    if contains_outras_cores_ou_gale:
+        logging.info("Sinal ignorado: Contém BRANCO, mas também contém GALE, WIN, LOSS ou outras CORES (sinal misto/resultado).")
         return {"ok": True, "action": "ignored_mixed_signal"}
     # --- FIM DO BLOCO DE FILTRAGEM ---
 
