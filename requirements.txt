@@ -3,3 +3,4 @@ uvicorn
 httpx 
 python-dotenv
 openai
+openai>=1.42.0
