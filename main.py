@@ -12,7 +12,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "Jonbet")
 CANAL_ORIGEM_IDS = [s.strip() for s in os.getenv("CANAL_ORIGEM_IDS", "-1003156785631").split(",")]
 CANAL_DESTINO_ID = os.getenv("CANAL_DESTINO_ID", "-1002796105884")
-COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "5"))  # recomendação: 5s
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "5"))  # sugerido 5s
 
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 SEND_MESSAGE_URL = f"{TELEGRAM_API_URL}/sendMessage"
@@ -152,7 +152,7 @@ async def webhook(webhook_token: str, request: Request):
         await send_telegram_message(CANAL_DESTINO_ID, "♻️ Contadores zerados manualmente.")
         return {"ok": True, "action": "reset_manual"}
 
-    # ===== PLACAR (somente vitória no branco é GREEN; resto é LOSS) =====
+    # ===== PLACAR (só é GREEN se for vitória no BRANCO) =====
     resultado = classificar_resultado(text)
     if resultado == "GREEN_VALIDO":
         salvar_evento("resultado", "GREEN")
@@ -166,22 +166,29 @@ async def webhook(webhook_token: str, request: Request):
         await send_telegram_message(CANAL_DESTINO_ID, f"❌ **LOSS** 😥\n\n{get_status_msg()}")
         return {"ok": True, "action": "loss"}
 
-    # ===== ENTRADA BRANCO AJUSTADA (destravada) =====
+    # ===== ENTRADA BRANCO (aceita 'Entrada confirmada' com ✅/proteção) =====
     contains_branco = ("branco" in text_lower) or ("⚪" in text) or ("⬜" in text)
+    has_entrada_words = any(w in text_lower for w in ["entrada", "entrar", "entrada confirmada"])
 
-    # mensagens de resultado não são entrada
-    is_resultado_msg = any(w in text_lower for w in ["vitória", "vitoria", "win", "✅", "🟢", "loss", "derrota", "perda"])
+    # Resultado verdadeiro: tem palavras de resultado E não é uma mensagem de entrada
+    has_result_words = any(w in text_lower for w in ["vitória", "vitoria", "win", "loss", "derrota", "perda", "não bateu", "nao bateu", "não deu", "nao deu", "falhou"])
+    is_resultado_msg = has_result_words and not has_entrada_words
+    # ⚠️ NÃO trate ✅/🟢 como resultado por si só — aparecem muito nas entradas
+
     if not contains_branco:
         logging.info("Ignorado: não contém BRANCO.")
         return {"ok": True, "action": "ignored_not_branco"}
+
     if is_resultado_msg:
         logging.info("Ignorado: mensagem de resultado, não de entrada.")
         return {"ok": True, "action": "ignored_result_message"}
 
-    # aceita "branco com proteção" e similares (não bloqueia)
-    # seguimos ignorando apenas quando for explicitamente outra cor sem branco
-    # (já garantimos contains_branco acima)
+    # Ignora pré-sinais
+    if any(w in text_lower for w in ["possível entrada", "possivel entrada", "analisando"]):
+        logging.info("Ignorado: possível entrada/análise.")
+        return {"ok": True, "action": "ignored_possible_entry"}
 
+    # Aceita “branco com proteção” e similares
     global last_signal_time
     now = time.time()
     if now - last_signal_time < COOLDOWN_SECONDS:
@@ -191,5 +198,5 @@ async def webhook(webhook_token: str, request: Request):
     salvar_evento("entrada")
     await send_telegram_message(CANAL_DESTINO_ID, build_final_message())
     last_signal_time = now
-    logging.info("Sinal BRANCO enviado (destravado).")
+    logging.info("Sinal BRANCO enviado (entrada confirmada).")
     return {"ok": True, "action": "signal_sent_white"}
