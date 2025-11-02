@@ -14,7 +14,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "Jonbet")
 CANAL_ORIGEM_IDS = [s.strip() for s in os.getenv("CANAL_ORIGEM_IDS", "-1003156785631").split(",")]
 CANAL_DESTINO_ID = os.getenv("CANAL_DESTINO_ID", "-1002796105884")
-COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "0"))  # 0 = sem travar
+
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "0"))         # 0 = sem travar
+RESULT_WINDOW_SECONDS = int(os.getenv("RESULT_WINDOW_SECONDS", "600"))  # 10min p/ parear placar
 
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 SEND_MESSAGE_URL = f"{TELEGRAM_API_URL}/sendMessage"
@@ -33,17 +35,32 @@ logging.info(f"🗂️ counters:  {COUNTERS_PATH}")
 # ========== APP/STATE ==========
 app = FastAPI()
 last_signal_time = 0
+last_signal_msg_id: Optional[int] = None
 app.state.processed_entries = set()  # antiduplicação por message_id
 
-# ========== HELPERS ==========
-async def send_telegram_message(chat_id: str, text: str):
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True}
+# ========== TELEGRAM SENDER ==========
+async def send_telegram_message(chat_id: str, text: str, reply_to_message_id: Optional[int] = None) -> Optional[int]:
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True,
+    }
+    if reply_to_message_id:
+        payload["reply_to_message_id"] = reply_to_message_id
+        payload["allow_sending_without_reply"] = True
+
     async with httpx.AsyncClient() as client:
         try:
-            await client.post(SEND_MESSAGE_URL, json=payload, timeout=15)
+            r = await client.post(SEND_MESSAGE_URL, json=payload, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            return data.get("result", {}).get("message_id")
         except Exception as e:
             logging.error(f"Erro ao enviar mensagem: {e}")
+            return None
 
+# ========== HELPERS ==========
 def build_final_message() -> str:
     return (
         "🚨 **ENTRADA IMEDIATA NO BRANCO!** ⚪️\n\n"
@@ -81,21 +98,18 @@ def is_pre_signal(text_lower: str) -> bool:
     ])
 
 def is_result_message(text_lower: str, has_entrada_words: bool) -> bool:
-    # Resultado verdadeiro = palavras de resultado E não ser mensagem de entrada
+    # Resultado real = palavras de resultado E NÃO ser mensagem de entrada
     has_result_words = any(w in text_lower for w in [
         "vitória","vitoria","win","loss","derrota","perda",
         "não bateu","nao bateu","não deu","nao deu","falhou"
     ])
-    # NÃO usar ✅/🟢 como critério de resultado (aparecem nas entradas)
+    # Não usar ✅/🟢 como critério de resultado (aparecem nas entradas)
     return has_result_words and not has_entrada_words
 
 def is_entrada_branco(text_raw: str) -> bool:
     """
-    Aceita variações:
-      - 'entrada confirmada ... branco/⚪/⬜'
-      - 'apostar no branco ...'
-      - 'entrar após ... branco'
-      - emojis/ordem trocada/acentos
+    Aceita variações: 'entrada confirmada ... branco/⚪/⬜', 'apostar no branco ...',
+    'entrar após ... branco', emojis/ordem trocada/acentos.
     """
     t = _strip_accents(text_raw.strip().lower())
     has_branco = ("branco" in t) or ("⚪" in text_raw) or ("⬜" in text_raw)
@@ -160,7 +174,7 @@ def classificar_resultado(texto: str) -> Optional[str]:
     t = _strip_accents(texto.lower())
     menciona_vitoria = any(p in t for p in ["vitoria", "acertamos", "acerto"])
     menciona_branco  = ("branco" in t) or ("⚪" in texto) or ("⬜" in texto)
-    if menciona_vitoria and menciona_branco and ("protecao" not in t and "protecão" not in t and "como protecao" not in t):
+    if menciona_vitoria and menciona_branco and ("protecao" not in t and "como protecao" not in t):
         return "GREEN_VALIDO"
 
     if any(p in t for p in ["derrota","loss","perdeu","perda","nao bateu","nao deu","falhou"]):
@@ -177,7 +191,7 @@ def classificar_resultado(texto: str) -> Optional[str]:
 # ========== ROUTES ==========
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "Jonbet - Branco (detecção ampla + contador diário)"}
+    return {"status": "ok", "service": "Jonbet - Branco (sinal + reply de resultado + contador)"}
 
 @app.post(f"/webhook/{{webhook_token}}")
 async def webhook(webhook_token: str, request: Request):
@@ -203,29 +217,38 @@ async def webhook(webhook_token: str, request: Request):
         await send_telegram_message(CANAL_DESTINO_ID, "♻️ Contadores zerados manualmente.")
         return {"ok": True, "action": "reset_manual"}
 
-    # ===== PLACAR =====
-    resultado = classificar_resultado(text)
-    if resultado == "GREEN_VALIDO":
-        salvar_evento("resultado", "GREEN")
-        contabilizar("GREEN")
-        await send_telegram_message(CANAL_DESTINO_ID, f"✅ **GREEN no BRANCO!** ⚪️\n\n{get_status_msg()}")
-        return {"ok": True, "action": "green_branco"}
+    global last_signal_time, last_signal_msg_id
 
-    if resultado == "LOSS":
-        salvar_evento("resultado", "LOSS")
-        contabilizar("LOSS")
-        await send_telegram_message(CANAL_DESTINO_ID, f"❌ **LOSS** 😥\n\n{get_status_msg()}")
-        return {"ok": True, "action": "loss"}
+    # ===== PLACAR (reply ao último sinal recente) =====
+    resultado = classificar_resultado(text)
+    if resultado in ("GREEN_VALIDO", "LOSS"):
+        now = time.time()
+        if last_signal_msg_id and (now - last_signal_time <= RESULT_WINDOW_SECONDS):
+            salvar_evento("resultado", "GREEN" if resultado == "GREEN_VALIDO" else "LOSS")
+            contabilizar("GREEN" if resultado == "GREEN_VALIDO" else "LOSS")
+            texto = "✅ **GREEN no BRANCO!** ⚪️" if resultado == "GREEN_VALIDO" else "❌ **LOSS** 😥"
+            await send_telegram_message(
+                CANAL_DESTINO_ID,
+                f"{texto}\n\n{get_status_msg()}",
+                reply_to_message_id=last_signal_msg_id,
+            )
+            logging.info(f"Placar postado como reply ao sinal. ref_msg_id={last_signal_msg_id}")
+            # libera para o próximo ciclo
+            last_signal_msg_id = None
+            last_signal_time = 0
+            return {"ok": True, "action": "result_replied"}
+        else:
+            logging.info("Resultado recebido sem sinal recente -> ignorado (não polui o feed).")
+            return {"ok": True, "action": "result_ignored_no_recent_signal"}
 
     # ===== ENTRADA (detecção ampla) =====
     if is_entrada_branco(text):
-        # Não confundir com resultado
+        # Evitar confundir com resultado
         has_entrada_words = any(w in tnorm for w in ["entrada", "entrar", "entrada confirmada", "confirmada", "aposta", "apostar", "aposte", "aposta confirmada"])
         if is_result_message(tnorm, has_entrada_words):
-            logging.info("Ignorado: mensagem parece resultado (não entrada).")
+            logging.info("Ignorado: parece resultado, não entrada.")
             return {"ok": True, "action": "ignored_result_like"}
 
-        # Pré-sinal?
         if is_pre_signal(tnorm):
             logging.info("Ignorado: possível entrada/análise.")
             return {"ok": True, "action": "ignored_possible_entry"}
@@ -238,17 +261,19 @@ async def webhook(webhook_token: str, request: Request):
         if mid:
             app.state.processed_entries.add(mid)
 
-        # Cooldown (opcional, controlado por env)
-        global last_signal_time
         now = time.time()
         if COOLDOWN_SECONDS and now - last_signal_time < COOLDOWN_SECONDS:
             logging.info("Cooldown ativo: sinal ignorado.")
             return {"ok": True, "action": "ignored_cooldown"}
 
         salvar_evento("entrada")
-        await send_telegram_message(CANAL_DESTINO_ID, build_final_message())
-        last_signal_time = now
-        logging.info("Sinal BRANCO enviado (detecção ampla).")
+        sent_id = await send_telegram_message(CANAL_DESTINO_ID, build_final_message())
+        if sent_id:
+            last_signal_msg_id = sent_id
+            last_signal_time = now
+            logging.info(f"Sinal BRANCO enviado. message_id={sent_id}")
+        else:
+            logging.warning("Sinal enviado, mas sem message_id retornado.")
         return {"ok": True, "action": "signal_sent_white"}
 
     return {"ok": True, "action": "ignored"}
