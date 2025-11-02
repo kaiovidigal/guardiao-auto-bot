@@ -9,7 +9,6 @@ from datetime import datetime
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Request
 import httpx
-# (import do OpenAI fica lazy dentro da função)
 
 # ========== CONFIG ==========
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -23,10 +22,13 @@ RESULT_WINDOW_SECONDS = int(os.getenv("RESULT_WINDOW_SECONDS", "600"))   # parea
 # Aprendizado & critérios
 SMART_TIMING = os.getenv("SMART_TIMING", "true").lower() == "true"
 AUTO_EXECUTE = os.getenv("AUTO_EXECUTE", "true").lower() == "true"
-CONF_THRESHOLD = float(os.getenv("CONF_THRESHOLD", "0.65"))              # default (pode ser sobrescrito via /setconf)
+CONF_THRESHOLD = float(os.getenv("CONF_THRESHOLD", "0.65"))
 MIN_SAMPLES = int(os.getenv("MIN_SAMPLES", "20"))
 
-# IA (relatório /analise)
+# Liberação "fail-open" para não travar o fluxo
+ALWAYS_SEND_ON_ENTRY = os.getenv("ALWAYS_SEND_ON_ENTRY", "true").lower() == "true"  # default TRUE
+
+# IA analítica (relatórios)
 ANALYTICS_MODE = os.getenv("ANALYTICS_MODE", "true").lower() == "true"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
@@ -50,13 +52,19 @@ app.state.processed_entries = set()  # anti-duplicação
 
 # ===== estado de aprendizado =====
 learn_state = {
-    "deltas": [],              # segundos sinal→placar
-    "last_entry_ts": None,     # ts do último sinal
-    "by_hour": {},             # {"13":{"g":X,"l":Y}}
-    "last_white_ts": None,     # ts do último GREEN BRANCO
-    "white_gaps": [],          # segundos entre brancos
-    "white_gaps_by_hour": {},  # {"13":[...]} hora do branco anterior
-    "conf_threshold": None     # corte persistido via /setconf
+    "deltas": [],                 # seg sinal→placar
+    "last_entry_ts": None,        # ts do último sinal
+    "by_hour": {},                # {"13":{"g":X,"l":Y}}  (mantido)
+    "last_white_ts": None,        # ts do último GREEN BRANCO
+    "white_gaps": [],             # seg entre brancos (global)
+    "white_gaps_by_hour": {},     # {"13":[...]} (por hora do BRANCO anterior)
+    "conf_threshold": None,       # corte persistido via /setconf
+
+    # NOVO: padrões (cor + número) e por hora
+    # {"verde": {"2": {"g": 10, "l": 3, "by_hour": {"13":{"g":7,"l":1}}}}, "preto": {...}}
+    "pattern_hits": {},
+    # guarda último padrão detectado para amarrar ao próximo resultado
+    "last_detected_pattern": None  # {"cor":"verde","numero":"2","ts":..., "hora":"13"}
 }
 
 def _load_learn():
@@ -71,6 +79,8 @@ def _load_learn():
         if not isinstance(data.get("by_hour"), dict): data["by_hour"] = {}
         if not isinstance(data.get("white_gaps"), list): data["white_gaps"] = []
         if not isinstance(data.get("white_gaps_by_hour"), dict): data["white_gaps_by_hour"] = {}
+        if not isinstance(data.get("pattern_hits"), dict): data["pattern_hits"] = {}
+        if not isinstance(data.get("last_detected_pattern"), (dict, type(None))): data["last_detected_pattern"] = None
         learn_state = data
     except Exception:
         pass
@@ -86,12 +96,6 @@ _load_learn()
 
 # ---------- helper seguro para cutoff ----------
 def _get_cutoff() -> float:
-    """
-    Retorna um float sempre. Cai para CONF_THRESHOLD se:
-      - learn_state['conf_threshold'] não existir
-      - for None
-      - não for conversível para float
-    """
     v = learn_state.get("conf_threshold", None)
     try:
         return float(v) if v is not None else CONF_THRESHOLD
@@ -119,8 +123,8 @@ async def send_telegram_message(chat_id: str, text: str, reply_to_message_id: Op
             return None
 
 # ========== HELPERS ==========
-def build_final_message() -> str:
-    return (
+def build_final_message(extra_note: str = "") -> str:
+    base = (
         "🚨 **ENTRADA IMEDIATA NO BRANCO!** ⚪️\n\n"
         "🎯 JOGO: Double JonBet\n"
         "🔥 FOCO: BRANCO\n"
@@ -129,6 +133,9 @@ def build_final_message() -> str:
         "⚠️ **ESTRATÉGIA: G0 (ZERO GALES)**\n"
         "💻 Site: Acessar Double"
     )
+    if extra_note:
+        base += f"\n\n{extra_note}"
+    return base
 
 def salvar_evento(tipo: str, resultado: Optional[str] = None):
     registro = {"hora": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "tipo": tipo, "resultado": resultado}
@@ -148,6 +155,9 @@ def extract_message(data: dict) -> dict:
 
 def _strip_accents(s: str) -> str:
     return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+
+def _hour_now():
+    return datetime.now().strftime("%H")
 
 def is_pre_signal(t: str) -> bool:
     return any(w in t for w in ["possivel entrada","possível entrada","analisando","analise","análise","aguarde","ainda nao","ainda não","esperar","esperem"])
@@ -170,12 +180,103 @@ def is_entrada_branco(raw: str) -> bool:
             r'\b(branco)\b.{0,40}\b(entrada|aposta[rdo]?|confirmad[oa])\b',
             r'\bentrar(?:\s+apos|\s*:\s*)?.{0,10}(branco)\b',
         ]:
-            if re.search(p, t):
-                has_entrada = True
-                break
+            if re.search(p, t): has_entrada = True; break
     return has_entrada and not is_pre_signal(t)
 
-# contadores
+# -------- Padrões (cor+numero) --------
+def _parse_cor_numero(texto: str):
+    """
+    Extrai par (cor, numero) de padrões como:
+      "Entrar após: 🟢 2", "após verde 2", "depois do ⚫ 14", etc.
+    Retorna (cor, numero) normalizados ou (None, None).
+    Cores aceitas: 'verde', 'preto' (Jon.bet)
+    """
+    t = _strip_accents(texto.lower())
+    # Mapear emojis para nomes
+    t = t.replace("🟢", "verde").replace("⚫", "preto").replace("⬛", "preto").replace("🔴", "vermelho")
+    # Padrões comuns "após|depois|entrar apos|entrar depois|após o|depois do"
+    m = re.search(r'(ap(os|o)s|depois)\s*(do|da|:)?\s*(verde|preto|vermelho)\s*(\d{1,2})', t)
+    if m:
+        cor = m.group(4)
+        if cor == "vermelho":  # Jon.bet não usa vermelho como gatilho; ignorar
+            return None, None
+        return cor, m.group(5)
+    # fallback: "verde 2" solto
+    m2 = re.search(r'\b(verde|preto)\s*(\d{1,2})\b', t)
+    if m2:
+        cor = m2.group(1)
+        if cor == "vermelho":
+            return None, None
+        return cor, m2.group(2)
+    return None, None
+
+def _pattern_touch(cor: str, numero: str, res: Optional[str] = None):
+    """
+    Atualiza memória do último padrão detectado e,
+    se res for GREEN/LOSS, grava nos contadores.
+    """
+    if not cor or not numero:
+        return
+    cor = _strip_accents(cor.lower())
+    numero = str(numero)
+
+    if res is None:
+        # Apenas armazena o "último detectado" até sair o resultado
+        learn_state["last_detected_pattern"] = {
+            "cor": cor, "numero": numero,
+            "ts": time.time(),
+            "hora": _hour_now()
+        }
+        _save_learn()
+        return
+
+    # Grava hit/loss
+    ph = learn_state.setdefault("pattern_hits", {})
+    cor_d = ph.setdefault(cor, {})
+    slot = cor_d.setdefault(numero, {"g": 0, "l": 0, "by_hour": {}})
+    if res == "GREEN":
+        slot["g"] += 1
+    else:
+        slot["l"] += 1
+
+    h = _hour_now()
+    bh = slot["by_hour"].setdefault(h, {"g": 0, "l": 0})
+    if res == "GREEN":
+        bh["g"] += 1
+    else:
+        bh["l"] += 1
+    _save_learn()
+
+def _pattern_boost_for_text(texto: str) -> float:
+    """
+    Retorna bônus/malus de confiança com base no histórico da combinação (cor, numero).
+    """
+    cor, numero = _parse_cor_numero(texto)
+    if not cor or not numero:
+        return 0.0
+    dados = learn_state.get("pattern_hits", {}).get(cor, {}).get(str(numero))
+    if not dados:
+        return 0.0
+
+    total = (dados.get("g", 0) + dados.get("l", 0))
+    if total < 3:
+        return 0.0  # precisa de amostras mínimas
+
+    taxa = dados.get("g", 0) / total
+    # bônus moderado: de -0.07 até +0.10
+    boost = (taxa - 0.5) * 0.20  # 0.5->0, 1.0->+0.10, 0.0->-0.10
+    # ajuste leve por hora atual se houver
+    h = _hour_now()
+    bh = dados.get("by_hour", {}).get(h)
+    if bh:
+        th = bh["g"] + bh["l"]
+        if th >= 3:
+            taxa_h = bh["g"] / th
+            boost += (taxa_h - 0.5) * 0.10  # até ±0.05 adicional
+    # clamp
+    return max(-0.10, min(0.15, boost))
+
+# contadores gerais do dia (GREEN/LOSS)
 def _load_counters():
     try:
         with open(COUNTERS_PATH, "r") as f:
@@ -204,16 +305,17 @@ def get_status_msg():
     c = _reset_if_new_day()
     return f"📊 *Parcial do dia* ({c['date']}):\n✅ GREEN: {c['green']}\n❌ LOSS: {c['loss']}"
 
-# classificar resultado
+# classificar resultado (APENAS "vitória no branco" conta GREEN)
 def classificar_resultado(txt: str) -> Optional[str]:
     t = _strip_accents(txt.lower())
     vitoria = any(p in t for p in ["vitoria", "acertamos", "acerto"])
-    branco = ("branco" in t) or ("⚪" in txt) or ("⬜" in txt)
+    branco  = ("branco" in t) or ("⚪" in txt) or ("⬜" in txt)
+    # Não contar "proteção" como green válido
     if vitoria and branco and ("protecao" not in t and "como protecao" not in t):
         return "GREEN_VALIDO"
-    if any(p in t for p in ["derrota", "loss", "perdeu", "perda", "nao bateu", "nao deu", "falhou"]):
+    if any(p in t for p in ["derrota","loss","perdeu","perda","nao bateu","nao deu","falhou"]):
         return "LOSS"
-    if any(p in t for p in ["vitoria de primeira", "vitoria com", "gale", "g1", "g 1", "g2", "g 2"]):
+    if any(p in t for p in ["vitoria de primeira","vitoria com","gale","g1","g 1","g2","g 2"]):
         return "LOSS"
     if "green" in t and not branco:
         return "LOSS"
@@ -246,7 +348,7 @@ def _carregar_eventos():
         pass
     return eventos
 
-def _horario(h):
+def _horario(h):  # usado em relatórios IA
     return h[11:13] if h and len(h) >= 13 else "??"
 
 def _sinal_para_placar_deltas(eventos):
@@ -356,16 +458,11 @@ def _recent_perf(n=12):
     return sum(1 for e in res if e.get("resultado") == "GREEN") / len(res)
 
 def _text_signal_score(t):
-    t0 = _strip_accents(t.lower())
-    s = 0.0
-    if any(w in t0 for w in ["entrada", "entrar", "confirmada"]):
-        s += 0.35
-    if ("branco" in t0) or ("⚪" in t) or ("⬜" in t):
-        s += 0.35
-    if any(w in t0 for w in ["agora", "imediata", "confirmada", "gatilho"]):
-        s += 0.15
-    if any(w in t0 for w in ["possivel", "possível", "analisando", "teste", "simulacao", "simulação"]):
-        s -= 0.25
+    t0 = _strip_accents(t.lower()); s = 0.0
+    if any(w in t0 for w in ["entrada","entrar","confirmada"]): s += 0.35
+    if ("branco" in t0) or ("⚪" in t) or ("⬜" in t):          s += 0.35
+    if any(w in t0 for w in ["agora","imediata","confirmada","gatilho"]): s += 0.15
+    if any(w in t0 for w in ["possivel","possível","analisando","teste","simulacao","simulação"]): s -= 0.25
     return max(0.0, min(s, 1.0))
 
 def _confidence_for_entry(text, now_ts):
@@ -382,7 +479,11 @@ def _confidence_for_entry(text, now_ts):
             prox = (ratio - 0.5) / 0.5 if ratio <= 1.0 else max(0.0, 1.0 - (ratio - 1.0) / 0.8)
             prox = max(0.0, min(prox, 1.0))
     w_hour, w_rec, w_txt, w_time = (0.35, 0.25, 0.20, 0.20) if samples >= MIN_SAMPLES else (0.20, 0.25, 0.25, 0.30)
-    conf = w_hour * hour_rate + w_rec * recent + w_txt * txt + w_time * prox
+    conf = w_hour*hour_rate + w_rec*recent + w_txt*txt + w_time*prox
+
+    # reforço baseado em padrão detectado (cor+numero)
+    conf += _pattern_boost_for_text(text)
+
     # penalidade por 3 losses seguidos
     ev = _carregar_eventos()
     streak = [e.get("resultado") for e in ev if e.get("tipo") == "resultado"][-3:]
@@ -393,14 +494,13 @@ def _confidence_for_entry(text, now_ts):
 # ========== ROUTES ==========
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "Jonbet - Branco (aprendizado em segundos + confiança persistida + reply pareado)"}
+    return {"status": "ok", "service": "Jonbet - Branco (aprendizado + padrões cor/número + reply pareado)"}
 
 @app.post(f"/webhook/{{webhook_token}}")
 async def webhook(webhook_token: str, request: Request):
     if webhook_token != WEBHOOK_TOKEN:
         raise HTTPException(status_code=403, detail="Token incorreto.")
 
-    # globais no topo
     global last_signal_time, last_signal_msg_id, RESULT_WINDOW_SECONDS
 
     data = await request.json()
@@ -422,13 +522,7 @@ async def webhook(webhook_token: str, request: Request):
     if tnorm.startswith("/aprendizado"):
         deltas = learn_state.get("deltas", [])
         med = int(median(deltas)) if deltas else 0
-        byh = learn_state.get("by_hour", {})
-        top = sorted(((h, v.get("g", 0), v.get("l", 0)) for h, v in byh.items()), key=lambda x: (x[1] - x[2]), reverse=True)[:3]
-        linhas = [f"{h}h → G:{g} / L:{l}" for h, g, l in top] or ["(sem dados)"]
-        await send_telegram_message(
-            CANAL_DESTINO_ID,
-            f"🧠 *Aprendizado*\n• Mediana Δ sinal→placar: {med}s\n• RESULT_WINDOW_SECONDS: {RESULT_WINDOW_SECONDS}s\n• Top horários (G-L):\n- " + "\n- ".join(linhas)
-        )
+        await send_telegram_message(CANAL_DESTINO_ID, f"🧠 *Aprendizado (tempo)*\n• Mediana Δ sinal→placar: {med}s\n• RESULT_WINDOW_SECONDS: {RESULT_WINDOW_SECONDS}s")
         return {"ok": True}
     if tnorm.startswith("/confstatus"):
         cutoff = _get_cutoff()
@@ -441,49 +535,80 @@ async def webhook(webhook_token: str, request: Request):
             f"• recent: {parts['recent']:.2f}\n"
             f"• texto: {parts['txt']:.2f}\n"
             f"• prox(tempo): {parts['prox']:.2f} • gap_med: {int(parts['gap_med'] or 0)}s"
-        )
-        return {"ok": True}
+        ); return {"ok": True}
     if tnorm.startswith("/setconf"):
         try:
-            val = float(tnorm.split(maxsplit=1)[1])
-            val = max(0.0, min(val, 1.0))
-            learn_state["conf_threshold"] = val
-            _save_learn()
+            val = float(tnorm.split(maxsplit=1)[1]); val = max(0.0, min(val, 1.0))
+            learn_state["conf_threshold"] = val; _save_learn()
             await send_telegram_message(CANAL_DESTINO_ID, f"⚙️ CONF_THRESHOLD atualizado para {val:.2f}")
         except Exception:
             await send_telegram_message(CANAL_DESTINO_ID, "Uso: /setconf 0.70")
         return {"ok": True}
+    if tnorm.startswith("/padroes"):
+        ph = learn_state.get("pattern_hits", {})
+        linhas=[]
+        for cor, nums in ph.items():
+            for numero, dados in nums.items():
+                g, l = dados.get("g",0), dados.get("l",0)
+                tot = g+l
+                if tot>=3:
+                    taxa = g/tot
+                    linhas.append((taxa, tot, cor, numero, g, l))
+        if not linhas:
+            await send_telegram_message(CANAL_DESTINO_ID, "ℹ️ Sem padrões com amostra ≥ 3 ainda."); return {"ok": True}
+        linhas.sort(reverse=True)
+        top = linhas[:8]
+        txt = "🏷️ *Top padrões (cor+número)*\n" + "\n".join([f"- {c} {n}: {g}/{g+l} GREEN ({t:.0%})" for t,_,c,n,g,l in top])
+        await send_telegram_message(CANAL_DESTINO_ID, txt); return {"ok": True}
+    if tnorm.startswith("/padroes_hora"):
+        ph = learn_state.get("pattern_hits", {})
+        h = _hour_now()
+        linhas=[]
+        for cor, nums in ph.items():
+            for numero, dados in nums.items():
+                bh = dados.get("by_hour", {}).get(h)
+                if not bh: continue
+                g, l = bh.get("g",0), bh.get("l",0)
+                tot = g+l
+                if tot>=3:
+                    taxa = g/tot
+                    linhas.append((taxa, tot, cor, numero, g, l))
+        if not linhas:
+            await send_telegram_message(CANAL_DESTINO_ID, f"ℹ️ Sem padrões com amostra ≥ 3 para {h}h."); return {"ok": True}
+        linhas.sort(reverse=True)
+        top = linhas[:8]
+        txt = f"⏰ *Top padrões ({h}h)*\n" + "\n".join([f"- {c} {n}: {g}/{g+l} GREEN ({t:.0%})" for t,_,c,n,g,l in top])
+        await send_telegram_message(CANAL_DESTINO_ID, txt); return {"ok": True}
     if tnorm.startswith("/forcar"):
         salvar_evento("entrada")
         sent_id = await send_telegram_message(CANAL_DESTINO_ID, build_final_message())
         if sent_id:
-            last_signal_msg_id = sent_id
-            last_signal_time = time.time()
-            if SMART_TIMING:
-                learn_state["last_entry_ts"] = time.time()
-                _save_learn()
+            last_signal_msg_id = sent_id; last_signal_time = time.time()
+            if SMART_TIMING: learn_state["last_entry_ts"] = time.time(); _save_learn()
             return {"ok": True, "action": "forced_entry"}
         return {"ok": False, "action": "force_failed"}
     if tnorm.startswith("/branco_tempo"):
         eta_ts, gap_med, fonte = _predict_next_white_eta()
-        gaps = learn_state.get("white_gaps", [])
-        med_g = _med_or_none(gaps)
+        gaps = learn_state.get("white_gaps", []); med_g = _med_or_none(gaps)
         byh = learn_state.get("white_gaps_by_hour", {})
-        rows = [(h, _med_or_none(lst), len(lst)) for h, lst in byh.items() if len(lst) >= 3]
-        rows.sort(key=lambda x: (x[1] if x[1] is not None else 1e9))
-        top = rows[:5]
-        linhas = [f"{h}h → med {int(m//60)}m {int(m%60)}s ({n} amostras)" for h, m, n in top if m] or ["(sem dados por hora)"]
+        rows=[(h,_med_or_none(lst),len(lst)) for h,lst in byh.items() if len(lst)>=3]
+        rows.sort(key=lambda x:(x[1] if x[1] is not None else 1e9)); top=rows[:5]
+        linhas=[f"{h}h → med {int(m//60)}m {int(m%60)}s ({n} amostras)" for h,m,n in top if m] or ["(sem dados por hora)"]
         eta_txt = "indefinido"
         if eta_ts and gap_med:
-            eta_txt = f"~{int(gap_med//60)}m {int(gap_med%60)}s após o último • ETA ≈ {datetime.fromtimestamp(eta_ts).strftime('%H:%M:%S')} ({'por ' + fonte})"
+            eta_txt=f"~{int(gap_med//60)}m {int(gap_med%60)}s após o último • ETA ≈ {datetime.fromtimestamp(eta_ts).strftime('%H:%M:%S')} ({'por ' + fonte})"
         await send_telegram_message(
             CANAL_DESTINO_ID,
             "⏱️ *Tempo entre BRANCOS*\n"
             f"• Mediana global: {int((med_g or 0)//60)}m {int((med_g or 0)%60)}s\n"
             f"• Próximo branco (estimativa): {eta_txt}\n"
             "• Top horas (menor intervalo):\n- " + "\n- ".join(linhas)
-        )
-        return {"ok": True}
+        ); return {"ok": True}
+
+    # -------- Aprender padrão já na leitura do texto --------
+    cor_padrao, num_padrao = _parse_cor_numero(text)
+    if cor_padrao and num_padrao:
+        _pattern_touch(cor_padrao, num_padrao, res=None)  # marca padrão detectado mais recente
 
     # -------- PLACAR (reply no último sinal) --------
     resultado = classificar_resultado(text)
@@ -493,7 +618,7 @@ async def webhook(webhook_token: str, request: Request):
             salvar_evento("resultado", "GREEN" if resultado == "GREEN_VALIDO" else "LOSS")
             contabilizar("GREEN" if resultado == "GREEN_VALIDO" else "LOSS")
 
-            # aprender delta sinal→placar
+            # aprender tempo sinal→placar
             if SMART_TIMING and learn_state.get("last_entry_ts"):
                 delta = time.time() - float(learn_state["last_entry_ts"])
                 learn_state["deltas"] = (learn_state.get("deltas", []) + [delta])[-60:]
@@ -501,7 +626,7 @@ async def webhook(webhook_token: str, request: Request):
                 try:
                     med = median(learn_state["deltas"])
                     new = int(max(180, min(med + 60, 1800)))
-                    if RESULT_WINDOW_SECONDS == 0 or abs(new - RESULT_WINDOW_SECONDS) / max(RESULT_WINDOW_SECONDS, 1) > 0.2:
+                    if RESULT_WINDOW_SECONDS == 0 or abs(new - RESULT_WINDOW_SECONDS)/max(RESULT_WINDOW_SECONDS,1) > 0.2:
                         RESULT_WINDOW_SECONDS = new
                         logging.info(f"🧠 SMART_TIMING: RESULT_WINDOW_SECONDS={RESULT_WINDOW_SECONDS}s (med={int(med)}s)")
                 except Exception as e:
@@ -509,26 +634,28 @@ async def webhook(webhook_token: str, request: Request):
 
             # aprender gap entre brancos quando GREEN
             if resultado == "GREEN_VALIDO":
-                now_ts = time.time()
-                last_w = learn_state.get("last_white_ts")
+                now_ts = time.time(); last_w = learn_state.get("last_white_ts")
                 if last_w:
                     gap = now_ts - float(last_w)
                     if gap > 0:
                         lst = learn_state.setdefault("white_gaps", [])
-                        _append_bounded(lst, gap, 200)
-                        learn_state["white_gaps"] = lst
+                        _append_bounded(lst, gap, 200); learn_state["white_gaps"] = lst
                         hh_last = datetime.fromtimestamp(float(last_w)).strftime("%H")
                         wb = learn_state.setdefault("white_gaps_by_hour", {})
-                        wb_list = wb.get(hh_last, [])
-                        _append_bounded(wb_list, gap, 120)
-                        wb[hh_last] = wb_list
+                        wb_list = wb.get(hh_last, []); _append_bounded(wb_list, gap, 120); wb[hh_last] = wb_list
                 learn_state["last_white_ts"] = now_ts
-                _save_learn()
+
+            # amarrar resultado ao último padrão detectado (se existir)
+            lp = learn_state.get("last_detected_pattern")
+            if lp and (time.time() - lp.get("ts", 0) <= 1200):  # janela 20 min
+                _pattern_touch(lp["cor"], lp["numero"], "GREEN" if resultado=="GREEN_VALIDO" else "LOSS")
+                learn_state["last_detected_pattern"] = None
+
+            _save_learn()
 
             txt = "✅ **GREEN no BRANCO!** ⚪️" if resultado == "GREEN_VALIDO" else "❌ **LOSS** 😥"
             await send_telegram_message(CANAL_DESTINO_ID, f"{txt}\n\n{get_status_msg()}", reply_to_message_id=last_signal_msg_id)
-            last_signal_msg_id = None
-            last_signal_time = 0
+            last_signal_msg_id = None; last_signal_time = 0
             return {"ok": True, "action": "result_replied"}
         else:
             return {"ok": True, "action": "result_ignored_no_recent_signal"}
@@ -536,36 +663,35 @@ async def webhook(webhook_token: str, request: Request):
     # -------- ENTRADA (detecção ampla) --------
     if is_entrada_branco(text):
         has_ent = any(w in tnorm for w in ["entrada", "entrar", "entrada confirmada", "confirmada", "aposta", "apostar", "aposte", "aposta confirmada"])
-        if is_result_message(tnorm, has_ent):
-            return {"ok": True, "action": "ignored_result_like"}
-        if is_pre_signal(tnorm):
-            return {"ok": True, "action": "ignored_possible_entry"}
+        if is_result_message(tnorm, has_ent): return {"ok": True, "action": "ignored_result_like"}
+        if is_pre_signal(tnorm):           return {"ok": True, "action": "ignored_possible_entry"}
 
+        extra_note = ""
         if AUTO_EXECUTE:
-            cutoff = _get_cutoff()  # <-- SEMPRE float
+            cutoff = _get_cutoff()
             conf, parts = _confidence_for_entry(text, time.time())
-            if conf < cutoff:
-                logging.info(f"🔒 Bloqueado por confiança: {conf:.2f} < {cutoff:.2f} parts={parts}")
+            low = conf < cutoff
+            strong_phrase = ("entrada confirmada" in tnorm) and ("branco" in tnorm)
+
+            if low and not (ALWAYS_SEND_ON_ENTRY or strong_phrase):
+                logging.info(f"🔒 Bloqueado por confiança: conf={conf:.2f} < cutoff={cutoff:.2f} parts={parts} strong={strong_phrase} always={ALWAYS_SEND_ON_ENTRY}")
                 return {"ok": True, "action": "blocked_low_confidence"}
+            if low:
+                extra_note = f"⚠️ Observação: confiança baixa ({conf:.2f} < {cutoff:.2f}) — liberado por critério forte."
 
         mid = msg.get("message_id")
-        if mid and mid in app.state.processed_entries:
-            return {"ok": True, "action": "ignored_duplicate_entry"}
-        if mid:
-            app.state.processed_entries.add(mid)
+        if mid and mid in app.state.processed_entries: return {"ok": True, "action": "ignored_duplicate_entry"}
+        if mid: app.state.processed_entries.add(mid)
 
         now = time.time()
         if COOLDOWN_SECONDS and now - last_signal_time < COOLDOWN_SECONDS:
             return {"ok": True, "action": "ignored_cooldown"}
 
         salvar_evento("entrada")
-        sent_id = await send_telegram_message(CANAL_DESTINO_ID, build_final_message())
+        sent_id = await send_telegram_message(CANAL_DESTINO_ID, build_final_message(extra_note))
         if sent_id:
-            last_signal_msg_id = sent_id
-            last_signal_time = now
-            if SMART_TIMING:
-                learn_state["last_entry_ts"] = time.time()
-                _save_learn()
+            last_signal_msg_id = sent_id; last_signal_time = now
+            if SMART_TIMING: learn_state["last_entry_ts"] = time.time(); _save_learn()
         return {"ok": True, "action": "signal_sent_white"}
 
     return {"ok": True, "action": "ignored"}
