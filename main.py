@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Request
 import httpx
-# ❌ REMOVIDO: from openai import OpenAI  (fazemos import lazy dentro da função)
+# (import do OpenAI fica lazy dentro da função)
 
 # ========== CONFIG ==========
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -64,13 +64,13 @@ def _load_learn():
     try:
         with open(LEARN_PATH, "r") as f:
             data = json.load(f)
+        # garante chaves e tipos
         for k, v in learn_state.items():
             data.setdefault(k, v)
-        for key, default in {
-            "deltas": [], "by_hour": {}, "white_gaps": [], "white_gaps_by_hour": {}
-        }.items():
-            if not isinstance(data.get(key), type(default)):
-                data[key] = default
+        if not isinstance(data.get("deltas"), list): data["deltas"] = []
+        if not isinstance(data.get("by_hour"), dict): data["by_hour"] = {}
+        if not isinstance(data.get("white_gaps"), list): data["white_gaps"] = []
+        if not isinstance(data.get("white_gaps_by_hour"), dict): data["white_gaps_by_hour"] = {}
         learn_state = data
     except Exception:
         pass
@@ -83,6 +83,20 @@ def _save_learn():
         logging.error(f"Erro ao salvar learn.json: {e}")
 
 _load_learn()
+
+# ---------- helper seguro para cutoff ----------
+def _get_cutoff() -> float:
+    """
+    Retorna um float sempre. Cai para CONF_THRESHOLD se:
+      - learn_state['conf_threshold'] não existir
+      - for None
+      - não for conversível para float
+    """
+    v = learn_state.get("conf_threshold", None)
+    try:
+        return float(v) if v is not None else CONF_THRESHOLD
+    except Exception:
+        return CONF_THRESHOLD
 
 # ========== TELEGRAM ==========
 async def send_telegram_message(chat_id: str, text: str, reply_to_message_id: Optional[int] = None) -> Optional[int]:
@@ -210,7 +224,7 @@ def _get_openai_client():
     if not ANALYTICS_MODE or not OPENAI_API_KEY:
         return None
     try:
-        from openai import OpenAI  # ✅ import aqui evita ModuleNotFoundError no deploy
+        from openai import OpenAI  # import aqui evita ModuleNotFoundError no deploy
         return OpenAI(api_key=OPENAI_API_KEY)
     except ImportError:
         logging.error("Pacote 'openai' não instalado; IA desativada.")
@@ -386,7 +400,7 @@ async def webhook(webhook_token: str, request: Request):
     if webhook_token != WEBHOOK_TOKEN:
         raise HTTPException(status_code=403, detail="Token incorreto.")
 
-    # ✅ declarar globais no topo
+    # globais no topo
     global last_signal_time, last_signal_msg_id, RESULT_WINDOW_SECONDS
 
     data = await request.json()
@@ -417,12 +431,12 @@ async def webhook(webhook_token: str, request: Request):
         )
         return {"ok": True}
     if tnorm.startswith("/confstatus"):
-        cutoff = learn_state.get("conf_threshold", CONF_THRESHOLD)
+        cutoff = _get_cutoff()
         conf, parts = _confidence_for_entry("entrada branco ⚪", time.time())
         await send_telegram_message(
             CANAL_DESTINO_ID,
             "🔎 *Confiança agora*\n"
-            f"• conf: {conf:.2f} (cutoff {cutoff})\n"
+            f"• conf: {conf:.2f} (cutoff {cutoff:.2f})\n"
             f"• hora_rate: {parts['hour_rate']:.2f} (samples {parts['hour_samples']})\n"
             f"• recent: {parts['recent']:.2f}\n"
             f"• texto: {parts['txt']:.2f}\n"
@@ -528,10 +542,10 @@ async def webhook(webhook_token: str, request: Request):
             return {"ok": True, "action": "ignored_possible_entry"}
 
         if AUTO_EXECUTE:
-            cutoff = learn_state.get("conf_threshold", CONF_THRESHOLD)
+            cutoff = _get_cutoff()  # <-- SEMPRE float
             conf, parts = _confidence_for_entry(text, time.time())
             if conf < cutoff:
-                logging.info(f"🔒 Bloqueado por confiança: {conf:.2f} < {cutoff} parts={parts}")
+                logging.info(f"🔒 Bloqueado por confiança: {conf:.2f} < {cutoff:.2f} parts={parts}")
                 return {"ok": True, "action": "blocked_low_confidence"}
 
         mid = msg.get("message_id")
