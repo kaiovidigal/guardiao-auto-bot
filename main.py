@@ -9,14 +9,21 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Request
 import httpx
 
+# ===== IA analítica (ChatGPT) =====
+from openai import OpenAI
+
 # ========== CONFIG ==========
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "Jonbet")
 CANAL_ORIGEM_IDS = [s.strip() for s in os.getenv("CANAL_ORIGEM_IDS", "-1003156785631").split(",")]
 CANAL_DESTINO_ID = os.getenv("CANAL_DESTINO_ID", "-1002796105884")
 
-COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "0"))         # 0 = sem travar
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "0"))            # 0 = sem travar
 RESULT_WINDOW_SECONDS = int(os.getenv("RESULT_WINDOW_SECONDS", "600"))  # 10min p/ parear placar
+
+# IA
+ANALYTICS_MODE = os.getenv("ANALYTICS_MODE", "true").lower() == "true"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 SEND_MESSAGE_URL = f"{TELEGRAM_API_URL}/sendMessage"
@@ -188,10 +195,110 @@ def classificar_resultado(texto: str) -> Optional[str]:
 
     return None
 
+# ====== IA ANALÍTICA (ChatGPT) ======
+def _get_openai_client():
+    if not ANALYTICS_MODE or not OPENAI_API_KEY:
+        return None
+    try:
+        return OpenAI(api_key=OPENAI_API_KEY)
+    except Exception as e:
+        logging.error(f"OpenAI client error: {e}")
+        return None
+
+def _carregar_eventos():
+    eventos = []
+    try:
+        with open(HISTORICO_PATH, "r") as f:
+            for line in f:
+                try:
+                    eventos.append(json.loads(line))
+                except:
+                    pass
+    except FileNotFoundError:
+        pass
+    return eventos
+
+def _horario(hora_str):
+    return hora_str[11:13] if hora_str and len(hora_str) >= 13 else "??"
+
+def _sinal_para_placar_deltas(eventos):
+    deltas = []
+    last_entry_ts = None
+    for e in eventos:
+        if e.get("tipo") == "entrada":
+            last_entry_ts = e.get("hora")
+        elif e.get("tipo") == "resultado" and last_entry_ts:
+            try:
+                t1 = datetime.strptime(last_entry_ts, "%Y-%m-%d %H:%M:%S").timestamp()
+                t2 = datetime.strptime(e["hora"], "%Y-%m-%d %H:%M:%S").timestamp()
+                if t2 >= t1:
+                    deltas.append(t2 - t1)
+                    last_entry_ts = None
+            except:
+                pass
+    return deltas
+
+async def gerar_analise_ia_e_postar():
+    client = _get_openai_client()
+    if not client:
+        await send_telegram_message(CANAL_DESTINO_ID, "⚠️ IA desativada ou sem OPENAI_API_KEY.")
+        return
+
+    eventos = _carregar_eventos()
+    if not eventos:
+        await send_telegram_message(CANAL_DESTINO_ID, "⚠️ Sem dados ainda para analisar.")
+        return
+
+    por_hora_green = {}
+    greens = losses = 0
+    for e in eventos:
+        if e.get("tipo") == "resultado":
+            if e.get("resultado") == "GREEN":
+                greens += 1
+                h = _horario(e.get("hora"))
+                por_hora_green[h] = por_hora_green.get(h, 0) + 1
+            elif e.get("resultado") == "LOSS":
+                losses += 1
+
+    deltas = _sinal_para_placar_deltas(eventos)
+    med_delta = int(sorted(deltas)[len(deltas)//2]) if deltas else 0
+
+    resumo_json = json.dumps({
+        "greens_por_hora": por_hora_green,
+        "greens_total": greens,
+        "losses_total": losses,
+        "mediana_segundos_sinal_para_placar": med_delta
+    }, ensure_ascii=False, indent=2)
+
+    prompt = (
+        "Você é um analista de desempenho para sinais de 'BRANCO' no double.\n"
+        "Com base nos dados abaixo, gere um relatório curto e objetivo com:\n"
+        "• Horários com maior frequência de GREEN (top 3)\n"
+        "• Janela recomendada de pareamento (use a mediana + margem)\n"
+        "• Taxa geral de acerto (aprox.)\n"
+        "• Observações úteis\n\n"
+        f"DADOS:\n{resumo_json}\n"
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Seja conciso, prático e direto."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.2,
+        )
+        analise = resp.choices[0].message.content.strip()
+        await send_telegram_message(CANAL_DESTINO_ID, f"🧠 *Análise IA (BRANCO)*\n\n{analise}")
+    except Exception as e:
+        logging.error(f"OpenAI request error: {e}")
+        await send_telegram_message(CANAL_DESTINO_ID, f"⚠️ Erro ao gerar análise IA: {e}")
+
 # ========== ROUTES ==========
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "Jonbet - Branco (sinal + reply de resultado + contador)"}
+    return {"status": "ok", "service": "Jonbet - Branco (sinal + reply de resultado + contador + IA)"}
 
 @app.post(f"/webhook/{{webhook_token}}")
 async def webhook(webhook_token: str, request: Request):
@@ -216,6 +323,10 @@ async def webhook(webhook_token: str, request: Request):
         _save_counters({"date": datetime.now().strftime("%Y-%m-%d"), "green": 0, "loss": 0})
         await send_telegram_message(CANAL_DESTINO_ID, "♻️ Contadores zerados manualmente.")
         return {"ok": True, "action": "reset_manual"}
+
+    if tnorm.startswith("/analise") or tnorm.startswith("/análise"):
+        await gerar_analise_ia_e_postar()
+        return {"ok": True, "action": "analysis_posted"}
 
     global last_signal_time, last_signal_msg_id
 
