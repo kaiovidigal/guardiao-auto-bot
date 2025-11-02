@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Request
 import httpx
-from openai import OpenAI
+# ❌ REMOVIDO: from openai import OpenAI  (fazemos import lazy dentro da função)
 
 # ========== CONFIG ==========
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -205,12 +205,16 @@ def classificar_resultado(txt: str) -> Optional[str]:
         return "LOSS"
     return None
 
-# IA analítica
+# IA analítica (import lazy)
 def _get_openai_client():
     if not ANALYTICS_MODE or not OPENAI_API_KEY:
         return None
     try:
+        from openai import OpenAI  # ✅ import aqui evita ModuleNotFoundError no deploy
         return OpenAI(api_key=OPENAI_API_KEY)
+    except ImportError:
+        logging.error("Pacote 'openai' não instalado; IA desativada.")
+        return None
     except Exception as e:
         logging.error(f"OpenAI client error: {e}")
         return None
@@ -382,7 +386,7 @@ async def webhook(webhook_token: str, request: Request):
     if webhook_token != WEBHOOK_TOKEN:
         raise HTTPException(status_code=403, detail="Token incorreto.")
 
-    # ✅ declare globais no topo da função
+    # ✅ declarar globais no topo
     global last_signal_time, last_signal_msg_id, RESULT_WINDOW_SECONDS
 
     data = await request.json()
@@ -483,7 +487,6 @@ async def webhook(webhook_token: str, request: Request):
                 try:
                     med = median(learn_state["deltas"])
                     new = int(max(180, min(med + 60, 1800)))
-                    # já declarado global no topo da função
                     if RESULT_WINDOW_SECONDS == 0 or abs(new - RESULT_WINDOW_SECONDS) / max(RESULT_WINDOW_SECONDS, 1) > 0.2:
                         RESULT_WINDOW_SECONDS = new
                         logging.info(f"🧠 SMART_TIMING: RESULT_WINDOW_SECONDS={RESULT_WINDOW_SECONDS}s (med={int(med)}s)")
