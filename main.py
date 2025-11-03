@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 # ✅ JonBet Auto Bot - Conversor de sinais (Conversão Total para o BRANCO)
-# REGRAS: Converte tudo para BRANCO. Só aceita "GREEN no BRANCO" como GREEN.
-# CONTROLE DE FLUXO: Trava (Lock) 1:1 ativada para evitar duplicação de sinais.
+# REGRAS:
+# 1. FILTRO ESTRITO: Só aceita sinais no padrão 'Apostar no [cor] e ⚪ branco como proteção! [x] Gales'.
+# 2. CONVERSÃO: Converte o sinal filtrado para uma entrada simples no BRANCO.
+# 3. RESULTADO: Só aceita "GREEN no BRANCO" como GREEN. Outros resultados são LOSS.
+# 4. CONTROLE DE FLUXO: Trava (Lock) 1:1 ativada para evitar duplicação.
 
 import os
 import json
@@ -39,7 +42,7 @@ learn_state = {
     "white_gaps": [],
     "stones_since_last_white": 0,
     "stones_gaps": [],
-    "entry_active": False # <--- REINTRODUÇÃO DA TRAVA (LOCK)
+    "entry_active": False # Trava de fluxo 1:1
 }
 
 def _save_learn():
@@ -97,12 +100,23 @@ async def send_telegram_message(chat_id: str, text: str):
 
 def is_entrada_confirmada(text: str) -> bool:
     """
-    Detecta se a mensagem é um sinal de entrada de aposta (ignorando a cor).
+    <<< FILTRO ESTRITO >>>
+    Só retorna True se a mensagem contiver as palavras-chave do padrão de aposta mista
+    (entrada, branco como proteção, e gales). Ignora todo o resto.
     """
     t = _strip_accents(text.lower())
-    if any(x in t for x in ["entrada", "apostar", "entrar apos", "jogo", "confirma"]):
-        return not any(x in t for x in ["g1", "g2", "protecao", "proteção"])
-    return False
+    
+    # Critério 1: Deve ser um sinal de aposta (entrada/apostar)
+    is_entry_format = any(x in t for x in ["entrada confirmada", "apostar no"])
+
+    # Critério 2: Deve ser uma aposta mista/proteção focada no BRANCO
+    is_mixed_bet = ("branco como protecao" in t or "branco como proteção" in t)
+    
+    # Critério 3: Deve mencionar Gales (como nos exemplos do usuário)
+    mentions_gale = ("gale" in t or "gales" in t)
+
+    # Só aceita se atender a todos os critérios.
+    return is_entry_format and is_mixed_bet and mentions_gale
 
 def build_entry_message(text_original: str) -> str:
     """
@@ -122,7 +136,7 @@ def build_entry_message(text_original: str) -> str:
 def classificar_resultado(txt: str) -> Optional[str]:
     """
     Classifica a mensagem como GREEN, LOSS ou None (ignorável).
-    APENAS VITÓRIAS NO BRANCO são GREEN. Outras vitórias/derrotas são LOSS.
+    APENAS VITÓRIAS NO BRANCO são GREEN.
     """
     t = _strip_accents(txt.lower())
     
@@ -155,7 +169,7 @@ def build_result_message(resultado_txt: str) -> str:
 # ===================== WEBHOOK =====================
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "JonBet - Branco Automático (Trava 1:1 Ativa)"}
+    return {"status": "ok", "service": "JonBet - Branco Automático (Filtro Estrito e Trava 1:1 Ativa)"}
 
 @app.post(f"/webhook/{{webhook_token}}")
 async def webhook(webhook_token: str, request: Request):
@@ -171,6 +185,7 @@ async def webhook(webhook_token: str, request: Request):
     chat_id = str(msg.get("chat", {}).get("id"))
     text = (msg.get("text") or "").strip()
 
+    # Ignora mensagens do próprio canal de destino e de fontes não autorizadas
     if chat_id == CANAL_DESTINO_ID or chat_id not in CANAL_ORIGEM_IDS:
         return {"ok": True, "action": "ignored_channel"}
 
@@ -219,6 +234,6 @@ async def webhook(webhook_token: str, request: Request):
         _save_learn()
         return {"ok": True, "action": "entry_converted_and_locked"}
 
-    # ========================== BLOCO DE IGNORAR ==========================
+    # ========================== BLOCO DE IGNORAR (TUDO MAIS) ==========================
     _save_learn() 
     return {"ok": True, "action": "ignored"}
