@@ -1,9 +1,6 @@
 # -*- coding: utf-8 -*-
-# ✅ JonBet Auto Bot — Modo Aprendizado Ativo + Atualização de Resultado
-# - Reenvia todo sinal de entrada no branco ⚪️
-# - Atualiza a mesma mensagem com GREEN/LOSS
-# - Ignora G1, G2, VW, variações etc
-# - Mantém aprendizado e distância entre brancos
+# ✅ JonBet Auto Bot - Reenvio no Branco + Aprendizado Ativo
+# Ignora G1, G2, VW e envia sinais instantâneos no branco
 
 import os
 import json
@@ -11,9 +8,8 @@ import time
 import logging
 import re
 import unicodedata
-from statistics import median
 from datetime import datetime
-from typing import Optional
+from statistics import median
 from fastapi import FastAPI, HTTPException, Request
 import httpx
 
@@ -23,26 +19,26 @@ WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "Jonbet")
 CANAL_ORIGEM_IDS = [s.strip() for s in os.getenv("CANAL_ORIGEM_IDS", "-1003156785631").split(",")]
 CANAL_DESTINO_ID = os.getenv("CANAL_DESTINO_ID", "-1002796105884")
 
-DATA_DIR = "/var/data"
-os.makedirs(DATA_DIR, exist_ok=True)
-LEARN_PATH = os.path.join(DATA_DIR, "learn.json")
-
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 SEND_MESSAGE_URL = f"{TELEGRAM_API_URL}/sendMessage"
 EDIT_MESSAGE_URL = f"{TELEGRAM_API_URL}/editMessageText"
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+DATA_DIR = "/var/data"
+os.makedirs(DATA_DIR, exist_ok=True)
+LEARN_PATH = os.path.join(DATA_DIR, "learn.json")
+HISTORICO_PATH = os.path.join(DATA_DIR, "historico.json")
 
 app = FastAPI()
-last_signal_msg_id: Optional[int] = None
-last_result_text = ""
-last_result_time = 0
+last_signal_time = 0
+last_signal_msg_id = None
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # ===================== APRENDIZADO =====================
 learn_state = {
     "last_white_ts": None,
     "stones_since_last_white": 0,
-    "stones_gaps": [],
+    "stones_gaps": []
 }
 
 def _save_learn():
@@ -54,78 +50,28 @@ def _save_learn():
 
 def _load_learn():
     global learn_state
-    try:
-        if os.path.exists(LEARN_PATH):
+    if os.path.exists(LEARN_PATH):
+        try:
             with open(LEARN_PATH, "r") as f:
-                data = json.load(f)
-            for k, v in learn_state.items():
-                data.setdefault(k, v)
-            learn_state = data
-    except Exception:
-        pass
+                learn_state.update(json.load(f))
+        except Exception:
+            pass
 
 _load_learn()
 
 # ===================== FUNÇÕES =====================
-def _strip_accents(s: str) -> str:
+def _strip_accents(s):
     return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
 
 def _append_bounded(lst, val, maxlen=200):
     lst.append(val)
     if len(lst) > maxlen:
-        del lst[:len(lst)-maxlen]
+        del lst[:len(lst) - maxlen]
 
-def extract_message(data: dict) -> dict:
-    msg = data.get("message") or data.get("channel_post") or {}
-    return {
-        "chat": msg.get("chat", {}),
-        "text": msg.get("text") or "",
-        "message_id": msg.get("message_id")
-    }
+def _now_iso():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-# ===================== CLASSIFICAÇÕES =====================
-def is_entry_signal_any_color(raw: str) -> bool:
-    t = _strip_accents(raw.lower())
-    has_call = any(w in t for w in ["entrada confirmada", "apostar", "entrar apos", "entrar após", "modo de aposta"])
-    has_color = any(w in t for w in ["verde", "preto", "⚫", "⬛", "🟢", "protecao", "proteção", "branco"])
-    # ignora gale, vw, etc
-    if re.search(r"\bg[ ]?1\b|\bg[ ]?2\b|gale|vw|v[ ]?w|variacao win|variação win", t):
-        return False
-    return has_call and has_color
-
-def classificar_resultado(txt: str):
-    t = _strip_accents(txt.lower())
-    menciona_branco = ("branco" in t) or ("⚪" in txt) or ("⬜" in txt)
-    if any(p in t for p in ["vitoria", "vitória", "ganho", "ganhamos", "bateu", "acertou", "win"]) and menciona_branco:
-        return "GREEN"
-    if any(p in t for p in ["loss", "derrota", "nao bateu", "não bateu", "nao deu", "falhou", "perdeu"]):
-        return "LOSS"
-    if any(p in t for p in ["vitoria", "vitória", "bateu", "acertou", "win"]) and not menciona_branco:
-        return "LOSS"
-    return None
-
-# ===================== MENSAGENS =====================
-def build_entry_message() -> str:
-    return (
-        "🚨 **ENTRADA IMEDIATA NO BRANCO!** ⚪️\n\n"
-        "🎯 JOGO: Double JonBet\n"
-        "🔥 FOCO: BRANCO\n"
-        "📊 Aprendizado ativo (sem travas)\n\n"
-        "⚠️ **ESTRATÉGIA: G0 (ZERO GALES)**\n"
-        "💻 Site: Acessar Double"
-    )
-
-def build_result_message(resultado_txt: str) -> str:
-    stones = learn_state.get("stones_since_last_white", 0)
-    med_stones = int(median(learn_state["stones_gaps"])) if learn_state["stones_gaps"] else 0
-    return (
-        f"{resultado_txt}\n\n"
-        f"🪙 *Distância entre BRANCOS:* {stones} pedras "
-        f"(mediana: {med_stones} pedras)"
-    )
-
-# ===================== TELEGRAM =====================
-async def send_telegram_message(chat_id: str, text: str):
+async def send_telegram_message(chat_id, text):
     async with httpx.AsyncClient() as client:
         payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
         try:
@@ -136,30 +82,71 @@ async def send_telegram_message(chat_id: str, text: str):
             logging.error(f"Erro ao enviar mensagem: {e}")
             return None
 
-async def edit_telegram_message(chat_id: str, msg_id: int, text: str):
+async def edit_telegram_message(chat_id, message_id, new_text):
     async with httpx.AsyncClient() as client:
-        payload = {
-            "chat_id": chat_id,
-            "message_id": msg_id,
-            "text": text,
-            "parse_mode": "Markdown"
-        }
+        payload = {"chat_id": chat_id, "message_id": message_id, "text": new_text, "parse_mode": "Markdown"}
         try:
-            await client.post(EDIT_MESSAGE_URL, json=payload, timeout=15)
+            r = await client.post(EDIT_MESSAGE_URL, json=payload, timeout=15)
+            r.raise_for_status()
+            return True
         except Exception as e:
             logging.error(f"Erro ao editar mensagem: {e}")
+            return False
+
+def extract_message(data):
+    msg = data.get("message") or data.get("channel_post") or {}
+    return {"chat": msg.get("chat", {}), "text": msg.get("text") or "", "message_id": msg.get("message_id")}
+
+def classificar_resultado(txt):
+    t = _strip_accents(txt.lower())
+    if any(w in t for w in ["vitoria", "vitória", "green", "acertamos", "acerto"]) and "branco" in t:
+        return "GREEN_VALIDO"
+    if any(w in t for w in ["loss", "derrota", "nao deu", "não deu", "falhou", "perdeu"]):
+        return "LOSS"
+    return None
+
+def is_entrada_confirmada(t):
+    tnorm = _strip_accents(t.lower())
+    if not ("entrada confirmada" in tnorm or "apostar" in tnorm or "entrada" in tnorm):
+        return False
+    # ignora gales e variações
+    if any(w in tnorm for w in ["g1", "g 1", "g2", "g 2", "vw", "variacao", "variação win", "win variação"]):
+        return False
+    # garante que tem preto/verde
+    if any(c in tnorm for c in ["verde", "preto"]):
+        return True
+    return False
+
+# ===================== MENSAGENS =====================
+def build_entry_message():
+    return (
+        "🚨 **ENTRADA IMEDIATA NO BRANCO!** ⚪️\n\n"
+        "🎯 JOGO: Double JonBet\n"
+        "🔥 FOCO: BRANCO\n"
+        "📊 Aprendizado ativo (sem travas)\n\n"
+        "⚠️ **ESTRATÉGIA: G0 (ZERO GALES)**\n"
+        "💻 Site: Acessar Double"
+    )
+
+def build_result_message(resultado_txt):
+    stones = learn_state.get("stones_since_last_white", 0)
+    stones_med = int(median(learn_state["stones_gaps"])) if learn_state["stones_gaps"] else 0
+    return (
+        f"{resultado_txt}\n\n"
+        f"🪙 *Distância entre brancos:* {stones} pedras • mediana global {stones_med} pedras"
+    )
 
 # ===================== ROTAS =====================
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "JonBet — Entrada + Resultado Atualizado"}
+    return {"status": "ok", "service": "JonBet Branco - Aprendizado + Reenvio"}
 
 @app.post(f"/webhook/{{webhook_token}}")
 async def webhook(webhook_token: str, request: Request):
-    global last_signal_msg_id, last_result_text, last_result_time
-
     if webhook_token != WEBHOOK_TOKEN:
-        raise HTTPException(status_code=403, detail="Token incorreto")
+        raise HTTPException(status_code=403, detail="Token incorreto.")
+
+    global last_signal_time, last_signal_msg_id
 
     data = await request.json()
     msg = extract_message(data)
@@ -167,42 +154,35 @@ async def webhook(webhook_token: str, request: Request):
     text = msg["text"].strip()
 
     if chat_id not in CANAL_ORIGEM_IDS:
-        return {"ok": True, "action": "ignored"}
+        return {"ok": True, "action": "ignored_source"}
 
-    # aprendizado: conta pedras
+    # incremento de pedras (toda msg conta)
     learn_state["stones_since_last_white"] = learn_state.get("stones_since_last_white", 0) + 1
 
     # resultado
     resultado = classificar_resultado(text)
-    if resultado in ("GREEN", "LOSS"):
-        if text == last_result_text and time.time() - last_result_time < 15:
-            return {"ok": True, "action": "ignored_duplicate_result"}
-        last_result_text = text
-        last_result_time = time.time()
-
-        if resultado == "GREEN":
-            _append_bounded(learn_state["stones_gaps"], int(learn_state["stones_since_last_white"]), 200)
+    if resultado:
+        if resultado == "GREEN_VALIDO":
+            now = time.time()
+            if learn_state.get("last_white_ts"):
+                gap = now - float(learn_state["last_white_ts"])
+                _append_bounded(learn_state["stones_gaps"], learn_state["stones_since_last_white"], 200)
+            learn_state["last_white_ts"] = now
             learn_state["stones_since_last_white"] = 0
-            learn_state["last_white_ts"] = time.time()
             _save_learn()
-            msg_text = build_result_message("✅ **GREEN no BRANCO!** ⚪️")
-        else:
-            msg_text = build_result_message("❌ **LOSS** 😥")
+            await edit_telegram_message(CANAL_DESTINO_ID, last_signal_msg_id, build_result_message("✅ **GREEN no BRANCO!** ⚪️"))
+        elif resultado == "LOSS":
+            await edit_telegram_message(CANAL_DESTINO_ID, last_signal_msg_id, build_result_message("❌ **LOSS** 😥"))
+        return {"ok": True, "action": "resultado_processado"}
 
-        if last_signal_msg_id:
-            await edit_telegram_message(CANAL_DESTINO_ID, last_signal_msg_id, msg_text)
-            last_signal_msg_id = None
-        else:
-            await send_telegram_message(CANAL_DESTINO_ID, msg_text)
-        return {"ok": True, "action": f"{resultado.lower()}_logged"}
-
-    # entrada
-    if is_entry_signal_any_color(text):
-        msg_id = await send_telegram_message(CANAL_DESTINO_ID, build_entry_message())
-        if msg_id:
-            last_signal_msg_id = msg_id
+    # sinal de entrada
+    if is_entrada_confirmada(text):
+        last_signal_msg_id = await send_telegram_message(CANAL_DESTINO_ID, build_entry_message())
+        last_signal_time = time.time()
+        with open(HISTORICO_PATH, "a") as f:
+            f.write(json.dumps({"hora": _now_iso(), "tipo": "entrada"}) + "\n")
         _save_learn()
-        return {"ok": True, "action": "entry_sent"}
+        return {"ok": True, "action": "sinal_enviado"}
 
     _save_learn()
     return {"ok": True, "action": "ignored"}
