@@ -37,7 +37,8 @@ learn_state = {
     "last_white_ts": None,
     "white_gaps": [],
     "stones_since_last_white": 0,
-    "stones_gaps": []
+    "stones_gaps": [],
+    "entry_active": False # <--- NOVA VARIÁVEL DE ESTADO
 }
 
 def _save_learn():
@@ -52,7 +53,9 @@ def _load_learn():
     try:
         if os.path.exists(LEARN_PATH):
             with open(LEARN_PATH, "r") as f:
-                learn_state.update(json.load(f))
+                loaded_state = json.load(f)
+                # Mantém a nova variável de estado se não existir no arquivo (primeira execução)
+                learn_state.update(loaded_state) 
     except Exception:
         pass
 
@@ -97,7 +100,6 @@ def ignorar_gale(text: str) -> bool:
     t = _strip_accents(text.lower())
     return any(x in t for x in ["g1", "g2", "vw", "protecao", "proteção", "⚠️"])
 
-# Função de classificação corrigida para maior robustez
 def classificar_resultado(txt: str) -> Optional[str]:
     t = _strip_accents(txt.lower())
     
@@ -118,8 +120,6 @@ def classificar_resultado(txt: str) -> Optional[str]:
     return None
 
 def build_entry_message(num_alvo: str) -> str:
-    # A contagem de pedras é incrementada antes da entrada, então a contagem aqui já está correta.
-    # Esta função só gera a mensagem de entrada.
     return (
         "✅ Entrada confirmada!\n"
         "Apostar no branco ⚪️\n"
@@ -130,7 +130,6 @@ def build_entry_message(num_alvo: str) -> str:
 
 def build_result_message(resultado_txt: str) -> str:
     stones = learn_state.get("stones_since_last_white", 0)
-    # A mediana pode falhar se não houver dados, garantimos que seja int ou 0
     try:
         med_stones = int(median(learn_state["stones_gaps"])) if learn_state["stones_gaps"] else 0
     except Exception:
@@ -174,46 +173,66 @@ async def webhook(webhook_token: str, request: Request):
     resultado = classificar_resultado(text)
     print("🔍 [DEBUG] Resultado classificado:", resultado)
     
-    # Se for um resultado, processa e envia a mensagem FINAL com a distância
-    if resultado == "GREEN_VALIDO":
-        now = time.time()
-        # Se houve um white anterior, loga o gap.
-        if learn_state.get("last_white_ts"):
-            gap = now - float(learn_state["last_white_ts"])
-            _append_bounded(learn_state["white_gaps"], gap, 200)
-            _append_bounded(learn_state["stones_gaps"], learn_state["stones_since_last_white"], 200)
-            
-        learn_state["last_white_ts"] = now
-        learn_state["stones_since_last_white"] = 0 # Zera a contagem de pedras
-        _save_learn()
-
-        msg_text = build_result_message("✅ **GREEN no BRANCO!** ⚪️")
-        print("✅ [DEBUG] Enviando mensagem de GREEN:", msg_text)
-        await send_telegram_message(CANAL_DESTINO_ID, msg_text)
-        return {"ok": True, "action": "green_logged"}
-
-    elif resultado == "LOSS":
-        # Não zera a contagem de pedras (porque o branco não saiu)
-        _save_learn() 
-        msg_text = build_result_message("❌ **LOSS** 😥")
-        print("❌ [DEBUG] Enviando mensagem de LOSS:", msg_text)
-        await send_telegram_message(CANAL_DESTINO_ID, msg_text)
-        return {"ok": True, "action": "loss_logged"}
+    entry_is_active = learn_state.get("entry_active", False) # Verifica se há um sinal ativo
+    
+    # ========================== BLOCO DE RESULTADO ==========================
+    if resultado == "GREEN_VALIDO" or resultado == "LOSS":
         
-    # Se não for resultado, TENTA CLASSIFICAR COMO ENTRADA
+        if not entry_is_active:
+            # IGNORA o resultado se NENHUM SINAL DE ENTRADA foi postado.
+            print(f"⚠️ [DEBUG] {resultado} ignorado: Nenhuma entrada ativa registrada para este resultado.")
+            _save_learn() 
+            return {"ok": True, "action": "result_ignored_no_entry"}
+            
+        # O SINAL ESTÁ ATIVO, ENTÃO PROCESSAMOS O RESULTADO:
+        learn_state["entry_active"] = False # RESETA O ESTADO: um resultado finalizou a entrada
+        
+        if resultado == "GREEN_VALIDO":
+            now = time.time()
+            if learn_state.get("last_white_ts"):
+                gap = now - float(learn_state["last_white_ts"])
+                _append_bounded(learn_state["white_gaps"], gap, 200)
+                _append_bounded(learn_state["stones_gaps"], learn_state["stones_since_last_white"], 200)
+                
+            learn_state["last_white_ts"] = now
+            learn_state["stones_since_last_white"] = 0 # Zera a contagem de pedras (saiu branco)
+
+            msg_text = build_result_message("✅ **GREEN no BRANCO!** ⚪️")
+            print("✅ [DEBUG] Enviando mensagem de GREEN (sinal ativo):", msg_text)
+            await send_telegram_message(CANAL_DESTINO_ID, msg_text)
+            _save_learn()
+            return {"ok": True, "action": "green_logged"}
+
+        elif resultado == "LOSS":
+            # Não zera a contagem de pedras (porque o branco não saiu)
+            msg_text = build_result_message("❌ **LOSS** 😥")
+            print("❌ [DEBUG] Enviando mensagem de LOSS (sinal ativo):", msg_text)
+            await send_telegram_message(CANAL_DESTINO_ID, msg_text)
+            _save_learn()
+            return {"ok": True, "action": "loss_logged"}
+        
+    # ========================== BLOCO DE ENTRADA ==========================
     if is_entrada_confirmada(text) and not ignorar_gale(text):
-        # Aumenta a contagem de pedras somente se for um novo sinal de entrada/jogada
+        
+        if entry_is_active:
+             # IGNORA o novo sinal se o sinal anterior ainda não foi finalizado.
+             print("⚠️ [DEBUG] Entrada ignorada: Já existe um sinal ativo aguardando resultado.")
+             return {"ok": True, "action": "entry_ignored_active_trade"}
+             
+        # Aumenta a contagem de pedras (pois este é o novo sinal de entrada)
         learn_state["stones_since_last_white"] = learn_state.get("stones_since_last_white", 0) + 1
-        _save_learn()
+        learn_state["entry_active"] = True # <--- ATIVA O ESTADO: AGORA ESTAMOS AGUARDANDO UM RESULTADO
 
         m = re.search(r"(\d{1,2})", text)
         num_alvo = m.group(1) if m else "?"
         msg_text = build_entry_message(num_alvo)
         print("🎯 [DEBUG] Entrada detectada! Enviando:", msg_text)
         await send_telegram_message(CANAL_DESTINO_ID, msg_text)
+        _save_learn()
         return {"ok": True, "action": "entry_forwarded"}
 
-    # Se a mensagem não é nem resultado nem entrada, é ignorada, mas a contagem de pedras não é afetada.
+    # ========================== BLOCO DE IGNORAR ==========================
+    # Se a mensagem não é nem resultado (e não estava ativo) nem entrada, é ignorada.
     print("⚪ [DEBUG] Nenhum evento identificado. Texto:", text)
-    # Não precisa salvar o learn_state aqui, pois não houve alteração no estado se não for entrada/resultado.
+    _save_learn() # Salvando caso o estado entry_active seja a única alteração
     return {"ok": True, "action": "ignored"}
