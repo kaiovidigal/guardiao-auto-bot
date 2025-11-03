@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: jonbet-branco
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port 10000
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: WEBHOOK_TOKEN
+        value: Jonbet
+      - key: CANAL_ORIGEM_IDS
+        value: "-1003156785631"
+      - key: CANAL_DESTINO_ID
+        value: "-1002796105884"
