@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # ✅ JonBet Auto Bot - Conversor de sinais (Conversão Total para o BRANCO)
-# Regras: Converte tudo para BRANCO. Só aceita "GREEN no BRANCO" como GREEN.
+# REGRAS: Converte tudo para BRANCO. Só aceita "GREEN no BRANCO" como GREEN.
+# CONTROLE DE FLUXO: Trava (Lock) 1:1 ativada para evitar duplicação de sinais.
 
 import os
 import json
@@ -8,7 +9,6 @@ import time
 import logging
 import re
 import unicodedata
-from datetime import datetime
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Request
 import httpx
@@ -16,7 +16,6 @@ from statistics import median
 
 # ===================== CONFIG =====================
 # Variáveis de Ambiente. Certifique-se de que estão definidas no Render!
-# ATENÇÃO: Verifique se estes IDs estão corretos no seu Render!
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "Jonbet")
 CANAL_ORIGEM_IDS = [s.strip() for s in os.getenv("CANAL_ORIGEM_IDS", "-1003156785631").split(",")]
@@ -39,11 +38,12 @@ learn_state = {
     "last_white_ts": None,
     "white_gaps": [],
     "stones_since_last_white": 0,
-    "stones_gaps": []
+    "stones_gaps": [],
+    "entry_active": False # <--- REINTRODUÇÃO DA TRAVA (LOCK)
 }
 
 def _save_learn():
-    """Salva o estado atual do aprendizado (gaps/pedras) no arquivo."""
+    """Salva o estado atual do aprendizado (gaps/pedras/lock) no arquivo."""
     try:
         with open(LEARN_PATH, "w") as f:
             json.dump(learn_state, f)
@@ -100,9 +100,7 @@ def is_entrada_confirmada(text: str) -> bool:
     Detecta se a mensagem é um sinal de entrada de aposta (ignorando a cor).
     """
     t = _strip_accents(text.lower())
-    # Foca em palavras de aposta
     if any(x in t for x in ["entrada", "apostar", "entrar apos", "jogo", "confirma"]):
-        # Filtro MINIMALISTA: Ignora se for claramente um GALE ou proteção
         return not any(x in t for x in ["g1", "g2", "protecao", "proteção"])
     return False
 
@@ -110,12 +108,9 @@ def build_entry_message(text_original: str) -> str:
     """
     Constrói a mensagem de entrada, forçando o sinal para o BRANCO (⚪️).
     """
-    
-    # Tenta extrair o número alvo da mensagem original (se houver)
     m = re.search(r"(\d{1,2})", text_original)
     num_alvo = m.group(1) if m else "?"
     
-    # Mensagem padronizada e convertida para o BRANCO
     return (
         "🚨 **CONVERSÃO: ENTRADA IMEDIATA NO BRANCO!** ⚪️\n\n"
         f"Apostar no **Branco** ⚪️\n"
@@ -127,7 +122,7 @@ def build_entry_message(text_original: str) -> str:
 def classificar_resultado(txt: str) -> Optional[str]:
     """
     Classifica a mensagem como GREEN, LOSS ou None (ignorável).
-    APENAS VITÓRIAS NO BRANCO são GREEN. Outras vitórias são LOSS na nossa estratégia.
+    APENAS VITÓRIAS NO BRANCO são GREEN. Outras vitórias/derrotas são LOSS.
     """
     t = _strip_accents(txt.lower())
     
@@ -137,7 +132,7 @@ def classificar_resultado(txt: str) -> Optional[str]:
         if "branco" in t or "⚪" in txt:
             return "GREEN_VALIDO"
         
-        # Se for uma vitória (green, acerto), mas NÃO no BRANCO, para a nossa estratégia é LOSS.
+        # Se for vitória (preto/verde), classifica como LOSS para a nossa estratégia
         return "LOSS" 
     
     # BLOCO 2: DETECTA LOSS EXPLÍCITO
@@ -148,22 +143,19 @@ def classificar_resultado(txt: str) -> Optional[str]:
 
 def build_result_message(resultado_txt: str) -> str:
     """Gera a mensagem de resultado formatada com dados de aprendizado."""
-    
-    # Calcula a distância entre os brancos (pedras jogadas)
     stones = learn_state.get("stones_since_last_white", 0)
     try:
         med_stones = int(median(learn_state["stones_gaps"])) if learn_state["stones_gaps"] else 0
     except Exception:
         med_stones = 0
         
-    # Mensagem de resultado formatada
     return f"Resultado: {resultado_txt}\n\n🪙 *Distância entre brancos:* {stones} pedras (mediana: {med_stones})"
 
 
 # ===================== WEBHOOK =====================
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "JonBet - Branco Automático (Conversão Total e Exclusiva)"}
+    return {"status": "ok", "service": "JonBet - Branco Automático (Trava 1:1 Ativa)"}
 
 @app.post(f"/webhook/{{webhook_token}}")
 async def webhook(webhook_token: str, request: Request):
@@ -179,50 +171,53 @@ async def webhook(webhook_token: str, request: Request):
     chat_id = str(msg.get("chat", {}).get("id"))
     text = (msg.get("text") or "").strip()
 
-    # Ignora mensagens do próprio canal de destino e de fontes não autorizadas
     if chat_id == CANAL_DESTINO_ID or chat_id not in CANAL_ORIGEM_IDS:
         return {"ok": True, "action": "ignored_channel"}
 
     # TENTA CLASSIFICAR RESULTADO PRIMEIRO
     resultado = classificar_resultado(text)
     
-    # ========================== BLOCO DE RESULTADO ==========================
-    if resultado == "GREEN_VALIDO":
-        # Só entra aqui se for uma VITÓRIA NO BRANCO! (Regra de Exclusividade)
-        now = time.time()
-        
-        # Atualiza métricas de gap/pedras
-        if learn_state.get("last_white_ts"):
-            gap = now - float(learn_state["last_white_ts"])
-            _append_bounded(learn_state["white_gaps"], gap, 200)
-            _append_bounded(learn_state["stones_gaps"], learn_state["stones_since_last_white"], 200)
+    # ========================== BLOCO DE RESULTADO (UNLOCK) ==========================
+    if resultado in ["GREEN_VALIDO", "LOSS"]:
+        # Se um resultado chegou, DESTRAVA o fluxo de entrada.
+        if learn_state.get("entry_active"):
+            learn_state["entry_active"] = False # <--- DESTRAVA A ENTRADA
             
-        learn_state["last_white_ts"] = now
-        learn_state["stones_since_last_white"] = 0 # Zera a contagem de pedras (saiu branco)
+        if resultado == "GREEN_VALIDO":
+            now = time.time()
+            if learn_state.get("last_white_ts"):
+                gap = now - float(learn_state["last_white_ts"])
+                _append_bounded(learn_state["white_gaps"], gap, 200)
+                _append_bounded(learn_state["stones_gaps"], learn_state["stones_since_last_white"], 200)
+                
+            learn_state["last_white_ts"] = now
+            learn_state["stones_since_last_white"] = 0 # Zera a contagem de pedras (saiu branco)
 
-        msg_text = build_result_message("✅ **GREEN no BRANCO!** ⚪️")
+            msg_text = build_result_message("✅ **GREEN no BRANCO!** ⚪️")
+        else: # Resultado é LOSS (inclui vitórias preto/verde e derrotas explícitas)
+            msg_text = build_result_message("❌ **LOSS** 😥")
+
         await send_telegram_message(CANAL_DESTINO_ID, msg_text)
         _save_learn()
-        return {"ok": True, "action": "green_logged_white_only"}
-
-    elif resultado == "LOSS":
-        # Entra aqui para LOSS explícito OU VITÓRIA (preto/verde)
-        # Não zera a contagem de pedras (continua esperando o branco)
-        msg_text = build_result_message("❌ **LOSS** 😥")
-        await send_telegram_message(CANAL_DESTINO_ID, msg_text)
-        _save_learn()
-        return {"ok": True, "action": "loss_logged_or_non_white_win"}
+        return {"ok": True, "action": f"result_logged_and_unlocked ({resultado})"}
         
-    # ========================== BLOCO DE ENTRADA (CONVERSÃO TOTAL) ==========================
+    # ========================== BLOCO DE ENTRADA (LOCK) ==========================
     if is_entrada_confirmada(text):
-        # Aumenta a contagem de pedras (pois é um sinal de aposta que não é resultado)
-        learn_state["stones_since_last_white"] = learn_state.get("stones_since_last_white", 0) + 1
+        
+        # Trava: IGNORA se já houver um sinal ativo
+        if learn_state.get("entry_active"):
+            return {"ok": True, "action": "ignored_entry_active_lock"}
 
-        # Converte o sinal para BRANCO (Regra de Conversão Total)
+        # LOCK: Se não houver sinal ativo, TRAVA o fluxo para esperar o resultado
+        learn_state["entry_active"] = True # <--- TRAVA A ENTRADA
+        
+        # Executa o envio e aumenta o contador
+        learn_state["stones_since_last_white"] = learn_state.get("stones_since_last_white", 0) + 1
         msg_text = build_entry_message(text)
+        
         await send_telegram_message(CANAL_DESTINO_ID, msg_text)
         _save_learn()
-        return {"ok": True, "action": "entry_converted_and_forwarded"}
+        return {"ok": True, "action": "entry_converted_and_locked"}
 
     # ========================== BLOCO DE IGNORAR ==========================
     _save_learn() 
