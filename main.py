@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # ✅ JonBet Auto Bot - Conversor de sinais (Conversão Total para o BRANCO)
-# Modo: Fluxo contínuo (SEM TRAVAS) + Conversão de QUALQUER cor para BRANCO
+# Regras: Converte tudo para BRANCO. Só aceita "GREEN no BRANCO" como GREEN.
 
 import os
 import json
@@ -16,6 +16,7 @@ from statistics import median
 
 # ===================== CONFIG =====================
 # Variáveis de Ambiente. Certifique-se de que estão definidas no Render!
+# ATENÇÃO: Verifique se estes IDs estão corretos no seu Render!
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "Jonbet")
 CANAL_ORIGEM_IDS = [s.strip() for s in os.getenv("CANAL_ORIGEM_IDS", "-1003156785631").split(",")]
@@ -42,6 +43,7 @@ learn_state = {
 }
 
 def _save_learn():
+    """Salva o estado atual do aprendizado (gaps/pedras) no arquivo."""
     try:
         with open(LEARN_PATH, "w") as f:
             json.dump(learn_state, f)
@@ -49,6 +51,7 @@ def _save_learn():
         logging.error(f"Erro ao salvar aprendizado: {e}")
 
 def _load_learn():
+    """Carrega o estado do aprendizado ao iniciar o bot."""
     global learn_state
     try:
         if os.path.exists(LEARN_PATH):
@@ -60,16 +63,19 @@ def _load_learn():
 
 _load_learn()
 
-# ===================== FUNÇÕES =====================
+# ===================== FUNÇÕES DE UTILIDADE =====================
 def _strip_accents(s: str) -> str:
+    """Remove acentos de uma string para facilitar a comparação."""
     return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
 
 def _append_bounded(lst, val, maxlen=200):
+    """Adiciona valor à lista, mantendo o tamanho máximo."""
     lst.append(val)
     if len(lst) > maxlen:
         del lst[:len(lst)-maxlen]
 
 def extract_message(data: dict):
+    """Extrai informações relevantes da requisição do Telegram."""
     msg = data.get("message") or data.get("channel_post") or {}
     return {
         "chat": msg.get("chat", {}),
@@ -78,6 +84,7 @@ def extract_message(data: dict):
     }
 
 async def send_telegram_message(chat_id: str, text: str):
+    """Envia uma mensagem formatada via API do Telegram."""
     async with httpx.AsyncClient() as client:
         payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
         try:
@@ -86,20 +93,22 @@ async def send_telegram_message(chat_id: str, text: str):
         except Exception as e:
             logging.error(f"Erro ao enviar mensagem: {e}")
 
-# MANTÉM apenas a detecção de palavras-chave de aposta, ignorando a cor.
+# ===================== FUNÇÕES DE LÓGICA =====================
+
 def is_entrada_confirmada(text: str) -> bool:
+    """
+    Detecta se a mensagem é um sinal de entrada de aposta (ignorando a cor).
+    """
     t = _strip_accents(text.lower())
-    # Foca em palavras de aposta e não em cores específicas
+    # Foca em palavras de aposta
     if any(x in t for x in ["entrada", "apostar", "entrar apos", "jogo", "confirma"]):
         # Filtro MINIMALISTA: Ignora se for claramente um GALE ou proteção
         return not any(x in t for x in ["g1", "g2", "protecao", "proteção"])
     return False
 
-# Esta função é a principal, pois forçamos o BRANCO (⚪️)
 def build_entry_message(text_original: str) -> str:
     """
-    Constrói a mensagem de entrada, forçando o sinal para o BRANCO (⚪️)
-    e formatando-a de forma padronizada.
+    Constrói a mensagem de entrada, forçando o sinal para o BRANCO (⚪️).
     """
     
     # Tenta extrair o número alvo da mensagem original (se houver)
@@ -116,20 +125,30 @@ def build_entry_message(text_original: str) -> str:
     )
 
 def classificar_resultado(txt: str) -> Optional[str]:
+    """
+    Classifica a mensagem como GREEN, LOSS ou None (ignorável).
+    APENAS VITÓRIAS NO BRANCO são GREEN. Outras vitórias são LOSS na nossa estratégia.
+    """
     t = _strip_accents(txt.lower())
     
-    # Detecta se é um resultado de VITÓRIA/GREEN
+    # BLOCO 1: DETECTA VITÓRIA (GREEN)
     if any(w in t for w in ["vitoria", "vitória", "acertamos", "acerto", "green"]):
-        # Retorna GREEN_VALIDO mesmo que o green original tenha sido no preto/verde.
-        return "GREEN_VALIDO"
+        # ✅ VERIFICA RIGOROSA: SÓ ACEITA SE HOUVER A PALAVRA 'BRANCO' OU O SÍMBOLO '⚪'
+        if "branco" in t or "⚪" in txt:
+            return "GREEN_VALIDO"
+        
+        # Se for uma vitória (green, acerto), mas NÃO no BRANCO, para a nossa estratégia é LOSS.
+        return "LOSS" 
     
-    # Detecta se é um resultado de LOSS/DERROTA
+    # BLOCO 2: DETECTA LOSS EXPLÍCITO
     if any(w in t for w in ["loss", "derrota", "nao deu", "não deu", "falhou"]):
         return "LOSS"
         
     return None
 
 def build_result_message(resultado_txt: str) -> str:
+    """Gera a mensagem de resultado formatada com dados de aprendizado."""
+    
     # Calcula a distância entre os brancos (pedras jogadas)
     stones = learn_state.get("stones_since_last_white", 0)
     try:
@@ -144,14 +163,11 @@ def build_result_message(resultado_txt: str) -> str:
 # ===================== WEBHOOK =====================
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "JonBet - Branco Automático (Conversão Total)"}
+    return {"status": "ok", "service": "JonBet - Branco Automático (Conversão Total e Exclusiva)"}
 
 @app.post(f"/webhook/{{webhook_token}}")
 async def webhook(webhook_token: str, request: Request):
-    print("🚀 [DEBUG] Webhook acionado >>>")
-
     if webhook_token != WEBHOOK_TOKEN:
-        print("❌ [DEBUG] Token incorreto recebido:", webhook_token)
         raise HTTPException(status_code=403, detail="Token incorreto")
 
     try:
@@ -163,19 +179,19 @@ async def webhook(webhook_token: str, request: Request):
     chat_id = str(msg.get("chat", {}).get("id"))
     text = (msg.get("text") or "").strip()
 
-    if chat_id == CANAL_DESTINO_ID:
-        return {"ok": True, "action": "ignored_destination"}
-
-    if chat_id not in CANAL_ORIGEM_IDS:
-        return {"ok": True, "action": "ignored_source"}
+    # Ignora mensagens do próprio canal de destino e de fontes não autorizadas
+    if chat_id == CANAL_DESTINO_ID or chat_id not in CANAL_ORIGEM_IDS:
+        return {"ok": True, "action": "ignored_channel"}
 
     # TENTA CLASSIFICAR RESULTADO PRIMEIRO
     resultado = classificar_resultado(text)
     
-    # ========================== BLOCO DE RESULTADO (FLUXO LIVRE) ==========================
+    # ========================== BLOCO DE RESULTADO ==========================
     if resultado == "GREEN_VALIDO":
+        # Só entra aqui se for uma VITÓRIA NO BRANCO! (Regra de Exclusividade)
         now = time.time()
         
+        # Atualiza métricas de gap/pedras
         if learn_state.get("last_white_ts"):
             gap = now - float(learn_state["last_white_ts"])
             _append_bounded(learn_state["white_gaps"], gap, 200)
@@ -187,21 +203,22 @@ async def webhook(webhook_token: str, request: Request):
         msg_text = build_result_message("✅ **GREEN no BRANCO!** ⚪️")
         await send_telegram_message(CANAL_DESTINO_ID, msg_text)
         _save_learn()
-        return {"ok": True, "action": "green_logged"}
+        return {"ok": True, "action": "green_logged_white_only"}
 
     elif resultado == "LOSS":
-        # Não zera a contagem de pedras
+        # Entra aqui para LOSS explícito OU VITÓRIA (preto/verde)
+        # Não zera a contagem de pedras (continua esperando o branco)
         msg_text = build_result_message("❌ **LOSS** 😥")
         await send_telegram_message(CANAL_DESTINO_ID, msg_text)
         _save_learn()
-        return {"ok": True, "action": "loss_logged"}
+        return {"ok": True, "action": "loss_logged_or_non_white_win"}
         
     # ========================== BLOCO DE ENTRADA (CONVERSÃO TOTAL) ==========================
     if is_entrada_confirmada(text):
-        # Aumenta a contagem de pedras
+        # Aumenta a contagem de pedras (pois é um sinal de aposta que não é resultado)
         learn_state["stones_since_last_white"] = learn_state.get("stones_since_last_white", 0) + 1
 
-        # Converte o sinal para BRANCO
+        # Converte o sinal para BRANCO (Regra de Conversão Total)
         msg_text = build_entry_message(text)
         await send_telegram_message(CANAL_DESTINO_ID, msg_text)
         _save_learn()
