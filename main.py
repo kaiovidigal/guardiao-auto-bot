@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# ✅ JonBet Auto Bot - Conversor de sinais (somente Branco ⚪️)
+# ✅ JonBet Auto Bot - Conversor de sinais (modo teste/debug)
 # Modo: Aprendizado ativo + fluxo contínuo (sem gale, sem travas)
 
 import os
@@ -119,29 +119,43 @@ def build_result_message(resultado_txt: str) -> str:
     med_stones = int(median(learn_state["stones_gaps"])) if learn_state["stones_gaps"] else 0
     return f"{resultado_txt}\n\n🪙 *Distância entre brancos:* {stones} pedras (mediana: {med_stones})"
 
-# ===================== WEBHOOK =====================
+
+# ===================== WEBHOOK (COM DEBUG) =====================
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "JonBet - Branco Automático (Fluxo Livre)"}
+    return {"status": "ok", "service": "JonBet - Branco Automático (Modo Teste)"}
 
 @app.post(f"/webhook/{{webhook_token}}")
 async def webhook(webhook_token: str, request: Request):
+    print("🚀 [DEBUG] Webhook acionado >>>")
+
     if webhook_token != WEBHOOK_TOKEN:
+        print("❌ [DEBUG] Token incorreto recebido:", webhook_token)
         raise HTTPException(status_code=403, detail="Token incorreto")
 
-    data = await request.json()
+    try:
+        data = await request.json()
+        print("📦 [DEBUG] JSON recebido bruto:", json.dumps(data, ensure_ascii=False))
+    except Exception as e:
+        print("❌ [DEBUG] Erro ao ler JSON:", e)
+        raise HTTPException(status_code=400, detail="JSON inválido")
+
     msg = extract_message(data)
-    chat_id = str(msg["chat"].get("id"))
-    text = msg["text"].strip()
+    chat_id = str(msg.get("chat", {}).get("id"))
+    text = (msg.get("text") or "").strip()
+
+    print("💬 [DEBUG] chat_id:", chat_id)
+    print("📝 [DEBUG] Texto recebido:", text)
 
     if chat_id not in CANAL_ORIGEM_IDS:
+        print("⚠️ [DEBUG] Ignorado: Canal não autorizado ->", chat_id)
         return {"ok": True, "action": "ignored_source"}
 
-    # Conta pedras
     learn_state["stones_since_last_white"] = learn_state.get("stones_since_last_white", 0) + 1
 
-    # Classifica resultados
     resultado = classificar_resultado(text)
+    print("🔍 [DEBUG] Resultado classificado:", resultado)
+
     if resultado == "GREEN_VALIDO":
         now = time.time()
         if learn_state.get("last_white_ts"):
@@ -152,20 +166,25 @@ async def webhook(webhook_token: str, request: Request):
         learn_state["stones_since_last_white"] = 0
         _save_learn()
 
-        await send_telegram_message(CANAL_DESTINO_ID, build_result_message("✅ **GREEN no BRANCO!** ⚪️"))
+        msg_text = build_result_message("✅ **GREEN no BRANCO!** ⚪️")
+        print("✅ [DEBUG] Enviando mensagem:", msg_text)
+        await send_telegram_message(CANAL_DESTINO_ID, msg_text)
         return {"ok": True, "action": "green_logged"}
 
     elif resultado == "LOSS":
-        await send_telegram_message(CANAL_DESTINO_ID, build_result_message("❌ **LOSS** 😥"))
+        msg_text = build_result_message("❌ **LOSS** 😥")
+        print("❌ [DEBUG] Enviando mensagem:", msg_text)
+        await send_telegram_message(CANAL_DESTINO_ID, msg_text)
         return {"ok": True, "action": "loss_logged"}
 
-    # Detecta entrada confirmada
     if is_entrada_confirmada(text) and not ignorar_gale(text):
-        # Pega número após "Entrar após:"
         m = re.search(r"(\d{1,2})", text)
         num_alvo = m.group(1) if m else "?"
-        await send_telegram_message(CANAL_DESTINO_ID, build_entry_message(num_alvo))
+        msg_text = build_entry_message(num_alvo)
+        print("🎯 [DEBUG] Entrada detectada! Enviando:", msg_text)
+        await send_telegram_message(CANAL_DESTINO_ID, msg_text)
         return {"ok": True, "action": "entry_forwarded"}
 
+    print("⚪ [DEBUG] Nenhum evento identificado. Texto:", text)
     _save_learn()
     return {"ok": True, "action": "ignored"}
