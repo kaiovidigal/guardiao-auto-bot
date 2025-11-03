@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
-# ✅ JonBet Auto Bot — Modo Aprendizado Ativo (Render)
-# - Reenvia todo sinal como "Entrada no BRANCO"
-# - Substitui o sinal anterior com resultado (GREEN/LOSS)
-# - Ignora G1, G2, Gale, VW, variação etc
-# - Mantém aprendizado: distância entre brancos
-# - Proteção anti-duplicação de resultados
+# ✅ JonBet Auto Bot — Modo Aprendizado Ativo + Atualização de Resultado
+# - Reenvia todo sinal de entrada no branco ⚪️
+# - Atualiza a mesma mensagem com GREEN/LOSS
+# - Ignora G1, G2, VW, variações etc
+# - Mantém aprendizado e distância entre brancos
 
 import os
 import json
@@ -35,11 +34,9 @@ EDIT_MESSAGE_URL = f"{TELEGRAM_API_URL}/editMessageText"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 app = FastAPI()
-last_signal_time = 0
 last_signal_msg_id: Optional[int] = None
 last_result_text = ""
 last_result_time = 0
-app.state.processed_entries = set()
 
 # ===================== APRENDIZADO =====================
 learn_state = {
@@ -89,7 +86,7 @@ def extract_message(data: dict) -> dict:
 # ===================== CLASSIFICAÇÕES =====================
 def is_entry_signal_any_color(raw: str) -> bool:
     t = _strip_accents(raw.lower())
-    has_call = any(w in t for w in ["entrada confirmada", "entrar", "entrada", "apostar", "aposta"])
+    has_call = any(w in t for w in ["entrada confirmada", "apostar", "entrar apos", "entrar após", "modo de aposta"])
     has_color = any(w in t for w in ["verde", "preto", "⚫", "⬛", "🟢", "protecao", "proteção", "branco"])
     # ignora gale, vw, etc
     if re.search(r"\bg[ ]?1\b|\bg[ ]?2\b|gale|vw|v[ ]?w|variacao win|variação win", t):
@@ -148,19 +145,18 @@ async def edit_telegram_message(chat_id: str, msg_id: int, text: str):
             "parse_mode": "Markdown"
         }
         try:
-            r = await client.post(EDIT_MESSAGE_URL, json=payload, timeout=15)
-            r.raise_for_status()
+            await client.post(EDIT_MESSAGE_URL, json=payload, timeout=15)
         except Exception as e:
             logging.error(f"Erro ao editar mensagem: {e}")
 
 # ===================== ROTAS =====================
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "JonBet — Substitui resultado no branco"}
+    return {"status": "ok", "service": "JonBet — Entrada + Resultado Atualizado"}
 
 @app.post(f"/webhook/{{webhook_token}}")
 async def webhook(webhook_token: str, request: Request):
-    global last_signal_msg_id, last_signal_time, last_result_text, last_result_time
+    global last_signal_msg_id, last_result_text, last_result_time
 
     if webhook_token != WEBHOOK_TOKEN:
         raise HTTPException(status_code=403, detail="Token incorreto")
@@ -173,14 +169,13 @@ async def webhook(webhook_token: str, request: Request):
     if chat_id not in CANAL_ORIGEM_IDS:
         return {"ok": True, "action": "ignored"}
 
-    # conta pedras
+    # aprendizado: conta pedras
     learn_state["stones_since_last_white"] = learn_state.get("stones_since_last_white", 0) + 1
 
-    # classifica resultado
+    # resultado
     resultado = classificar_resultado(text)
     if resultado in ("GREEN", "LOSS"):
-        # anti duplicação: evita repetição do mesmo texto
-        if text == last_result_text and time.time() - last_result_time < 20:
+        if text == last_result_text and time.time() - last_result_time < 15:
             return {"ok": True, "action": "ignored_duplicate_result"}
         last_result_text = text
         last_result_time = time.time()
@@ -199,17 +194,15 @@ async def webhook(webhook_token: str, request: Request):
             last_signal_msg_id = None
         else:
             await send_telegram_message(CANAL_DESTINO_ID, msg_text)
-
         return {"ok": True, "action": f"{resultado.lower()}_logged"}
 
-    # detectar entrada
+    # entrada
     if is_entry_signal_any_color(text):
         msg_id = await send_telegram_message(CANAL_DESTINO_ID, build_entry_message())
         if msg_id:
             last_signal_msg_id = msg_id
-            last_signal_time = time.time()
         _save_learn()
-        return {"ok": True, "action": "entry_forwarded"}
+        return {"ok": True, "action": "entry_sent"}
 
     _save_learn()
     return {"ok": True, "action": "ignored"}
