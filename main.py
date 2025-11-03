@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 # ✅ JonBet Auto Bot — Modo Aprendizado Ativo (Render)
 # - Reenvia TODO sinal como "Entrada no BRANCO" pro canal destino
-# - Resultado: só GREEN se a mensagem afirmar vitória no branco
+# - Ignora sinais de Gale (G1, G2, Gale 1/2, VW, variação win)
+# - Resultado: só GREEN se a mensagem indicar vitória no branco
 # - Aprende tempo entre brancos e "pedras" (contador incremental)
 # - Sem travas, sem estratégia, só forward + aprendizado
 
@@ -23,11 +24,8 @@ WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "Jonbet")
 CANAL_ORIGEM_IDS = [s.strip() for s in os.getenv("CANAL_ORIGEM_IDS", "-1003156785631").split(",")]
 CANAL_DESTINO_ID = os.getenv("CANAL_DESTINO_ID", "-1002796105884")
 
-# Sem travas
 COOLDOWN_SECONDS = 0
-RESULT_WINDOW_SECONDS = 600  # janela para parear resultado com última entrada (p/ editar no futuro, se quiser)
-
-# Aprendizado ligado, mas SEM usar para travar fluxo
+RESULT_WINDOW_SECONDS = 600
 SMART_TIMING = True
 
 DATA_DIR = "/var/data"
@@ -48,12 +46,12 @@ app.state.processed_entries = set()
 
 # ===================== APRENDIZADO =====================
 learn_state = {
-    "deltas": [],                 # segundos sinal->resultado (se quiser usar depois)
+    "deltas": [],
     "last_entry_ts": None,
-    "last_white_ts": None,        # timestamp do último GREEN no branco
-    "white_gaps": [],             # segundos entre brancos
-    "stones_since_last_white": 0, # "pedras" desde o último branco (contador incremental)
-    "stones_gaps": [],            # histórico de pedras entre brancos
+    "last_white_ts": None,
+    "white_gaps": [],
+    "stones_since_last_white": 0,
+    "stones_gaps": [],
 }
 
 def _save_learn():
@@ -69,7 +67,6 @@ def _load_learn():
         if os.path.exists(LEARN_PATH):
             with open(LEARN_PATH, "r") as f:
                 data = json.load(f)
-            # garante chaves
             for k, v in learn_state.items():
                 data.setdefault(k, v)
             learn_state = data
@@ -98,53 +95,48 @@ def extract_message(data: dict) -> dict:
         "message_id": msg.get("message_id")
     }
 
-# ===== entradas =====
+# ===================== CLASSIFICAÇÕES =====================
 def is_pre_signal(t: str) -> bool:
     t = _strip_accents(t)
-    return any(w in t for w in ["possivel entrada","possível entrada","analisando","analise","analise","aguarde","ainda nao","ainda não","esperar","esperem"])
+    return any(w in t for w in ["possivel entrada","possível entrada","analisando","analise","aguarde","ainda nao","ainda não","esperar","esperem"])
 
 def is_entry_signal_any_color(raw: str) -> bool:
     """
     Detecta "sinal de entrada" independente da cor (verde/preto),
-    para sempre reenviar como ENTRADA NO BRANCO no canal destino.
+    mas ignora gales e variações VW.
     """
     t = _strip_accents(raw.lower())
-    # palavras fortes de chamada
+
+    # palavras que indicam sinal
     has_call = any(w in t for w in [
         "entrada confirmada", "entrar", "entrada", "apostar", "aposta", "aposte"
     ])
-    # indícios de cor/estratégia do canal fonte (vamos converter tudo pra branco)
-    has_color_or_prot = any(w in t for w in ["verde", "preto", "⚫", "⬛", "🟢", "protecao", "proteção", "branco"])
-    return has_call and not is_pre_signal(t) and has_color_or_prot
 
-# ===== resultados =====
+    # palavras de cor / padrão
+    has_color = any(w in t for w in ["verde", "preto", "⚫", "⬛", "🟢", "protecao", "proteção", "branco"])
+
+    # filtrar mensagens de gale
+    if re.search(r"\bg[ ]?1\b|\bg[ ]?2\b|gale|vw|v[ ]?w|variacao win|variação win", t):
+        return False  # ignora sinais de gale ou VW
+
+    return has_call and has_color and not is_pre_signal(t)
+
 def classificar_resultado(txt: str) -> Optional[str]:
     """
-    Regras do destino:
-      - GREEN apenas se a mensagem indicar vitória no BRANCO (⚪ / "branco").
-      - Qualquer outro win (verde/preto) => LOSS no nosso canal.
+    Resultado: só GREEN se vitória for no branco (⚪ ou 'branco'),
+    qualquer outra vitória => LOSS.
     """
     t = _strip_accents(txt.lower())
     menciona_branco = ("branco" in t) or ("⚪" in txt) or ("⬜" in txt)
-
-    # termos de vitória
-    has_vitoria = any(p in t for p in [
-        "vitoria", "vitória", "ganho", "ganhamos", "bateu", "acertou", "deu certo", "win"
-    ])
-    # termos de derrota
-    has_derrota = any(p in t for p in [
-        "derrota", "loss", "perdeu", "nao bateu", "não bateu", "nao deu", "não deu", "falhou"
-    ])
+    has_vitoria = any(p in t for p in ["vitoria", "vitória", "ganho", "ganhamos", "bateu", "acertou", "win"])
+    has_derrota = any(p in t for p in ["derrota", "loss", "perdeu", "nao bateu", "não bateu", "nao deu", "falhou"])
 
     if has_vitoria and menciona_branco:
         return "GREEN_VALIDO"
     if has_derrota:
         return "LOSS"
-
-    # Se disser "bateu verde/preto" sem citar branco => LOSS
     if has_vitoria and not menciona_branco:
         return "LOSS"
-
     return None
 
 # ===================== MENSAGENS =====================
@@ -192,7 +184,7 @@ async def send_telegram_message(chat_id: str, text: str) -> Optional[int]:
 # ===================== ROTAS =====================
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "JonBet — Aprendizado + Forward para BRANCO"}
+    return {"status": "ok", "service": "JonBet — Aprendizado + Forward BRANCO (sem Gale/VW)"}
 
 @app.post(f"/webhook/{{webhook_token}}")
 async def webhook(webhook_token: str, request: Request):
@@ -206,22 +198,18 @@ async def webhook(webhook_token: str, request: Request):
     chat_id = str(msg["chat"].get("id"))
     text = (msg["text"] or "").strip()
 
-    # Só processa canal(es) fonte configurado(s)
+    # só processa canal de origem
     if chat_id not in CANAL_ORIGEM_IDS:
         return {"ok": True, "action": "ignored_wrong_source"}
 
-    # ===== Aprendizado: incrementa "pedras" a cada mensagem do canal-fonte
-    try:
-        learn_state["stones_since_last_white"] = int(learn_state.get("stones_since_last_white", 0)) + 1
-    except Exception:
-        learn_state["stones_since_last_white"] = 1
+    # aprendizado: conta pedra
+    learn_state["stones_since_last_white"] = learn_state.get("stones_since_last_white", 0) + 1
     _save_learn()
 
-    # ===== Resultado (GREEN/LOSS) — regra do destino
+    # resultado
     res = classificar_resultado(text)
     if res == "GREEN_VALIDO":
         now = time.time()
-        # aprender tempo e pedras
         if learn_state.get("last_white_ts"):
             gap = now - float(learn_state["last_white_ts"])
             if gap > 0:
@@ -230,32 +218,25 @@ async def webhook(webhook_token: str, request: Request):
         learn_state["last_white_ts"] = now
         learn_state["stones_since_last_white"] = 0
         _save_learn()
-
         await send_telegram_message(CANAL_DESTINO_ID, build_result_message("✅ **GREEN no BRANCO!** ⚪️"))
         return {"ok": True, "action": "green_logged"}
 
     if res == "LOSS":
-        # Não zera pedras aqui (não bateu branco)
         await send_telegram_message(CANAL_DESTINO_ID, build_result_message("❌ **LOSS** 😥"))
         return {"ok": True, "action": "loss_logged"}
 
-    # ===== Entrada — qualquer cor do fonte vira ENTRADA NO BRANCO no destino
+    # entrada
     if is_entry_signal_any_color(text):
-        # sem cooldown e sem bloqueios
         last_signal_msg_id = await send_telegram_message(CANAL_DESTINO_ID, build_entry_message())
         last_signal_time = time.time()
-        # log simples (opcional)
         try:
             with open(HISTORICO_PATH, "a") as f:
                 f.write(json.dumps({"hora": _now_iso(), "tipo": "entrada", "fonte": chat_id}) + "\n")
         except Exception:
             pass
-        # marca ts p/ futura medição (se quiser)
         if SMART_TIMING:
             learn_state["last_entry_ts"] = time.time()
             _save_learn()
         return {"ok": True, "action": "entry_forwarded"}
 
-    # Se não for entrada nem resultado, só aprendemos as pedras e seguimos
-    _save_learn()
     return {"ok": True, "action": "ignored"}
