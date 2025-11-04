@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-# ✅ JonBet Auto Bot - Conversor de sinais (Versão Final com Limpeza Agressiva)
-# REGRAS DEFINITIVAS:
-# 1. LIMPEZA ABRANGENTE: Remove emojis, acentos e símbolos para garantir o reconhecimento de texto.
-# 2. FILTRO FLEXÍVEL: Adaptado para reconhecer o novo formato de entrada (Double Blaze, Entrada, Gale).
-# 3. CONVERSÃO: Converte o sinal filtrado para uma entrada simples no BRANCO.
-# 4. RESULTADO MÁXIMA RIGIDEZ: GREEN só é validado se o resultado mencionar BRANCO ou ⚪.
-# 5. CONTROLE DE FLUXO: Trava (Lock) 1:1 ativada.
-# 6. MENSAGEM DE RESULTADO SIMPLIFICADA.
+# ✅ JonBet Auto Bot - Conversor de sinais (Versão Final e Estável)
+# REGRAS DEFINITIVAS APLICADAS:
+# 1. LIMPEZA ABRANGENTE: Garante o reconhecimento de texto do novo formato com emojis (🎲, 🎰, etc.).
+# 2. FILTRO FLEXÍVEL: Reconhece o novo formato de ENTRADA (Double Blaze, Entrada, Gale) e IGNORA resultados como entradas.
+# 3. CONVERSÃO EXCLUSIVA: Transforma QUALQUER entrada no sinal BRANCO (⚪️).
+# 4. RESULTADO MÁXIMA RIGIDEZ: GREEN só é validado se o resultado mencionar BRANCO ou ⚪. Vitórias em outras cores são LOSS.
+# 5. MENSAGEM SIMPLIFICADA: Resultado final é apenas "GREEN!" ou "LOSS 😥", sem a menção "no BRANCO".
+# 6. CONTROLE DE FLUXO: Trava (Lock) 1:1 ativada para evitar duplicação.
 
 import os
 import json
@@ -71,7 +71,10 @@ _load_learn()
 
 # ===================== FUNÇÕES DE UTILIDADE =====================
 def _strip_accents(s: str) -> str:
-    """Remove acentos, emojis e caracteres especiais de uma string para facilitar a comparação."""
+    """
+    Remove acentos, emojis e caracteres especiais de uma string, deixando apenas
+    letras, números e espaços, para garantir o reconhecimento das palavras-chave.
+    """
     # 1. Normaliza para remover acentos
     nfkd_form = unicodedata.normalize('NFKD', s)
     # 2. Remove todos os caracteres que não são ASCII (incluindo a maioria dos emojis)
@@ -126,7 +129,7 @@ def is_entrada_confirmada(text: str) -> bool:
     # Critério 3: Deve mencionar a gestão (Gale)
     mentions_gale = "gale" in t_cleaned
 
-    # Critério 4 (MAIS IMPORTANTE): Deve IGNORAR resultados.
+    # Critério 4 (MAIS IMPORTANTE): Deve IGNORAR resultados, que usam 'WIN!', 'LOSS', '✅', '❌' ou 'derrota'
     is_not_result = not any(w in t_cleaned for w in ["win", "loss", "derrota"])
 
     # Só aceita se atender a todos os critérios e não for um resultado.
