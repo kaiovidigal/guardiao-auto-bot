@@ -3,7 +3,7 @@
 # REGRAS DEFINITIVAS:
 # 1. FILTRO ESTRITO: Só aceita sinais no padrão 'Apostar no [cor] e ⚪ branco como proteção! [x] Gales'.
 # 2. CONVERSÃO: Converte o sinal filtrado para uma entrada simples no BRANCO.
-# 3. RESULTADO RIGOROSO: Só aceita "GREEN no BRANCO" como GREEN. Vitórias em outras cores são LOSS.
+# 3. RESULTADO MÁXIMA RIGIDEZ: Só aceita a combinação explícita de palavras para GREEN/LOSS.
 # 4. CONTROLE DE FLUXO: Trava (Lock) 1:1 ativada para evitar duplicação.
 # 5. MENSAGEM DE RESULTADO SIMPLIFICADA (apenas GREEN/LOSS e métricas).
 
@@ -135,23 +135,18 @@ def build_entry_message(text_original: str) -> str:
 
 def classificar_resultado(txt: str) -> Optional[str]:
     """
-    Classifica a mensagem como GREEN, LOSS ou None (ignorável).
-    APENAS VITÓRIAS NO BRANCO são GREEN.
+    Classifica a mensagem como GREEN, LOSS ou None (ignorável) com MÁXIMA RIGIDEZ.
     """
     t = _strip_accents(txt.lower())
     
-    # BLOCO 1: DETECTA VITÓRIA (GREEN)
-    if any(w in t for w in ["vitoria", "vitória", "acertamos", "acerto", "green"]):
-        
-        # ✅ VERIFICA RIGOROSA: SÓ ACEITA SE HOUVER A PALAVRA 'BRANCO' OU O SÍMBOLO '⚪'
-        if "branco" in t or "⚪" in txt:
-            return "GREEN_VALIDO"
-        
-        # Se for vitória (preto/verde/qualquer outra cor), CLASSIFICA COMO LOSS
-        return "LOSS" 
+    # MÁXIMA RIGIDEZ PARA GREEN: Precisa ter as 3 palavras-chave (vitória, branco, ✅)
+    if "vitoria" in t and "branco" in t and "✅" in txt:
+        return "GREEN_VALIDO"
     
-    # BLOCO 2: DETECTA LOSS EXPLÍCITO
-    if any(w in t for w in ["loss", "derrota", "nao deu", "não deu", "falhou"]):
+    # MÁXIMA RIGIDEZ PARA LOSS (Cobre Derrota e Wins de outras cores)
+    # Se contiver 'loss' OU (Contiver 'vitoria' E '⚫' ou '🟢' OU '❌')
+    if "loss" in t or "derrota" in t or \
+       ("vitoria" in t and any(c in txt for c in ["⚫", "🟢", "❌"])):
         return "LOSS"
         
     return None
@@ -182,7 +177,7 @@ def build_result_message(resultado_status: str) -> str:
 # ===================== WEBHOOK =====================
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "JonBet - Branco Automático (Versão Final Estável)"}
+    return {"status": "ok", "service": "JonBet - Branco Automático (Máxima Rigidez)"}
 
 @app.post(f"/webhook/{{webhook_token}}")
 async def webhook(webhook_token: str, request: Request):
@@ -207,6 +202,7 @@ async def webhook(webhook_token: str, request: Request):
     
     # ========================== BLOCO DE RESULTADO (UNLOCK) ==========================
     if resultado in ["GREEN_VALIDO", "LOSS"]:
+        
         # Se um resultado chegou, DESTRAVA o fluxo de entrada.
         if learn_state.get("entry_active"):
             learn_state["entry_active"] = False # <--- DESTRAVA A ENTRADA
@@ -248,4 +244,4 @@ async def webhook(webhook_token: str, request: Request):
 
     # ========================== BLOCO DE IGNORAR (TUDO MAIS) ==========================
     _save_learn() 
-    return {"ok": True, "action": "ignored"}
+    return {"ok": True, "action": "ignored_non_entry_non_result"}
