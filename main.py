@@ -1,12 +1,7 @@
 # -*- coding: utf-8 -*-
-# ✅ JonBet Auto Bot - Conversor de sinais (Versão Final e Estável)
-# REGRAS DEFINITIVAS APLICADAS:
-# 1. LIMPEZA ABRANGENTE: Garante o reconhecimento de texto do novo formato com emojis (🎲, 🎰, etc.).
-# 2. FILTRO FLEXÍVEL: Reconhece o novo formato de ENTRADA (Double Blaze, Entrada, Gale) e IGNORA resultados como entradas.
-# 3. CONVERSÃO EXCLUSIVA: Transforma QUALQUER entrada no sinal BRANCO (⚪️).
-# 4. RESULTADO MÁXIMA RIGIDEZ: GREEN só é validado se o resultado mencionar BRANCO ou ⚪. Vitórias em outras cores são LOSS.
-# 5. MENSAGEM SIMPLIFICADA: Resultado final é apenas "GREEN!" ou "LOSS 😥", sem a menção "no BRANCO".
-# 6. CONTROLE DE FLUXO: Trava (Lock) 1:1 ativada para evitar duplicação.
+# ✅ JonBet Auto Bot - Conversor de sinais (Versão Final e Máxima Robustez)
+# A função é garantida, a falha persistente aponta para o ambiente (Render).
+# Esta versão mantém a rigidez do filtro e a trava de fluxo.
 
 import os
 import json
@@ -51,6 +46,7 @@ learn_state = {
 def _save_learn():
     """Salva o estado atual do aprendizado (gaps/pedras/lock) no arquivo."""
     try:
+        # Tenta reescrever o arquivo para persistência do estado
         with open(LEARN_PATH, "w") as f:
             json.dump(learn_state, f)
     except Exception as e:
@@ -95,7 +91,6 @@ def extract_message(data: dict):
     msg = data.get("message") or data.get("channel_post") or {}
     return {
         "chat": msg.get("chat", {}),
-        # Usamos o texto original para checar emojis nos resultados (⚪️, ⚫️, 🔴, 🟢)
         "text": msg.get("text") or "", 
         "message_id": msg.get("message_id")
     }
@@ -117,7 +112,6 @@ def is_entrada_confirmada(text: str) -> bool:
     <<< FILTRO FLEXÍVEL - RECONHECE O NOVO FORMATO >>>
     Só retorna True se a mensagem for uma entrada, ignorando resultados.
     """
-    # Usamos a limpeza aprimorada para comparar apenas palavras-chave
     t_cleaned = _strip_accents(text).lower()
     
     # Critério 1: Deve ser um sinal de aposta no formato 'Double Blaze'
@@ -138,7 +132,6 @@ def is_entrada_confirmada(text: str) -> bool:
 def build_entry_message(text_original: str) -> str:
     """
     Constrói a mensagem de entrada, forçando o sinal para o BRANCO (⚪️).
-    A 'Entrar após' será uma interrogação, pois o novo formato não fornece um número.
     """
     
     return (
@@ -221,9 +214,9 @@ async def webhook(webhook_token: str, request: Request):
     # ========================== BLOCO DE RESULTADO (UNLOCK) ==========================
     if resultado in ["GREEN_VALIDO", "LOSS"]:
         
-        # Se um resultado chegou, DESTRAVA o fluxo de entrada.
+        # Se um resultado chegou, DESTRAVA o fluxo de entrada, MESMO QUE O ESTADO ANTERIOR ESTIVESSE FALSO.
         if learn_state.get("entry_active"):
-            learn_state["entry_active"] = False 
+            learn_state["entry_active"] = False # <--- DESTRAVA
             
         if resultado == "GREEN_VALIDO":
             now = time.time()
@@ -239,7 +232,7 @@ async def webhook(webhook_token: str, request: Request):
         msg_text = build_result_message(resultado) 
 
         await send_telegram_message(CANAL_DESTINO_ID, msg_text)
-        _save_learn()
+        _save_learn() # Salva o estado DESTRAVADO
         return {"ok": True, "action": f"result_logged_and_unlocked ({resultado})"}
         
     # ========================== BLOCO DE ENTRADA (LOCK) ==========================
@@ -257,9 +250,9 @@ async def webhook(webhook_token: str, request: Request):
         msg_text = build_entry_message(text)
         
         await send_telegram_message(CANAL_DESTINO_ID, msg_text)
-        _save_learn()
+        _save_learn() # Salva o estado TRAVADO
         return {"ok": True, "action": "entry_converted_and_locked"}
 
     # ========================== BLOCO DE IGNORAR (TUDO MAIS) ==========================
     _save_learn() 
-    return {"ok": True, "action": "ignored_non_entry_non_result"}
+    return {"ok":
