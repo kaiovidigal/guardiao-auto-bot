@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 # ✅ JonBet Auto Bot - Conversor de sinais (Conversão Total para o BRANCO)
-# REGRAS:
+# REGRAS DEFINITIVAS:
 # 1. FILTRO ESTRITO: Só aceita sinais no padrão 'Apostar no [cor] e ⚪ branco como proteção! [x] Gales'.
 # 2. CONVERSÃO: Converte o sinal filtrado para uma entrada simples no BRANCO.
-# 3. RESULTADO: Só aceita "GREEN no BRANCO" como GREEN. Outros resultados são LOSS.
+# 3. RESULTADO RIGOROSO: Só aceita "GREEN no BRANCO" como GREEN. Vitórias em outras cores são LOSS.
 # 4. CONTROLE DE FLUXO: Trava (Lock) 1:1 ativada para evitar duplicação.
 
 import os
@@ -142,11 +142,13 @@ def classificar_resultado(txt: str) -> Optional[str]:
     
     # BLOCO 1: DETECTA VITÓRIA (GREEN)
     if any(w in t for w in ["vitoria", "vitória", "acertamos", "acerto", "green"]):
+        
         # ✅ VERIFICA RIGOROSA: SÓ ACEITA SE HOUVER A PALAVRA 'BRANCO' OU O SÍMBOLO '⚪'
         if "branco" in t or "⚪" in txt:
             return "GREEN_VALIDO"
         
-        # Se for vitória (preto/verde), classifica como LOSS para a nossa estratégia
+        # Se for vitória (preto/verde/qualquer outra cor) e NÃO CONTÉM "branco" ou "⚪", CLASSIFICA COMO LOSS
+        # ESTA É A GARANTIA CONTRA WINS NÃO-BRANCO
         return "LOSS" 
     
     # BLOCO 2: DETECTA LOSS EXPLÍCITO
