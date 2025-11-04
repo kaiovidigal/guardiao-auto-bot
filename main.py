@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-# ✅ JonBet Auto Bot - Conversor de sinais (Adaptado ao Novo Formato de Entrada)
+# ✅ JonBet Auto Bot - Conversor de sinais (Filtro de Entrada Flexibilizado)
 # REGRAS DEFINITIVAS:
-# 1. FILTRO ESTRITO: Adaptado ao novo formato (Modo: Double Blaze, Entrada será para:, Gale: 0).
+# 1. FILTRO FLEXÍVEL: Adaptado ao novo formato, buscando apenas palavras-chave essenciais.
 # 2. CONVERSÃO: Converte o sinal filtrado para uma entrada simples no BRANCO.
-# 3. RESULTADO MÁXIMA RIGIDEZ: GREEN só com combinação explícita de vitória/branco (ou WIN no branco).
+# 3. RESULTADO MÁXIMA RIGIDEZ: GREEN só com combinação explícita de vitória/branco.
 # 4. CONTROLE DE FLUXO: Trava (Lock) 1:1 ativada.
-# 5. MENSAGEM DE RESULTADO SIMPLIFICADA (apenas GREEN/LOSS e métricas).
+# 5. MENSAGEM DE RESULTADO SIMPLIFICADA.
 
 import os
 import json
@@ -101,30 +101,30 @@ async def send_telegram_message(chat_id: str, text: str):
 
 def is_entrada_confirmada(text: str) -> bool:
     """
-    <<< FILTRO ESTRITO - ADAPTADO AO NOVO FORMATO >>>
-    Só retorna True se a mensagem contiver as palavras-chave do novo formato.
+    <<< FILTRO FLEXÍVEL - ADAPTADO AO NOVO FORMATO >>>
+    Só retorna True se a mensagem for uma entrada, ignorando resultados.
     """
     t = _strip_accents(text.lower())
     
-    # Critério 1: Deve ser um sinal de aposta no formato 'Modo: Double Blaze'
-    is_double_blaze = "modo: double blaze" in t
+    # Critério 1: Deve ser um sinal de aposta no formato 'Double Blaze'
+    is_double_blaze = "double blaze" in t
 
-    # Critério 2: Deve conter 'Entrada será para' (padrão de sinal)
+    # Critério 2: Deve conter a intenção de entrada (padrão 'Entrada será para')
     is_entry_format = "entrada será para" in t
 
-    # Critério 3: Deve conter a menção ao Gale 0
-    mentions_gale_0 = "gale: 0" in t or "gale: 1" in t or "gale: 2" in t
+    # Critério 3: Deve mencionar a gestão (Gale)
+    mentions_gale = "gale:" in t 
 
-    # Ignorar resultados que têm 'WIN!' ou 'LOSS' (para não travar o fluxo)
+    # Critério 4 (MAIS IMPORTANTE): Deve IGNORAR resultados, que usam 'WIN!', 'LOSS', '✅', '❌' ou 'derrota'
     is_not_result = not any(w in t for w in ["win!", "loss", "derrota", "✅", "❌"])
 
-    # Só aceita se atender a todos os critérios (Novo formato de entrada) e não for um resultado.
-    return is_double_blaze and is_entry_format and mentions_gale_0 and is_not_result
+    # Só aceita se atender a todos os critérios e não for um resultado.
+    return is_double_blaze and is_entry_format and mentions_gale and is_not_result
 
 def build_entry_message(text_original: str) -> str:
     """
     Constrói a mensagem de entrada, forçando o sinal para o BRANCO (⚪️).
-    A 'Entrar após' será uma interrogação, pois o novo formato não a fornece.
+    A 'Entrar após' será uma interrogação.
     """
     
     return (
@@ -138,21 +138,18 @@ def build_entry_message(text_original: str) -> str:
 def classificar_resultado(txt: str) -> Optional[str]:
     """
     Classifica a mensagem como GREEN, LOSS ou None (ignorável) com MÁXIMA RIGIDEZ.
-    Adaptado para aceitar "WIN!" e "LOSS" como indicadores, mas só GREEN no BRANCO é GREEN.
     """
     t = _strip_accents(txt.lower())
     
-    # MÁXIMA RIGIDEZ PARA GREEN:
-    # 1. O Formato Antigo, se ainda aparecer: precisa ter as 3 palavras-chave (vitória, branco, ✅)
-    # 2. O Formato Novo, se houver um WIN específico para o BRANCO.
-    if ("vitoria" in t and "branco" in t and "✅" in txt) or \
-       ("win!" in txt.upper() and ("branco" in t or "⚪" in txt)):
+    # MÁXIMA RIGIDEZ PARA GREEN (Novo e Antigo formato)
+    # GREEN é aceito SE for WIN e tiver a palavra BRANCO.
+    if ("win!" in txt.upper() or "vitoria" in t) and ("branco" in t or "⚪" in txt):
         return "GREEN_VALIDO"
     
-    # MÁXIMA RIGIDEZ PARA LOSS:
-    # Cobre Derrota explícita (LOSS/Derrota) OU (Vitória em outras cores - 'WIN!' + '⚫' ou '🔴' ou '🟢').
-    if "loss" in t or "derrota" in t or \
-       ("win!" in txt.upper() and any(c in txt for c in ["⚫", "🔴", "🟢"])):
+    # MÁXIMA RIGIDEZ PARA LOSS (Cobre Derrota e Wins de outras cores)
+    # Se contiver 'loss'/'derrota' OU (Contiver 'win'/'vitoria' E '⚫' ou '🔴' ou '🟢')
+    if "loss" in t or "derrota" in t or "❌" in txt or \
+       (("win!" in txt.upper() or "vitoria" in t) and any(c in txt for c in ["⚫", "🔴", "🟢"])):
         return "LOSS"
         
     return None
@@ -183,7 +180,7 @@ def build_result_message(resultado_status: str) -> str:
 # ===================== WEBHOOK =====================
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "JonBet - Branco Automático (Adaptado ao Novo Sinal)"}
+    return {"status": "ok", "service": "JonBet - Branco Automático (Filtro Flexível)"}
 
 @app.post(f"/webhook/{{webhook_token}}")
 async def webhook(webhook_token: str, request: Request):
@@ -211,7 +208,7 @@ async def webhook(webhook_token: str, request: Request):
         
         # Se um resultado chegou, DESTRAVA o fluxo de entrada.
         if learn_state.get("entry_active"):
-            learn_state["entry_active"] = False # <--- DESTRAVA A ENTRADA
+            learn_state["entry_active"] = False 
             
         if resultado == "GREEN_VALIDO":
             now = time.time()
@@ -221,7 +218,7 @@ async def webhook(webhook_token: str, request: Request):
                 _append_bounded(learn_state["stones_gaps"], learn_state["stones_since_last_white"], 200)
                 
             learn_state["last_white_ts"] = now
-            learn_state["stones_since_last_white"] = 0 # Zera a contagem de pedras (saiu branco)
+            learn_state["stones_since_last_white"] = 0 
 
         # Constrói a mensagem de resultado SIMPLIFICADA
         msg_text = build_result_message(resultado) 
@@ -238,7 +235,7 @@ async def webhook(webhook_token: str, request: Request):
             return {"ok": True, "action": "ignored_entry_active_lock"}
 
         # LOCK: Se não houver sinal ativo, TRAVA o fluxo para esperar o resultado
-        learn_state["entry_active"] = True # <--- TRAVA A ENTRADA
+        learn_state["entry_active"] = True 
         
         # Executa o envio e aumenta o contador
         learn_state["stones_since_last_white"] = learn_state.get("stones_since_last_white", 0) + 1
