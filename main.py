@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-# ✅ JonBet Auto Bot - Conversor de sinais (Filtro de Entrada Flexibilizado)
+# ✅ JonBet Auto Bot - Conversor de sinais (Versão Final com Limpeza Agressiva)
 # REGRAS DEFINITIVAS:
-# 1. FILTRO FLEXÍVEL: Adaptado ao novo formato, buscando apenas palavras-chave essenciais.
-# 2. CONVERSÃO: Converte o sinal filtrado para uma entrada simples no BRANCO.
-# 3. RESULTADO MÁXIMA RIGIDEZ: GREEN só com combinação explícita de vitória/branco.
-# 4. CONTROLE DE FLUXO: Trava (Lock) 1:1 ativada.
-# 5. MENSAGEM DE RESULTADO SIMPLIFICADA.
+# 1. LIMPEZA ABRANGENTE: Remove emojis, acentos e símbolos para garantir o reconhecimento de texto.
+# 2. FILTRO FLEXÍVEL: Adaptado para reconhecer o novo formato de entrada (Double Blaze, Entrada, Gale).
+# 3. CONVERSÃO: Converte o sinal filtrado para uma entrada simples no BRANCO.
+# 4. RESULTADO MÁXIMA RIGIDEZ: GREEN só é validado se o resultado mencionar BRANCO ou ⚪.
+# 5. CONTROLE DE FLUXO: Trava (Lock) 1:1 ativada.
+# 6. MENSAGEM DE RESULTADO SIMPLIFICADA.
 
 import os
 import json
@@ -22,6 +23,7 @@ from statistics import median
 # Variáveis de Ambiente. Certifique-se de que estão definidas no Render!
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "Jonbet")
+# ATENÇÃO: Verifique se estes IDs estão corretos!
 CANAL_ORIGEM_IDS = [s.strip() for s in os.getenv("CANAL_ORIGEM_IDS", "-1003156785631").split(",")]
 CANAL_DESTINO_ID = os.getenv("CANAL_DESTINO_ID", "-1002796105884")
 
@@ -69,8 +71,15 @@ _load_learn()
 
 # ===================== FUNÇÕES DE UTILIDADE =====================
 def _strip_accents(s: str) -> str:
-    """Remove acentos de uma string para facilitar a comparação."""
-    return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+    """Remove acentos, emojis e caracteres especiais de uma string para facilitar a comparação."""
+    # 1. Normaliza para remover acentos
+    nfkd_form = unicodedata.normalize('NFKD', s)
+    # 2. Remove todos os caracteres que não são ASCII (incluindo a maioria dos emojis)
+    only_ascii = nfkd_form.encode('ascii', 'ignore').decode('utf-8')
+    # 3. Substitui pontuações, quebras de linha e símbolos por espaços
+    cleaned = re.sub(r'[^a-zA-Z0-9\s]', ' ', only_ascii)
+    # 4. Remove múltiplos espaços e retorna em minúsculas
+    return re.sub(r'\s+', ' ', cleaned).strip()
 
 def _append_bounded(lst, val, maxlen=200):
     """Adiciona valor à lista, mantendo o tamanho máximo."""
@@ -83,7 +92,8 @@ def extract_message(data: dict):
     msg = data.get("message") or data.get("channel_post") or {}
     return {
         "chat": msg.get("chat", {}),
-        "text": msg.get("text") or "",
+        # Usamos o texto original para checar emojis nos resultados (⚪️, ⚫️, 🔴, 🟢)
+        "text": msg.get("text") or "", 
         "message_id": msg.get("message_id")
     }
 
@@ -101,22 +111,23 @@ async def send_telegram_message(chat_id: str, text: str):
 
 def is_entrada_confirmada(text: str) -> bool:
     """
-    <<< FILTRO FLEXÍVEL - ADAPTADO AO NOVO FORMATO >>>
+    <<< FILTRO FLEXÍVEL - RECONHECE O NOVO FORMATO >>>
     Só retorna True se a mensagem for uma entrada, ignorando resultados.
     """
-    t = _strip_accents(text.lower())
+    # Usamos a limpeza aprimorada para comparar apenas palavras-chave
+    t_cleaned = _strip_accents(text).lower()
     
     # Critério 1: Deve ser um sinal de aposta no formato 'Double Blaze'
-    is_double_blaze = "double blaze" in t
+    is_double_blaze = "double blaze" in t_cleaned
 
     # Critério 2: Deve conter a intenção de entrada (padrão 'Entrada será para')
-    is_entry_format = "entrada será para" in t
+    is_entry_format = "entrada sera para" in t_cleaned 
 
     # Critério 3: Deve mencionar a gestão (Gale)
-    mentions_gale = "gale:" in t 
+    mentions_gale = "gale" in t_cleaned
 
-    # Critério 4 (MAIS IMPORTANTE): Deve IGNORAR resultados, que usam 'WIN!', 'LOSS', '✅', '❌' ou 'derrota'
-    is_not_result = not any(w in t for w in ["win!", "loss", "derrota", "✅", "❌"])
+    # Critério 4 (MAIS IMPORTANTE): Deve IGNORAR resultados.
+    is_not_result = not any(w in t_cleaned for w in ["win", "loss", "derrota"])
 
     # Só aceita se atender a todos os critérios e não for um resultado.
     return is_double_blaze and is_entry_format and mentions_gale and is_not_result
@@ -124,7 +135,7 @@ def is_entrada_confirmada(text: str) -> bool:
 def build_entry_message(text_original: str) -> str:
     """
     Constrói a mensagem de entrada, forçando o sinal para o BRANCO (⚪️).
-    A 'Entrar após' será uma interrogação.
+    A 'Entrar após' será uma interrogação, pois o novo formato não fornece um número.
     """
     
     return (
@@ -138,18 +149,19 @@ def build_entry_message(text_original: str) -> str:
 def classificar_resultado(txt: str) -> Optional[str]:
     """
     Classifica a mensagem como GREEN, LOSS ou None (ignorável) com MÁXIMA RIGIDEZ.
+    Usa o texto original (txt) para checar emojis.
     """
-    t = _strip_accents(txt.lower())
+    t_cleaned = _strip_accents(txt).lower()
     
-    # MÁXIMA RIGIDEZ PARA GREEN (Novo e Antigo formato)
-    # GREEN é aceito SE for WIN e tiver a palavra BRANCO.
-    if ("win!" in txt.upper() or "vitoria" in t) and ("branco" in t or "⚪" in txt):
+    # MÁXIMA RIGIDEZ PARA GREEN:
+    # GREEN é aceito SE for WIN/Vitória E tiver a palavra BRANCO OU o emoji ⚪.
+    if ("win" in t_cleaned or "vitoria" in t_cleaned) and ("branco" in t_cleaned or "⚪" in txt):
         return "GREEN_VALIDO"
     
     # MÁXIMA RIGIDEZ PARA LOSS (Cobre Derrota e Wins de outras cores)
     # Se contiver 'loss'/'derrota' OU (Contiver 'win'/'vitoria' E '⚫' ou '🔴' ou '🟢')
-    if "loss" in t or "derrota" in t or "❌" in txt or \
-       (("win!" in txt.upper() or "vitoria" in t) and any(c in txt for c in ["⚫", "🔴", "🟢"])):
+    if "loss" in t_cleaned or "derrota" in t_cleaned or "❌" in txt or \
+       (("win" in t_cleaned or "vitoria" in t_cleaned) and any(c in txt for c in ["⚫", "🔴", "🟢"])):
         return "LOSS"
         
     return None
@@ -180,7 +192,7 @@ def build_result_message(resultado_status: str) -> str:
 # ===================== WEBHOOK =====================
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "JonBet - Branco Automático (Filtro Flexível)"}
+    return {"status": "ok", "service": "JonBet - Branco Automático (Versão Final Estável)"}
 
 @app.post(f"/webhook/{{webhook_token}}")
 async def webhook(webhook_token: str, request: Request):
