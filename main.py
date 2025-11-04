@@ -5,6 +5,7 @@
 # 2. CONVERSÃO: Converte o sinal filtrado para uma entrada simples no BRANCO.
 # 3. RESULTADO RIGOROSO: Só aceita "GREEN no BRANCO" como GREEN. Vitórias em outras cores são LOSS.
 # 4. CONTROLE DE FLUXO: Trava (Lock) 1:1 ativada para evitar duplicação.
+# 5. MENSAGEM DE RESULTADO SIMPLIFICADA (apenas GREEN/LOSS e métricas).
 
 import os
 import json
@@ -148,7 +149,6 @@ def classificar_resultado(txt: str) -> Optional[str]:
             return "GREEN_VALIDO"
         
         # Se for vitória (preto/verde/qualquer outra cor) e NÃO CONTÉM "branco" ou "⚪", CLASSIFICA COMO LOSS
-        # ESTA É A GARANTIA CONTRA WINS NÃO-BRANCO
         return "LOSS" 
     
     # BLOCO 2: DETECTA LOSS EXPLÍCITO
@@ -158,20 +158,32 @@ def classificar_resultado(txt: str) -> Optional[str]:
     return None
 
 def build_result_message(resultado_txt: str) -> str:
-    """Gera a mensagem de resultado formatada com dados de aprendizado."""
+    """
+    Gera a mensagem de resultado formatada com dados de aprendizado, AGORA SIMPLIFICADA.
+    """
     stones = learn_state.get("stones_since_last_white", 0)
     try:
         med_stones = int(median(learn_state["stones_gaps"])) if learn_state["stones_gaps"] else 0
     except Exception:
         med_stones = 0
         
-    return f"Resultado: {resultado_txt}\n\n🪙 *Distância entre brancos:* {stones} pedras (mediana: {med_stones})"
+    # Lógica de simplificação: se for GREEN_VALIDO, transforma em GREEN!
+    if "GREEN" in resultado_txt:
+        status_msg = "✅ **GREEN!**"
+    else:
+        status_msg = "❌ **LOSS** 😥"
+        
+    # Mensagem de resultado formatada (focada em status e métricas)
+    return (
+        f"Resultado: {status_msg}\n\n"
+        f"🪙 *Distância entre brancos:* {stones} pedras (mediana: {med_stones})"
+    )
 
 
 # ===================== WEBHOOK =====================
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "JonBet - Branco Automático (Filtro Estrito e Trava 1:1 Ativa)"}
+    return {"status": "ok", "service": "JonBet - Branco Automático (Resultados Simplificados)"}
 
 @app.post(f"/webhook/{{webhook_token}}")
 async def webhook(webhook_token: str, request: Request):
@@ -210,9 +222,8 @@ async def webhook(webhook_token: str, request: Request):
             learn_state["last_white_ts"] = now
             learn_state["stones_since_last_white"] = 0 # Zera a contagem de pedras (saiu branco)
 
-            msg_text = build_result_message("✅ **GREEN no BRANCO!** ⚪️")
-        else: # Resultado é LOSS (inclui vitórias preto/verde e derrotas explícitas)
-            msg_text = build_result_message("❌ **LOSS** 😥")
+        # Não precisa verificar o resultado de novo, a função build_result_message já trata o "GREEN_VALIDO" ou "LOSS"
+        msg_text = build_result_message(resultado) 
 
         await send_telegram_message(CANAL_DESTINO_ID, msg_text)
         _save_learn()
