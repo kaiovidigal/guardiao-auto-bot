@@ -102,8 +102,7 @@ async def send_telegram_message(chat_id: str, text: str):
 def is_entrada_confirmada(text: str) -> bool:
     """
     <<< FILTRO ESTRITO >>>
-    Só retorna True se a mensagem contiver as palavras-chave do padrão de aposta mista
-    (entrada, branco como proteção, e gales). Ignora todo o resto.
+    Só retorna True se a mensagem contiver as palavras-chave do padrão de aposta mista.
     """
     t = _strip_accents(text.lower())
     
@@ -113,7 +112,7 @@ def is_entrada_confirmada(text: str) -> bool:
     # Critério 2: Deve ser uma aposta mista/proteção focada no BRANCO
     is_mixed_bet = ("branco como protecao" in t or "branco como proteção" in t)
     
-    # Critério 3: Deve mencionar Gales (como nos exemplos do usuário)
+    # Critério 3: Deve mencionar Gales
     mentions_gale = ("gale" in t or "gales" in t)
 
     # Só aceita se atender a todos os critérios.
@@ -148,7 +147,7 @@ def classificar_resultado(txt: str) -> Optional[str]:
         if "branco" in t or "⚪" in txt:
             return "GREEN_VALIDO"
         
-        # Se for vitória (preto/verde/qualquer outra cor) e NÃO CONTÉM "branco" ou "⚪", CLASSIFICA COMO LOSS
+        # Se for vitória (preto/verde/qualquer outra cor), CLASSIFICA COMO LOSS
         return "LOSS" 
     
     # BLOCO 2: DETECTA LOSS EXPLÍCITO
@@ -157,9 +156,9 @@ def classificar_resultado(txt: str) -> Optional[str]:
         
     return None
 
-def build_result_message(resultado_txt: str) -> str:
+def build_result_message(resultado_status: str) -> str:
     """
-    Gera a mensagem de resultado formatada com dados de aprendizado, AGORA SIMPLIFICADA.
+    Gera a mensagem de resultado formatada com dados de aprendizado e STATUS SIMPLIFICADO.
     """
     stones = learn_state.get("stones_since_last_white", 0)
     try:
@@ -167,13 +166,13 @@ def build_result_message(resultado_txt: str) -> str:
     except Exception:
         med_stones = 0
         
-    # Lógica de simplificação: se for GREEN_VALIDO, transforma em GREEN!
-    if "GREEN" in resultado_txt:
+    # Status simplificado baseado no resultado ('GREEN_VALIDO' ou 'LOSS')
+    if resultado_status == "GREEN_VALIDO":
         status_msg = "✅ **GREEN!**"
-    else:
+    else: # LOSS
         status_msg = "❌ **LOSS** 😥"
         
-    # Mensagem de resultado formatada (focada em status e métricas)
+    # Mensagem de resultado final
     return (
         f"Resultado: {status_msg}\n\n"
         f"🪙 *Distância entre brancos:* {stones} pedras (mediana: {med_stones})"
@@ -183,7 +182,7 @@ def build_result_message(resultado_txt: str) -> str:
 # ===================== WEBHOOK =====================
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "JonBet - Branco Automático (Resultados Simplificados)"}
+    return {"status": "ok", "service": "JonBet - Branco Automático (Versão Final Estável)"}
 
 @app.post(f"/webhook/{{webhook_token}}")
 async def webhook(webhook_token: str, request: Request):
@@ -222,7 +221,7 @@ async def webhook(webhook_token: str, request: Request):
             learn_state["last_white_ts"] = now
             learn_state["stones_since_last_white"] = 0 # Zera a contagem de pedras (saiu branco)
 
-        # Não precisa verificar o resultado de novo, a função build_result_message já trata o "GREEN_VALIDO" ou "LOSS"
+        # Constrói a mensagem de resultado SIMPLIFICADA
         msg_text = build_result_message(resultado) 
 
         await send_telegram_message(CANAL_DESTINO_ID, msg_text)
