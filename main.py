@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-# ✅ JonBet Auto Bot - Conversor de sinais (Conversão Total para o BRANCO)
+# ✅ JonBet Auto Bot - Conversor de sinais (Adaptado ao Novo Formato de Entrada)
 # REGRAS DEFINITIVAS:
-# 1. FILTRO ESTRITO: Só aceita sinais no padrão 'Apostar no [cor] e ⚪ branco como proteção! [x] Gales'.
+# 1. FILTRO ESTRITO: Adaptado ao novo formato (Modo: Double Blaze, Entrada será para:, Gale: 0).
 # 2. CONVERSÃO: Converte o sinal filtrado para uma entrada simples no BRANCO.
-# 3. RESULTADO MÁXIMA RIGIDEZ: Só aceita a combinação explícita de palavras para GREEN/LOSS.
-# 4. CONTROLE DE FLUXO: Trava (Lock) 1:1 ativada para evitar duplicação.
+# 3. RESULTADO MÁXIMA RIGIDEZ: GREEN só com combinação explícita de vitória/branco (ou WIN no branco).
+# 4. CONTROLE DE FLUXO: Trava (Lock) 1:1 ativada.
 # 5. MENSAGEM DE RESULTADO SIMPLIFICADA (apenas GREEN/LOSS e métricas).
 
 import os
@@ -101,34 +101,36 @@ async def send_telegram_message(chat_id: str, text: str):
 
 def is_entrada_confirmada(text: str) -> bool:
     """
-    <<< FILTRO ESTRITO >>>
-    Só retorna True se a mensagem contiver as palavras-chave do padrão de aposta mista.
+    <<< FILTRO ESTRITO - ADAPTADO AO NOVO FORMATO >>>
+    Só retorna True se a mensagem contiver as palavras-chave do novo formato.
     """
     t = _strip_accents(text.lower())
     
-    # Critério 1: Deve ser um sinal de aposta (entrada/apostar)
-    is_entry_format = any(x in t for x in ["entrada confirmada", "apostar no"])
+    # Critério 1: Deve ser um sinal de aposta no formato 'Modo: Double Blaze'
+    is_double_blaze = "modo: double blaze" in t
 
-    # Critério 2: Deve ser uma aposta mista/proteção focada no BRANCO
-    is_mixed_bet = ("branco como protecao" in t or "branco como proteção" in t)
-    
-    # Critério 3: Deve mencionar Gales
-    mentions_gale = ("gale" in t or "gales" in t)
+    # Critério 2: Deve conter 'Entrada será para' (padrão de sinal)
+    is_entry_format = "entrada será para" in t
 
-    # Só aceita se atender a todos os critérios.
-    return is_entry_format and is_mixed_bet and mentions_gale
+    # Critério 3: Deve conter a menção ao Gale 0
+    mentions_gale_0 = "gale: 0" in t or "gale: 1" in t or "gale: 2" in t
+
+    # Ignorar resultados que têm 'WIN!' ou 'LOSS' (para não travar o fluxo)
+    is_not_result = not any(w in t for w in ["win!", "loss", "derrota", "✅", "❌"])
+
+    # Só aceita se atender a todos os critérios (Novo formato de entrada) e não for um resultado.
+    return is_double_blaze and is_entry_format and mentions_gale_0 and is_not_result
 
 def build_entry_message(text_original: str) -> str:
     """
     Constrói a mensagem de entrada, forçando o sinal para o BRANCO (⚪️).
+    A 'Entrar após' será uma interrogação, pois o novo formato não a fornece.
     """
-    m = re.search(r"(\d{1,2})", text_original)
-    num_alvo = m.group(1) if m else "?"
     
     return (
         "🚨 **CONVERSÃO: ENTRADA IMEDIATA NO BRANCO!** ⚪️\n\n"
         f"Apostar no **Branco** ⚪️\n"
-        f"Entrar após: ⚪️ {num_alvo}\n\n"
+        f"Entrar após: ⚪️ ?\n\n"
         "🎰 Jogo: Double - JonBet\n"
         "💻 Site: Acessar Double"
     )
@@ -136,17 +138,21 @@ def build_entry_message(text_original: str) -> str:
 def classificar_resultado(txt: str) -> Optional[str]:
     """
     Classifica a mensagem como GREEN, LOSS ou None (ignorável) com MÁXIMA RIGIDEZ.
+    Adaptado para aceitar "WIN!" e "LOSS" como indicadores, mas só GREEN no BRANCO é GREEN.
     """
     t = _strip_accents(txt.lower())
     
-    # MÁXIMA RIGIDEZ PARA GREEN: Precisa ter as 3 palavras-chave (vitória, branco, ✅)
-    if "vitoria" in t and "branco" in t and "✅" in txt:
+    # MÁXIMA RIGIDEZ PARA GREEN:
+    # 1. O Formato Antigo, se ainda aparecer: precisa ter as 3 palavras-chave (vitória, branco, ✅)
+    # 2. O Formato Novo, se houver um WIN específico para o BRANCO.
+    if ("vitoria" in t and "branco" in t and "✅" in txt) or \
+       ("win!" in txt.upper() and ("branco" in t or "⚪" in txt)):
         return "GREEN_VALIDO"
     
-    # MÁXIMA RIGIDEZ PARA LOSS (Cobre Derrota e Wins de outras cores)
-    # Se contiver 'loss' OU (Contiver 'vitoria' E '⚫' ou '🟢' OU '❌')
+    # MÁXIMA RIGIDEZ PARA LOSS:
+    # Cobre Derrota explícita (LOSS/Derrota) OU (Vitória em outras cores - 'WIN!' + '⚫' ou '🔴' ou '🟢').
     if "loss" in t or "derrota" in t or \
-       ("vitoria" in t and any(c in txt for c in ["⚫", "🟢", "❌"])):
+       ("win!" in txt.upper() and any(c in txt for c in ["⚫", "🔴", "🟢"])):
         return "LOSS"
         
     return None
@@ -177,7 +183,7 @@ def build_result_message(resultado_status: str) -> str:
 # ===================== WEBHOOK =====================
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "JonBet - Branco Automático (Máxima Rigidez)"}
+    return {"status": "ok", "service": "JonBet - Branco Automático (Adaptado ao Novo Sinal)"}
 
 @app.post(f"/webhook/{{webhook_token}}")
 async def webhook(webhook_token: str, request: Request):
