@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-# ✅ JonBet Auto Bot - Conversor de sinais (Versão Final + Diagnóstico Completo)
+# ✅ JonBet Auto Bot - Conversor de sinais (Versão Final com Diagnóstico e Status)
 # Atualização 04/11/2025
-# - Diagnóstico detalhado de envio (retorna status_code e texto do Telegram)
-# - Endpoint /debug/sendtest para validar o envio
-# - Correção de erro de parse_mode (Markdown inválido)
-# - Logs reforçados para rastrear travas, unlock e bloqueios
+# - Diagnóstico detalhado de envio (status_code e resposta do Telegram)
+# - Endpoint /debug/sendtest para testar o envio
+# - Endpoint /debug/status para monitorar travas e estatísticas
+# - Proteção contra erros de Markdown e logs reforçados
 
 import os
 import json
@@ -86,11 +86,9 @@ def extract_message(data: dict):
 
 # ===================== ENVIO TELEGRAM =====================
 async def send_telegram_message(chat_id: str, text: str):
-    """Envia mensagem ao Telegram com diagnóstico e proteção de formatação"""
+    """Envia mensagem ao Telegram com diagnóstico e fallback de parse_mode"""
     async with httpx.AsyncClient() as client:
         payload = {"chat_id": chat_id, "text": text}
-
-        # tenta Markdown e recua para texto puro se falhar
         for mode in ["Markdown", None]:
             if mode:
                 payload["parse_mode"] = mode
@@ -102,11 +100,11 @@ async def send_telegram_message(chat_id: str, text: str):
                 logging.info(f"🔧 Envio Telegram: {r.status_code} | {r.text[:120]}")
                 r.raise_for_status()
                 logging.info(f"✅ Mensagem enviada com sucesso para {chat_id}")
-                return
+                return True
             except Exception as e:
                 logging.error(f"Erro ao enviar ({mode}): {e}")
-                # tenta novamente com texto puro
                 continue
+    return False
 
 # ===================== LÓGICA =====================
 def is_entrada_confirmada(text: str) -> bool:
@@ -117,11 +115,11 @@ def is_entrada_confirmada(text: str) -> bool:
     is_not_result = not any(w in t_cleaned for w in ["win", "loss", "derrota"])
     return is_double_blaze and is_entry_format and mentions_gale and is_not_result
 
-def build_entry_message(text_original: str) -> str:
+def build_entry_message(_: str) -> str:
     return (
         "🚨 **CONVERSÃO: ENTRADA IMEDIATA NO BRANCO!** ⚪️\n\n"
-        f"Apostar no **Branco** ⚪️\n"
-        f"Entrar após: ⚪️ ?\n\n"
+        "Apostar no **Branco** ⚪️\n"
+        "Entrar após: ⚪️ ?\n\n"
         "🎰 Jogo: Double - JonBet\n"
         "💻 Site: Acessar Double"
     )
@@ -148,17 +146,30 @@ def build_result_message(resultado_status: str) -> str:
         f"🪙 *Distância entre brancos:* {stones} pedras (mediana: {med_stones})"
     )
 
-# ===================== WEBHOOK =====================
+# ===================== ENDPOINTS =====================
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "JonBet - Branco Automático (Diagnóstico Final)"}
+    return {"status": "ok", "service": "JonBet - Branco Automático (Diagnóstico + Status)"}
 
 @app.get("/debug/sendtest")
 async def send_test():
     """Teste manual para verificar envio ao canal destino"""
-    await send_telegram_message(CANAL_DESTINO_ID, "🚀 Teste direto do JonBet Auto Bot (Render OK)")
-    return {"ok": True, "sent_to": CANAL_DESTINO_ID}
+    ok = await send_telegram_message(CANAL_DESTINO_ID, "🚀 Teste direto do JonBet Auto Bot (Render OK)")
+    return {"ok": ok, "sent_to": CANAL_DESTINO_ID}
 
+@app.get("/debug/status")
+def status():
+    """Exibe o estado atual do aprendizado e travas"""
+    return {
+        "entry_active": learn_state.get("entry_active"),
+        "stones_since_last_white": learn_state.get("stones_since_last_white"),
+        "white_gaps": learn_state.get("white_gaps")[-5:],
+        "stones_gaps": learn_state.get("stones_gaps")[-5:],
+        "last_white_ts": learn_state.get("last_white_ts"),
+        "processed_ids": len(learn_state.get("processed_ids", []))
+    }
+
+# ===================== WEBHOOK =====================
 @app.post(f"/webhook/{{webhook_token}}")
 async def webhook(webhook_token: str, request: Request):
     if webhook_token != WEBHOOK_TOKEN:
