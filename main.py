@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-# ✅ JonBet Auto Bot - Conversor de sinais (Versão Final e Máxima Robustez - Com Trava de ID)
-# Esta versão é a solução lógica final:
-# 1. Filtro agressivo para novo formato (sem entrada imediata e com emojis).
-# 2. Conversão forçada para o BRANCO (⚪️).
-# 3. Trava dupla (entry_active + processed_ids) para minimizar duplicação durante instabilidade do servidor.
+# ✅ JonBet Auto Bot - Conversor de sinais (Versão Final + Diagnóstico Completo)
+# Atualização 04/11/2025
+# - Diagnóstico detalhado de envio (retorna status_code e texto do Telegram)
+# - Endpoint /debug/sendtest para validar o envio
+# - Correção de erro de parse_mode (Markdown inválido)
+# - Logs reforçados para rastrear travas, unlock e bloqueios
 
 import os
 import json
@@ -17,7 +18,6 @@ import httpx
 from statistics import median
 
 # ===================== CONFIG =====================
-# Variáveis de Ambiente. Certifique-se de que estão definidas no Render!
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "Jonbet")
 CANAL_ORIGEM_IDS = [s.strip() for s in os.getenv("CANAL_ORIGEM_IDS", "-1003156785631").split(",")]
@@ -34,18 +34,17 @@ app = FastAPI()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# ===================== APRENDIZADO =====================
+# ===================== ESTADO DE APRENDIZADO =====================
 learn_state = {
     "last_white_ts": None,
     "white_gaps": [],
     "stones_since_last_white": 0,
     "stones_gaps": [],
-    "entry_active": False, # Trava de fluxo 1:1
-    "processed_ids": []     # Armazena IDs de mensagens processadas (Trava por ID)
+    "entry_active": False,
+    "processed_ids": []
 }
 
 def _save_learn():
-    """Salva o estado atual do aprendizado (gaps/pedras/lock) no arquivo."""
     try:
         with open(LEARN_PATH, "w") as f:
             json.dump(learn_state, f)
@@ -53,81 +52,72 @@ def _save_learn():
         logging.error(f"Erro ao salvar aprendizado: {e}")
 
 def _load_learn():
-    """Carrega o estado do aprendizado ao iniciar o bot."""
     global learn_state
     try:
         if os.path.exists(LEARN_PATH):
             with open(LEARN_PATH, "r") as f:
                 loaded_state = json.load(f)
-                learn_state.update(loaded_state) 
-                # Garante que a lista de IDs seja limitada a 100
+                learn_state.update(loaded_state)
                 learn_state["processed_ids"] = learn_state.get("processed_ids", [])[-100:]
     except Exception:
         pass
 
 _load_learn()
 
-# ===================== FUNÇÕES DE UTILIDADE =====================
+# ===================== UTILIDADES =====================
 def _strip_accents(s: str) -> str:
-    """
-    Remove acentos, emojis e caracteres especiais de uma string, deixando apenas
-    letras, números e espaços, para garantir o reconhecimento das palavras-chave.
-    """
     nfkd_form = unicodedata.normalize('NFKD', s)
     only_ascii = nfkd_form.encode('ascii', 'ignore').decode('utf-8')
     cleaned = re.sub(r'[^a-zA-Z0-9\s]', ' ', only_ascii)
     return re.sub(r'\s+', ' ', cleaned).strip()
 
 def _append_bounded(lst, val, maxlen=200):
-    """Adiciona valor à lista, mantendo o tamanho máximo."""
     lst.append(val)
     if len(lst) > maxlen:
         del lst[:len(lst)-maxlen]
 
 def extract_message(data: dict):
-    """Extrai informações relevantes da requisição do Telegram."""
     msg = data.get("message") or data.get("channel_post") or {}
     return {
         "chat": msg.get("chat", {}),
-        "text": msg.get("text") or "", 
+        "text": msg.get("text") or "",
         "message_id": msg.get("message_id")
     }
 
+# ===================== ENVIO TELEGRAM =====================
 async def send_telegram_message(chat_id: str, text: str):
-    """Envia uma mensagem formatada via API do Telegram."""
+    """Envia mensagem ao Telegram com diagnóstico e proteção de formatação"""
     async with httpx.AsyncClient() as client:
-        payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-        try:
-            r = await client.post(SEND_MESSAGE_URL, json=payload, timeout=15)
-            r.raise_for_status()
-        except Exception as e:
-            logging.error(f"Erro ao enviar mensagem: {e}")
+        payload = {"chat_id": chat_id, "text": text}
 
-# ===================== FUNÇÕES DE LÓGICA =====================
+        # tenta Markdown e recua para texto puro se falhar
+        for mode in ["Markdown", None]:
+            if mode:
+                payload["parse_mode"] = mode
+            else:
+                payload.pop("parse_mode", None)
 
+            try:
+                r = await client.post(SEND_MESSAGE_URL, json=payload, timeout=15)
+                logging.info(f"🔧 Envio Telegram: {r.status_code} | {r.text[:120]}")
+                r.raise_for_status()
+                logging.info(f"✅ Mensagem enviada com sucesso para {chat_id}")
+                return
+            except Exception as e:
+                logging.error(f"Erro ao enviar ({mode}): {e}")
+                # tenta novamente com texto puro
+                continue
+
+# ===================== LÓGICA =====================
 def is_entrada_confirmada(text: str) -> bool:
-    """
-    <<< FILTRO FLEXÍVEL - RECONHECE O NOVO FORMATO >>>
-    Só retorna True se a mensagem for uma entrada, ignorando resultados.
-    """
     t_cleaned = _strip_accents(text).lower()
-    
-    # Verifica as palavras-chave essenciais do novo formato (sem entrada imediata)
     is_double_blaze = "double blaze" in t_cleaned
-    is_entry_format = "entrada sera para" in t_cleaned 
+    is_entry_format = "entrada sera para" in t_cleaned
     mentions_gale = "gale" in t_cleaned
-    
-    # Critério MAIS IMPORTANTE: Deve IGNORAR resultados.
     is_not_result = not any(w in t_cleaned for w in ["win", "loss", "derrota"])
-
     return is_double_blaze and is_entry_format and mentions_gale and is_not_result
 
 def build_entry_message(text_original: str) -> str:
-    """
-    Constrói a mensagem de entrada, forçando o sinal para o BRANCO (⚪️).
-    A 'Entrar após' é colocada como '?' para representar a conversão de entrada imediata.
-    """
-    
     return (
         "🚨 **CONVERSÃO: ENTRADA IMEDIATA NO BRANCO!** ⚪️\n\n"
         f"Apostar no **Branco** ⚪️\n"
@@ -137,47 +127,37 @@ def build_entry_message(text_original: str) -> str:
     )
 
 def classificar_resultado(txt: str) -> Optional[str]:
-    """
-    Classifica a mensagem como GREEN, LOSS ou None (ignorável) com MÁXIMA RIGIDEZ.
-    """
     t_cleaned = _strip_accents(txt).lower()
-    
-    # MÁXIMA RIGIDEZ PARA GREEN: WIN/Vitória E BRANCO/⚪
     if ("win" in t_cleaned or "vitoria" in t_cleaned) and ("branco" in t_cleaned or "⚪" in txt):
         return "GREEN_VALIDO"
-    
-    # MÁXIMA RIGIDEZ PARA LOSS (Cobre Derrota e Wins de outras cores)
     if "loss" in t_cleaned or "derrota" in t_cleaned or "❌" in txt or \
        (("win" in t_cleaned or "vitoria" in t_cleaned) and any(c in txt for c in ["⚫", "🔴", "🟢"])):
         return "LOSS"
-        
     return None
 
 def build_result_message(resultado_status: str) -> str:
-    """
-    Gera a mensagem de resultado formatada com dados de aprendizado e STATUS SIMPLIFICADO.
-    """
     stones = learn_state.get("stones_since_last_white", 0)
     try:
         med_stones = int(median(learn_state["stones_gaps"])) if learn_state["stones_gaps"] else 0
     except Exception:
         med_stones = 0
-        
-    if resultado_status == "GREEN_VALIDO":
-        status_msg = "✅ **GREEN!**"
-    else: 
-        status_msg = "❌ **LOSS** 😥"
-        
+
+    status_msg = "✅ **GREEN!**" if resultado_status == "GREEN_VALIDO" else "❌ **LOSS** 😥"
     return (
         f"Resultado: {status_msg}\n\n"
         f"🪙 *Distância entre brancos:* {stones} pedras (mediana: {med_stones})"
     )
 
-
 # ===================== WEBHOOK =====================
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "JonBet - Branco Automático (FINAL ID LOCK)"}
+    return {"status": "ok", "service": "JonBet - Branco Automático (Diagnóstico Final)"}
+
+@app.get("/debug/sendtest")
+async def send_test():
+    """Teste manual para verificar envio ao canal destino"""
+    await send_telegram_message(CANAL_DESTINO_ID, "🚀 Teste direto do JonBet Auto Bot (Render OK)")
+    return {"ok": True, "sent_to": CANAL_DESTINO_ID}
 
 @app.post(f"/webhook/{{webhook_token}}")
 async def webhook(webhook_token: str, request: Request):
@@ -194,63 +174,53 @@ async def webhook(webhook_token: str, request: Request):
     text = (msg.get("text") or "").strip()
     message_id = msg.get("message_id")
 
-    # IGNORA: Mensagens já processadas (Trava por ID - Defesa contra duplicação)
     if message_id and message_id in learn_state["processed_ids"]:
         logging.info(f"Ignorando ID duplicado: {message_id}")
         return {"ok": True, "action": "ignored_duplicate_id"}
 
-    # Ignora mensagens do próprio canal de destino e de fontes não autorizadas
     if chat_id == CANAL_DESTINO_ID or chat_id not in CANAL_ORIGEM_IDS:
         return {"ok": True, "action": "ignored_channel"}
-    
-    # Adiciona o ID à lista de processados
+
     if message_id:
         learn_state["processed_ids"].append(message_id)
         learn_state["processed_ids"] = learn_state["processed_ids"][-100:]
-        _save_learn() # Salva a trava de ID imediatamente
+        _save_learn()
 
-    # TENTA CLASSIFICAR RESULTADO PRIMEIRO
     resultado = classificar_resultado(text)
-    
-    # ========================== BLOCO DE RESULTADO (UNLOCK) ==========================
+
+    # === RESULTADO (UNLOCK) ===
     if resultado in ["GREEN_VALIDO", "LOSS"]:
-        
-        # DESTRAVA, independentemente do estado anterior
         if learn_state.get("entry_active"):
-            learn_state["entry_active"] = False 
-            
+            learn_state["entry_active"] = False
+
         if resultado == "GREEN_VALIDO":
             now = time.time()
             if learn_state.get("last_white_ts"):
                 gap = now - float(learn_state["last_white_ts"])
                 _append_bounded(learn_state["white_gaps"], gap, 200)
                 _append_bounded(learn_state["stones_gaps"], learn_state["stones_since_last_white"], 200)
-                
-            learn_state["last_white_ts"] = now
-            learn_state["stones_since_last_white"] = 0 
 
-        msg_text = build_result_message(resultado) 
+            learn_state["last_white_ts"] = now
+            learn_state["stones_since_last_white"] = 0
+
+        msg_text = build_result_message(resultado)
+        logging.info(f"📩 Enviando resultado: {resultado}")
         await send_telegram_message(CANAL_DESTINO_ID, msg_text)
-        _save_learn() # Salva o estado DESTRAVADO
+        _save_learn()
         return {"ok": True, "action": f"result_logged_and_unlocked ({resultado})"}
-        
-    # ========================== BLOCO DE ENTRADA (LOCK) ==========================
+
+    # === ENTRADA (LOCK) ===
     if is_entrada_confirmada(text):
-        
-        # Trava: IGNORA se já houver um sinal ativo
         if learn_state.get("entry_active"):
             return {"ok": True, "action": "ignored_entry_active_lock"}
 
-        # LOCK: TRAVA o fluxo
-        learn_state["entry_active"] = True 
-        
+        learn_state["entry_active"] = True
         learn_state["stones_since_last_white"] = learn_state.get("stones_since_last_white", 0) + 1
         msg_text = build_entry_message(text)
-        
+        logging.info("📩 Enviando entrada convertida para BRANCO ⚪️")
         await send_telegram_message(CANAL_DESTINO_ID, msg_text)
-        _save_learn() # Salva o estado TRAVADO
+        _save_learn()
         return {"ok": True, "action": "entry_converted_and_locked"}
 
-    # ========================== BLOCO DE IGNORAR (TUDO MAIS) ==========================
-    _save_learn() 
+    _save_learn()
     return {"ok": True, "action": "ignored_non_entry_non_result"}
